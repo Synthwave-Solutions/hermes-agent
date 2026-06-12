@@ -1,11 +1,8 @@
-<svg viewBox="0 0 48 48" role="img" aria-label="Synthwave Solutions" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="sw-wave-grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="hsl(195, 100%, 60%)"/>
-      <stop offset="100%" stop-color="hsl(210, 100%, 50%)"/>
-    </linearGradient>
-  </defs>
-  <circle cx="24" cy="24" r="21" fill="none" stroke="url(#sw-wave-grad)" stroke-width="2.4" opacity="0.45"/>
-  <path d="M14 30c2.8-5 7-7 10-3.5 2.4 2.8 6 2.2 8.5-1.5" fill="none" stroke="url(#sw-wave-grad)" stroke-width="3.2" stroke-linecap="round"/>
-  <path d="M15.5 19c2.5-3.7 5.8-3.2 8.2-.6 2.6 2.9 6.4 1.4 9-2.6" fill="none" stroke="url(#sw-wave-grad)" stroke-width="3.2" stroke-linecap="round" opacity="0.85"/>
+<svg viewBox="0 0 48 48" role="img" aria-label="SynthPulse" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="spg" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="hsl(195,100%,62%)"/><stop offset="100%" stop-color="hsl(206,100%,52%)"/>
+  </linearGradient></defs>
+  <circle cx="24" cy="24" r="21" fill="none" stroke="url(#spg)" stroke-width="2.4" opacity="0.45"/>
+  <path d="M9.5 24 C12 24 13 22.5 14.5 21.5 C16.5 20.2 17.5 22 18.5 24 C20 27 21 30.5 23 30.5 C25.5 30.5 26 24 27.5 19 C28.5 15.8 30 15.5 31.5 18.5 C32.8 21 33.6 24 36 24 L38.5 24"
+   fill="none" stroke="url(#spg)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
