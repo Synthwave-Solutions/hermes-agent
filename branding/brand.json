@@ -1,0 +1,65 @@
+{
+  "brand": "Synthwave Solutions",
+  "tagline_nl": "Breng AI écht in praktijk.",
+  "tagline_en": "Put AI truly into practice.",
+  "mission_nl": "Het versterken van organisaties en individuen om te excelleren in het digitale tijdperk door de kracht van AI te benutten.",
+  "source": "Notion brandbook 'Brand Guidelines Synthwave' + Brand Colors Brand Kit + website portal (docs/PORTAL_BRANDING.md)",
+  "colors": {
+    "primary": "#009dff",
+    "_primary_name": "Dark blue / Wave Blue — THE brand accent (links, CTAs, active, KPI/section accents)",
+    "synthwave_blue": "#48d9fe",
+    "cyan_calm": "#04cbff",
+    "cyan_header": "#25cbfc",
+    "navy": "#0f172a",
+    "navy_light": "#1e293b",
+    "ink": "#1e293b",
+    "grey": "#64748b",
+    "grey_light": "#b5b5b5",
+    "black": "#000000",
+    "surface": "#f8fafc",
+    "card": "#ffffff",
+    "border": "#e2e8f0",
+    "on_navy": "#f8fafc",
+    "on_navy_muted": "#a3b1c6",
+    "wave_soft": "#e6f6ff",
+    "status_ok": "#16a34a",
+    "status_warn": "#d97706",
+    "status_danger": "#dc2626"
+  },
+  "gradients": {
+    "wave": "linear-gradient(135deg, #48d9fe 0%, #009dff 100%)",
+    "wave_hsl": "linear-gradient(135deg, hsl(195 100% 60%) 0%, hsl(210 100% 50%) 100%)",
+    "blue_to_white": "linear-gradient(135deg, #48d9fe 0%, #ffffff 100%)",
+    "navy": "linear-gradient(135deg, #0f172a 0%, #1e293b 100%)"
+  },
+  "fonts": {
+    "heading": "Montserrat",
+    "heading_weight": 700,
+    "body": "Roboto",
+    "body_weights": [
+      400,
+      500,
+      700
+    ],
+    "google_fonts_url": "https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Roboto:wght@400;500;700&display=swap",
+    "heading_stack": "'Montserrat','Helvetica Neue',Arial,sans-serif",
+    "body_stack": "'Roboto','Helvetica Neue',Arial,sans-serif",
+    "office_heading": "Montserrat",
+    "office_body": "Roboto",
+    "note": "Brandbook fonts: Montserrat Bold headings, Roboto body (18-24px). Web loads via Google Fonts; Arial/Helvetica is the offline fallback. Office (pptx/docx) sets the font name; install Montserrat/Roboto on the opener for exact rendering."
+  },
+  "logos": {
+    "symbol": "synthwave-symbol.png",
+    "symbol_white": "synthwave-symbol-white.png",
+    "lockup_black": "synthwave-logo.png",
+    "wavemark_svg": "wavemark.svg",
+    "wordmark_text": "synthwave",
+    "usage": "ALWAYS the COLOURED wave-swirl (Michaël, 2026-06-10): use symbol (synthwave-symbol.png, blue/cyan swirl) on every background incl. navy/dark; never the white or monochrome variant. On light docs the full-colour lockup (synthwave-logo.png: coloured swirl + black wordmark) is also fine."
+  },
+  "radius": "0.75rem",
+  "shadow_card": "0 4px 24px -6px rgba(30,41,59,.10)",
+  "rules": {
+    "no_orange": "NO orange/neon as branding. Amber (#d97706) only as a warning STATUS, never decoratively. Koningsdag orange is a manual seasonal exception.",
+    "personality": "minimalism + vintage-modern; empowering, accessible-yet-expert, pragmatic, human."
+  }
+}

@@ -1,3 +1,11 @@
+<!-- ───────────────────────────────────────────────────────────────────────────
+  Synthwave Solutions fork — the engine behind the SynthPulse Agentic Workstation.
+  Clean fork (no upstream source edits); see SYNTHPULSE.md. Deploy template:
+  https://github.com/Synthwave-Solutions/synthpulse-agentic-workstation
+─────────────────────────────────────────────────────────────────────────── -->
+> **⚡ Synthwave Solutions fork** — engine for the **[SynthPulse Agentic Workstation](SYNTHPULSE.md)**.
+> Kept upstream-mergeable; branding lives in `SYNTHPULSE.md` + `branding/`. Original Hermes Agent docs follow.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
