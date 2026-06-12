@@ -1,0 +1,11 @@
+<svg viewBox="0 0 48 48" role="img" aria-label="Synthwave Solutions" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="sw-wave-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="hsl(195, 100%, 60%)"/>
+      <stop offset="100%" stop-color="hsl(210, 100%, 50%)"/>
+    </linearGradient>
+  </defs>
+  <circle cx="24" cy="24" r="21" fill="none" stroke="url(#sw-wave-grad)" stroke-width="2.4" opacity="0.45"/>
+  <path d="M14 30c2.8-5 7-7 10-3.5 2.4 2.8 6 2.2 8.5-1.5" fill="none" stroke="url(#sw-wave-grad)" stroke-width="3.2" stroke-linecap="round"/>
+  <path d="M15.5 19c2.5-3.7 5.8-3.2 8.2-.6 2.6 2.9 6.4 1.4 9-2.6" fill="none" stroke="url(#sw-wave-grad)" stroke-width="3.2" stroke-linecap="round" opacity="0.85"/>
+</svg>
