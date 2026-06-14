@@ -50,8 +50,8 @@ export const es: Translations = {
   },
 
   app: {
-    brand: "Hermes Agent",
-    brandShort: "HA",
+    brand: "SynthPulse",
+    brandShort: "SP",
     closeNavigation: "Cerrar navegación",
     closeModelTools: "Cerrar modelo y herramientas",
     footer: {
@@ -120,8 +120,8 @@ export const es: Translations = {
     starting: "Iniciando",
     startedInBackground: "Iniciado en segundo plano — revisa los registros para ver el progreso",
     stopped: "Detenido",
-    updateHermes: "Actualizar Hermes",
-    updatingHermes: "Actualizando Hermes…",
+    updateHermes: "Actualizar SynthPulse",
+    updatingHermes: "Actualizando SynthPulse…",
     waitingForOutput: "Esperando salida…",
   },
 
@@ -319,7 +319,7 @@ export const es: Translations = {
     enableRuntime: "Habilitar",
     forceReinstall: "Forzar reinstalación (eliminar carpeta existente primero)",
     headline:
-      "Descubre, instala, habilita y actualiza complementos de Hermes (equivalente a `hermes plugins`).",
+      "Descubre, instala, habilita y actualiza complementos de SynthPulse (equivalente a `sp-engine plugins`).",
     identifierLabel: "URL de Git u owner/repo",
     inactive: "inactivo",
     installBtn: "Instalar",
@@ -484,11 +484,11 @@ export const es: Translations = {
   achievements: {
     hero: {
       kicker: "Agentic Gamerscore",
-      title: "Hermes Achievements",
+      title: "SynthPulse Achievements",
       subtitle:
-        "Insignias coleccionables de Hermes ganadas a partir del historial real de sesiones. Los logros conocidos no completados se muestran como Descubiertos; los logros secretos permanecen ocultos hasta que aparece el primer comportamiento coincidente.",
+        "Insignias coleccionables de SynthPulse ganadas a partir del historial real de sesiones. Los logros conocidos no completados se muestran como Descubiertos; los logros secretos permanecen ocultos hasta que aparece el primer comportamiento coincidente.",
       scan_subtitle:
-        "Escaneando el historial de sesiones de Hermes. El primer escaneo puede tardar 5–10 segundos en historiales grandes.",
+        "Escaneando el historial de sesiones de SynthPulse. El primer escaneo puede tardar 5–10 segundos en historiales grandes.",
     },
     actions: {
       rescan: "Volver a escanear",
@@ -503,7 +503,7 @@ export const es: Translations = {
       highest_tier: "Nivel más alto",
       highest_tier_hint: "Copper → Silver → Gold → Diamond → Olympian",
       latest: "Más reciente",
-      latest_hint_empty: "usa Hermes más",
+      latest_hint_empty: "usa SynthPulse más",
       none_yet: "Ninguno aún",
     },
     state: {
@@ -534,10 +534,10 @@ export const es: Translations = {
       tiers_header: "Niveles",
       secret_header: "Logros secretos",
       secret_body:
-        "Los secretos ocultan su disparador exacto. Una vez que Hermes detecta una señal relacionada, la tarjeta pasa a Descubierto y muestra su requisito.",
+        "Los secretos ocultan su disparador exacto. Una vez que SynthPulse detecta una señal relacionada, la tarjeta pasa a Descubierto y muestra su requisito.",
       scan_status_header: "Estado del escaneo",
       scan_status_body:
-        "Hermes está escaneando el historial local una vez, después las tarjetas aparecerán automáticamente. No hay nada bloqueado si tarda unos segundos.",
+        "SynthPulse está escaneando el historial local una vez, después las tarjetas aparecerán automáticamente. No hay nada bloqueado si tarda unos segundos.",
       what_scanned_header: "Qué se escanea",
       what_scanned_body:
         "Sesiones, llamadas a herramientas, metadatos del modelo, errores, logros y estado de desbloqueo local.",
@@ -584,7 +584,7 @@ export const es: Translations = {
         "Compartir en X abre una publicación predefinida en una nueva pestaña. Haz clic primero en Copiar imagen si quieres adjuntar la insignia 1200×630: X te permite pegarla directamente en el redactor del tuit. Descargar PNG guarda el archivo para usarlo en cualquier lugar.",
       clipboard_unsupported:
         "Este navegador no admite copiar imágenes al portapapeles: usa Descargar en su lugar.",
-      tweet_text: "Just unlocked {tier_part}\"{name}\" in Hermes Agent ☤",
+      tweet_text: "Just unlocked {tier_part}\"{name}\" in SynthPulse ☤",
     },
   },
   kanban: {

@@ -575,9 +575,9 @@ export default function App() {
                   className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase"
                   style={{ mixBlendMode: "plus-lighter" }}
                 >
-                  Hermes
+                  Synth
                   <br />
-                  Agent
+                  Pulse
                 </Typography>
               </div>
 

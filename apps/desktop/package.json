@@ -1,9 +1,9 @@
 {
   "name": "hermes",
-  "productName": "Hermes",
+  "productName": "SynthPulse",
   "private": true,
   "version": "0.15.1",
-  "description": "Native desktop shell for Hermes Agent.",
+  "description": "Native desktop shell for SynthPulse.",
   "author": "Nous Research",
   "type": "module",
   "main": "electron/main.cjs",
@@ -133,17 +133,17 @@
   "build": {
     "electronVersion": "40.9.3",
     "appId": "com.nousresearch.hermes",
-    "productName": "Hermes",
+    "productName": "SynthPulse",
     "executableName": "Hermes",
     "protocols": [
       {
-        "name": "Hermes Protocol",
+        "name": "SynthPulse Protocol",
         "schemes": [
           "hermes"
         ]
       }
     ],
-    "artifactName": "Hermes-${version}-${os}-${arch}.${ext}",
+    "artifactName": "SynthPulse-${version}-${os}-${arch}.${ext}",
     "icon": "assets/icon",
     "directories": {
       "output": "release"
@@ -184,11 +184,11 @@
       "entitlements": "electron/entitlements.mac.plist",
       "entitlementsInherit": "electron/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "CFBundleDisplayName": "Hermes",
+        "CFBundleDisplayName": "SynthPulse",
         "CFBundleExecutable": "Hermes",
-        "CFBundleName": "Hermes",
-        "NSAudioCaptureUsageDescription": "Hermes uses audio capture for voice conversations.",
-        "NSMicrophoneUsageDescription": "Hermes uses the microphone for voice input and voice conversations."
+        "CFBundleName": "SynthPulse",
+        "NSAudioCaptureUsageDescription": "SynthPulse uses audio capture for voice conversations.",
+        "NSMicrophoneUsageDescription": "SynthPulse uses the microphone for voice input and voice conversations."
       },
       "gatekeeperAssess": false,
       "hardenedRuntime": true,
@@ -198,7 +198,7 @@
       ]
     },
     "dmg": {
-      "title": "Install Hermes",
+      "title": "Install SynthPulse",
       "backgroundColor": "#f5f5f7",
       "iconSize": 96,
       "window": {
@@ -220,7 +220,7 @@
       ]
     },
     "win": {
-      "legalTrademarks": "Hermes",
+      "legalTrademarks": "SynthPulse",
       "target": [
         "nsis",
         "msi"
@@ -230,7 +230,7 @@
     "linux": {
       "category": "Development",
       "maintainer": "Nous Research <support@nousresearch.com>",
-      "synopsis": "Native desktop shell for Hermes Agent.",
+      "synopsis": "Native desktop shell for SynthPulse.",
       "target": [
         "AppImage",
         "deb",
@@ -241,8 +241,8 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
-      "shortcutName": "Hermes",
-      "uninstallDisplayName": "Hermes",
+      "shortcutName": "SynthPulse",
+      "uninstallDisplayName": "SynthPulse",
       "warningsAsErrors": false
     }
   }
