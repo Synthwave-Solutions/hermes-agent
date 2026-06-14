@@ -53,8 +53,8 @@ export const en: Translations = {
   },
 
   app: {
-    brand: "Hermes Agent",
-    brandShort: "HA",
+    brand: "SynthPulse",
+    brandShort: "SP",
     closeNavigation: "Close navigation",
     closeModelTools: "Close model and tools",
     footer: {
@@ -131,9 +131,6 @@ export const en: Translations = {
     platformError: "error",
     recentSessions: "Recent Sessions",
     restartGateway: "Restart Gateway",
-    restartGatewayConfirmMessage:
-      "This restarts the Hermes gateway process. Connected channels and active sessions will reconnect afterward.",
-    restartGatewayConfirmTitle: "Restart gateway?",
     restartingGateway: "Restarting gateway…",
     running: "Running",
     runningRemote: "Running (remote)",
@@ -141,12 +138,8 @@ export const en: Translations = {
     starting: "Starting",
     startedInBackground: "Started in background — check logs for progress",
     stopped: "Stopped",
-    updateHermes: "Update Hermes",
-    updateHermesConfirmMessage:
-      "This runs hermes update and restarts the gateway when it finishes. Active sessions keep their prompt cache until then.",
-    updateHermesConfirmNow: "Update now",
-    updateHermesConfirmTitle: "Update Hermes?",
-    updatingHermes: "Updating Hermes…",
+    updateHermes: "Update SynthPulse",
+    updatingHermes: "Updating SynthPulse…",
     waitingForOutput: "Waiting for output…",
   },
 
@@ -387,7 +380,7 @@ export const en: Translations = {
     enableRuntime: "Enable",
     forceReinstall: "Force reinstall (delete existing folder first)",
     headline:
-      "Discover, install, enable, and update Hermes plugins (`hermes plugins` parity).",
+      "Discover, install, enable, and update SynthPulse plugins (`sp-engine plugins` parity).",
     identifierLabel: "Git URL or owner/repo",
     inactive: "inactive",
     installBtn: "Install",
@@ -504,32 +497,21 @@ export const en: Translations = {
     replaceCurrentValue: "Replace current value ({preview})",
     showValue: "Show real value",
     hideValue: "Hide value",
-    customTitle: "Custom Keys",
-    customHint: "Arbitrary environment variables stored in your .env that Hermes doesn't recognise. Use these to inject env vars for skills, MCP servers, or your own tooling.",
-    customConfigured: "{count} custom key{s} set",
-    addCustomKey: "Add a custom key",
-    customKeyName: "Variable name",
-    customKeyNamePlaceholder: "e.g. MY_SERVICE_API_KEY",
-    add: "Add",
-    invalidKeyName: "Use letters, numbers and underscores only (must start with a letter or underscore).",
   },
 
   oauth: {
     title: "Provider Logins (OAuth)",
     providerLogins: "Provider Logins (OAuth)",
-    description:
-      "{connected} of {total} OAuth providers connected. Use Login for dashboard-supported flows; CLI commands remain available for external or fallback setup.",
+    description: "{connected} of {total} OAuth providers connected. Login flows currently run via the CLI; click Copy command and paste into a terminal to set up.",
     connected: "Connected",
     expired: "Expired",
-    notConnected: "Not connected. Use Login when available, or run {command} in a terminal.",
+    notConnected: "Not connected. Run {command} in a terminal.",
     runInTerminal: "in a terminal.",
     noProviders: "No OAuth-capable providers detected.",
     login: "Login",
     disconnect: "Disconnect",
     managedExternally: "Managed externally",
     copied: "Copied ✓",
-    copyCode: "Copy code",
-    copyFailed: "Could not copy automatically. Select the code and copy it manually.",
     cli: "Copy",
     copyCliCommand: "Copy CLI command (for external / fallback)",
     connect: "Connect",
@@ -574,11 +556,11 @@ export const en: Translations = {
   achievements: {
     hero: {
       kicker: "Agentic Gamerscore",
-      title: "Hermes Achievements",
+      title: "SynthPulse Achievements",
       subtitle:
-        "Collectible Hermes badges earned from real session history. Known unfinished achievements are shown as Discovered; Secret achievements stay hidden until the first matching behavior appears.",
+        "Collectible SynthPulse badges earned from real session history. Known unfinished achievements are shown as Discovered; Secret achievements stay hidden until the first matching behavior appears.",
       scan_subtitle:
-        "Scanning Hermes session history. First scan can take 5–10 seconds on large histories.",
+        "Scanning SynthPulse session history. First scan can take 5–10 seconds on large histories.",
     },
     actions: {
       rescan: "Rescan",
@@ -593,7 +575,7 @@ export const en: Translations = {
       highest_tier: "Highest tier",
       highest_tier_hint: "Copper → Silver → Gold → Diamond → Olympian",
       latest: "Latest",
-      latest_hint_empty: "run Hermes more",
+      latest_hint_empty: "run SynthPulse more",
       none_yet: "None yet",
     },
     state: {
@@ -624,10 +606,10 @@ export const en: Translations = {
       tiers_header: "Tiers",
       secret_header: "Secret achievements",
       secret_body:
-        "Secrets hide their exact trigger. Once Hermes sees a related signal, the card becomes Discovered and shows its requirement.",
+        "Secrets hide their exact trigger. Once SynthPulse sees a related signal, the card becomes Discovered and shows its requirement.",
       scan_status_header: "Scan status",
       scan_status_body:
-        "Hermes is scanning local history once, then cards will appear automatically. Nothing is stuck if this takes a few seconds.",
+        "SynthPulse is scanning local history once, then cards will appear automatically. Nothing is stuck if this takes a few seconds.",
       what_scanned_header: "What is scanned",
       what_scanned_body:
         "Sessions, tool calls, model metadata, errors, achievements, and local unlock state.",
@@ -674,7 +656,7 @@ export const en: Translations = {
         "Share on X opens a pre-filled post in a new tab. Click Copy image first if you want the 1200×630 badge attached — X lets you paste it right into the tweet composer. Download PNG saves the file for use anywhere.",
       clipboard_unsupported:
         "Clipboard image copy not supported in this browser — use Download instead.",
-      tweet_text: "Just unlocked {tier_part}\"{name}\" in Hermes Agent ☤",
+      tweet_text: "Just unlocked {tier_part}\"{name}\" in SynthPulse ☤",
     },
   },
 
