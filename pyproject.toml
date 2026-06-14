@@ -294,6 +294,11 @@ all = [
 ]
 
 [project.scripts]
+# SynthPulse-branded entrypoints (primary). The hermes* names are kept as
+# backward-compatible aliases so existing installs / scripts keep working.
+sp-engine = "hermes_cli.main:main"
+sp-engine-agent = "run_agent:main"
+sp-engine-acp = "acp_adapter.entry:main"
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
