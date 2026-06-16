@@ -23,3 +23,11 @@ createRoot(document.getElementById("root")!).render(
     </I18nProvider>
   </BrowserRouter>,
 );
+
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js").catch((error) => {
+      console.warn("Synthwave Control service worker registration failed", error);
+    });
+  });
+}

@@ -267,3 +267,417 @@ code { font-size: 0.875rem; }
   display: none;
 }
 
+
+
+/* ============================================================== */
+/* SynthPulse premium design system (merged from the redesign).    */
+/* Appended so the premium tokens + chrome win via the cascade,    */
+/* while keeping any fork-specific rules above as fallback.        */
+/* ============================================================== */
+
+@import 'tailwindcss';
+@import '@nous-research/ui/styles/globals.css';
+
+/* Scan the published design-system bundle so its utility classes survive
+   Tailwind's JIT purge. */
+@source '../node_modules/@nous-research/ui/dist';
+
+/* ------------------------------------------------------------------ */
+/* JetBrains Mono — bundled for the embedded TUI (/chat tab).          */
+/* Gives the terminal a proper monospace font even on systems where    */
+/* the user doesn't have one installed locally; xterm.js picks it up   */
+/* via ChatPage's `fontFamily` option.                                 */
+/* Apache-2.0.                                                         */
+/* ------------------------------------------------------------------ */
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts-terminal/JetBrainsMono-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts-terminal/JetBrainsMono-Bold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts-terminal/JetBrainsMono-Italic.woff2') format('woff2');
+}
+
+/* ------------------------------------------------------------------ */
+/* Synthwave Solutions dashboard skin with the underlying UI design-system tokens applied   */
+/* statically. Mirrors nousnet-web/(hermes-agent)/layout.tsx so the    */
+/* canonical Hermes palette is the default — teal canvas + cream      */
+/* accent — without relying on leva/gsap at runtime.                  */
+/* ------------------------------------------------------------------ */
+
+:root {
+  /* Default Synthwave palette. ThemeProvider can rewrite these at runtime. */
+  --foreground: color-mix(in srgb, #ffffff 0%, transparent);
+  --foreground-base: #ffffff;
+  --foreground-alpha: 0;
+  --midground: color-mix(in srgb, #f8fafc 100%, transparent);
+  --midground-base: #f8fafc;
+  --midground-alpha: 1;
+  --background: color-mix(in srgb, #0f172a 100%, transparent);
+  --background-base: #0f172a;
+  --background-alpha: 1;
+
+  /* Consumed by <Backdrop />; also theme-switchable. */
+  --warm-glow: rgba(0, 157, 255, 0.32);
+  --noise-opacity-mul: 1;
+
+  /* Typography tokens — rewritten by ThemeProvider. Defaults match the
+     system stack so themes that don't override look native. */
+  --theme-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, Arial, system-ui, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+  --theme-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
+    Consolas, monospace;
+  --theme-font-display: var(--theme-font-sans);
+  --theme-base-size: 15px;
+  --theme-line-height: 1.55;
+  --theme-letter-spacing: 0;
+
+  /* Layout tokens. */
+  --radius: 0.75rem;
+  --theme-radius: 0.75rem;
+  --theme-spacing-mul: 1;
+  --theme-density: comfortable;
+}
+
+/* Theme tokens cascade into the document root so every descendant inherits
+   the font stack, base size, and letter spacing without explicit calls. */
+html {
+  font-family: var(--theme-font-sans);
+  font-size: var(--theme-base-size);
+  line-height: var(--theme-line-height);
+  letter-spacing: var(--theme-letter-spacing);
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--theme-font-sans);
+  min-height: 0;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+code, kbd, pre, samp, .font-mono, .font-mono-ui {
+  font-family: var(--theme-font-mono);
+}
+
+/* Density: scale the shadcn spacing utilities via a multiplier. The DS
+   components use `p-N` / `gap-N` / `space-*` classes which resolve against
+   Tailwind's spacing scale; multiplying `--spacing` at :root scales them
+   all proportionally in Tailwind v4. */
+@theme inline {
+  --spacing: calc(0.25rem * var(--theme-spacing-mul, 1));
+}
+
+#root {
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+/* Nousnet's hermes-agent layout bumps `small` and `code` to readable
+   dashboard sizes. Keep in sync. */
+small { font-size: 1.0625rem; }
+code { font-size: 0.875rem; }
+
+/* Shadcn-compat tokens.
+   The dashboard's page code predates the Nous DS and uses shadcn-style
+   utility classes (bg-card, text-muted-foreground, border-border, etc.)
+   extensively. Rather than rewrite every call site, we expose those
+   tokens on top of the Nous palette so classes continue to resolve. */
+@theme inline {
+  /* Remap foreground to midground so `text-foreground` / `bg-foreground`
+     stay visible — in LENS_0, `--foreground` itself has alpha 0. */
+  --color-foreground: var(--midground);
+
+  --color-card: color-mix(in srgb, var(--midground-base) 4%, var(--background-base));
+  --color-card-foreground: var(--midground);
+  --color-primary: #009dff;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: color-mix(in srgb, #009dff 11%, var(--background-base));
+  --color-secondary-foreground: var(--midground);
+  --color-muted: color-mix(in srgb, var(--midground-base) 8%, var(--background-base));
+  --color-muted-foreground: color-mix(in srgb, var(--midground-base) 55%, transparent);
+  --color-accent: color-mix(in srgb, #009dff 16%, var(--background-base));
+  --color-accent-foreground: var(--midground);
+  --color-destructive: #fb2c36;
+  --color-destructive-foreground: #ffffff;
+  --color-success: #5db673;
+  --color-warning: #fbbf24;
+  --color-border: color-mix(in srgb, var(--midground-base) 15%, transparent);
+  --color-input: color-mix(in srgb, var(--midground-base) 15%, transparent);
+  --color-ring: var(--midground);
+  --color-popover: color-mix(in srgb, var(--midground-base) 4%, var(--background-base));
+  --color-popover-foreground: var(--midground);
+
+  --radius-sm: calc(var(--theme-radius) - 4px);
+  --radius-md: calc(var(--theme-radius) - 2px);
+  --radius-lg: var(--theme-radius);
+  --radius-xl: calc(var(--theme-radius) + 4px);
+}
+
+
+/* Toast animations used by `components/Toast.tsx`. */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes toast-out {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(16px); }
+}
+
+/* Generic fade + dialog entrance used by popovers and confirm dialogs. */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes dialog-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Hide scrollbar utility — used by the header's overflow-x nav row. */
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Plus-lighter blend used by logos/titles for a subtle glow. */
+.blend-lighter {
+  mix-blend-mode: plus-lighter;
+}
+
+/* System UI-monospace stack — distinct from `font-courier` (Courier
+   Prime), used for dense data readouts where the display font would
+   break the grid. Routes through the theme's mono stack so themes
+   with a different monospace (JetBrains Mono, IBM Plex Mono, etc.)
+   still apply here. */
+.font-mono-ui {
+  font-family: var(--theme-font-mono);
+}
+
+/* Subtle grain overlay for badges. */
+.grain {
+  position: relative;
+}
+.grain::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.12;
+  pointer-events: none;
+  background: repeating-conic-gradient(currentColor 0% 25%, #0000 0% 50%) 0 0 /
+    2px 2px;
+}
+
+/* When a theme provides `assets.bg`, the backdrop's <div> renders it as
+   a CSS background; the default filler <img> is hidden to prevent
+   double-compositing. Unset → initial → empty, so the :not() selector
+   matches and the default image stays visible. */
+:root:not([style*="--theme-asset-bg:"]) .theme-default-filler {
+  display: block;
+}
+:root[style*="--theme-asset-bg:"] .theme-default-filler {
+  display: none;
+}
+
+
+
+/* ------------------------------------------------------------------ */
+/* Synthwave premium shell polish. Keeps imported UI primitives but    */
+/* removes the playful Hermes/Nous display feel from visible chrome.   */
+/* ------------------------------------------------------------------ */
+:root {
+  color-scheme: dark;
+  --synthwave-navy: #0f172a;
+  --synthwave-navy-2: #1e293b;
+  --synthwave-blue: #009dff;
+  --synthwave-blue-soft: #e6f6ff;
+  --synthwave-green: #5db673;
+}
+
+.font-mondwest,
+.font-compressed,
+.font-expanded {
+  font-family: var(--theme-font-sans) !important;
+}
+
+body {
+  background:
+    radial-gradient(circle at 12% -8%, rgba(0, 157, 255, 0.22), transparent 36%),
+    radial-gradient(circle at 88% 2%, rgba(93, 182, 115, 0.12), transparent 30%),
+    linear-gradient(135deg, #07111f 0%, #0f172a 48%, #111827 100%);
+}
+
+::selection {
+  background: rgba(0, 157, 255, 0.36);
+  color: #ffffff;
+}
+
+button, a, input, select, textarea {
+  font-family: var(--theme-font-sans);
+}
+
+[class*="border-current"] {
+  border-color: rgba(148, 163, 184, 0.18);
+}
+
+.text-warning {
+  color: #fbbf24;
+}
+
+.bg-warning, .bg-orange-500, .bg-amber-500 {
+  background-color: #fbbf24;
+}
+
+.text-orange-500, .text-amber-500 {
+  color: #fbbf24;
+}
+
+
+/* Higher-contrast premium dashboard details. */
+.text-muted-foreground\/70 { color: rgba(226, 232, 240, 0.78) !important; }
+.text-muted-foreground\/60 { color: rgba(226, 232, 240, 0.70) !important; }
+.text-muted-foreground\/50 { color: rgba(226, 232, 240, 0.62) !important; }
+.opacity-60 { opacity: 0.78 !important; }
+
+.font-courier {
+  font-family: var(--theme-font-sans) !important;
+}
+
+aside[aria-label="Navigation"] {
+  box-shadow: 24px 0 70px -54px rgba(0, 157, 255, 0.9), inset -1px 0 0 rgba(255,255,255,.04);
+}
+
+nav[aria-label="Navigation"] a,
+nav[aria-label="Navigation"] [role="button"] {
+  letter-spacing: -0.01em;
+}
+
+nav[aria-label="Navigation"] a[aria-current="page"] {
+  background: linear-gradient(90deg, rgba(0, 157, 255, 0.22), rgba(0, 157, 255, 0.05));
+  box-shadow: inset 0 0 0 1px rgba(0, 157, 255, 0.26), 0 14px 36px -26px rgba(0, 157, 255, 0.9);
+}
+
+.bg-card\/80, [class*="bg-card"] {
+  backdrop-filter: blur(22px);
+}
+
+input::placeholder, textarea::placeholder {
+  color: rgba(226, 232, 240, 0.52);
+}
+
+[class*="CONNECTED"], .text-success {
+  text-shadow: 0 0 18px rgba(93, 182, 115, 0.22);
+}
+
+/* ------------------------------------------------------------------ */
+/* SynthPulse premium Apple-level typography and chrome.               */
+/* ------------------------------------------------------------------ */
+html, body, #root,
+#root *:not(code):not(kbd):not(pre):not(samp):not(.xterm):not(.xterm *) {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, Arial, Helvetica, "Segoe UI", system-ui, sans-serif !important;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  color: #f8fafc;
+}
+
+h1, h2, h3, h4,
+[role="heading"] {
+  letter-spacing: -0.052em !important;
+  line-height: 1.05 !important;
+  font-weight: 650 !important;
+}
+
+h1 {
+  font-size: clamp(2rem, 2.8vw, 3.4rem) !important;
+}
+
+p, li, a, button, input, textarea, select, small, span {
+  letter-spacing: -0.016em;
+}
+
+button, a {
+  transition: transform .18s ease, background-color .18s ease, border-color .18s ease, box-shadow .18s ease, opacity .18s ease;
+}
+
+button:hover, a:hover {
+  transform: translateY(-0.5px);
+}
+
+aside[aria-label="Navigation"] {
+  backdrop-filter: saturate(170%) blur(26px);
+  -webkit-backdrop-filter: saturate(170%) blur(26px);
+}
+
+aside[aria-label="Navigation"] > div:first-child {
+  min-height: 5.25rem;
+}
+
+nav[aria-label="Navigation"] a {
+  border-radius: 999px !important;
+  margin-inline: .4rem;
+  min-height: 2.35rem;
+  padding-inline: .85rem !important;
+  font-size: .91rem !important;
+  font-weight: 520 !important;
+  letter-spacing: -0.022em !important;
+}
+
+nav[aria-label="Navigation"] a:hover {
+  background: rgba(255, 255, 255, .065) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+}
+
+nav[aria-label="Navigation"] a[aria-current="page"] {
+  background: linear-gradient(90deg, rgba(0,157,255,.25), rgba(0,157,255,.07)) !important;
+  box-shadow: inset 0 0 0 1px rgba(0,157,255,.28), 0 18px 46px -34px rgba(0,157,255,.98) !important;
+}
+
+.text-muted-foreground,
+.text-muted-foreground\/70,
+.text-muted-foreground\/60,
+.text-muted-foreground\/50 {
+  color: #b7c4d6 !important;
+}
+
+.text-xs, small {
+  line-height: 1.42 !important;
+  letter-spacing: -0.01em !important;
+}
+
+[class*="rounded"] {
+  --tw-ring-color: rgba(0,157,255,.46) !important;
+}
+
+.bg-card\/80,
+[class*="bg-card"] {
+  backdrop-filter: saturate(145%) blur(26px);
+  -webkit-backdrop-filter: saturate(145%) blur(26px);
+}
