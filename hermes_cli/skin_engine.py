@@ -642,6 +642,82 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 [#F29C38]⠀⠀⠀⠀⠀⠀⠀⣼⡟⠀⠀⢻⣧⠀⠀⠀⠀⠀⠀⠀⠀[/]
 [dim #7A3511]⠀⠀⠀⠀⠀⠀⠀tail flame lit⠀⠀⠀⠀⠀⠀⠀⠀[/]""",
     },
+    "synthpulse": {
+        "name": "synthpulse",
+        "description": "SynthPulse Agentic Workstation (Wave Blue on Deep Navy)",
+        "colors": {
+            "banner_border": "#009dff",
+            "banner_title": "#3dd3ff",
+            "banner_accent": "#009dff",
+            "banner_dim": "#1e3a5f",
+            "banner_text": "#bfecff",
+            "ui_accent": "#009dff",
+            "ui_label": "#3dd3ff",
+            "ui_ok": "#5db673",
+            "ui_error": "#ef5350",
+            "ui_warn": "#fbbf24",
+            "prompt": "#bfecff",
+            "input_rule": "#009dff",
+            "response_border": "#009dff",
+            "status_bar_bg": "#07111f",
+            "status_bar_text": "#a3b1c6",
+            "status_bar_strong": "#3dd3ff",
+            "status_bar_dim": "#1e3a5f",
+            "status_bar_good": "#5db673",
+            "status_bar_warn": "#fbbf24",
+            "status_bar_bad": "#f59e0b",
+            "status_bar_critical": "#ef5350",
+            "session_label": "#3dd3ff",
+            "session_border": "#1e3a5f",
+            "voice_status_bg": "#07111f",
+            "selection_bg": "#0f2a4a",
+            "completion_menu_bg": "#07111f",
+            "completion_menu_current_bg": "#0f2a4a",
+            "completion_menu_meta_bg": "#07111f",
+            "completion_menu_meta_current_bg": "#0f2a4a",
+        },
+        "spinner": {
+            "waiting_faces": ["(~)", "(^)", "(~^)", "(^^)", "(~~)"],
+            "thinking_faces": ["(~)", "(^)", "(~~)", "(^~)", "(~^)"],
+            "thinking_verbs": [
+                "pulsing", "routing", "tracing the signal", "tuning the stack",
+                "scanning the waveform", "syncing agents", "reading the stream",
+                "amplifying context",
+            ],
+            "wings": [
+                ["~[", "]~"],
+                ["^[", "]^"],
+                ["~^[", "]^~"],
+                ["~~[", "]~~"],
+            ],
+        },
+        "branding": {
+            "agent_name": "SynthPulse",
+            "provider": "SynthPulse",
+            "welcome": "Welcome to SynthPulse! Type your message or /help for commands.",
+            "goodbye": "Goodbye! Keep the pulse going.",
+            "response_label": " ~ SynthPulse ",
+            "prompt_symbol": "~",
+            "help_header": "(~) Available Commands",
+        },
+        "tool_prefix": "~",
+        "banner_logo": """[bold #009dff]███████╗██╗   ██╗███╗   ██╗████████╗██╗  ██╗       ██████╗ ██╗   ██╗██╗     ███████╗███████╗[/]
+[bold #009dff]██╔════╝╚██╗ ██╔╝████╗  ██║╚══██╔══╝██║  ██║      ██╔══██╗██║   ██║██║     ██╔════╝██╔════╝[/]
+[#3dd3ff]███████╗ ╚████╔╝ ██╔██╗ ██║   ██║   ███████║█████╗██████╔╝██║   ██║██║     ███████╗█████╗  [/]
+[#3dd3ff]╚════██║  ╚██╔╝  ██║╚██╗██║   ██║   ██╔══██║╚════╝██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝  [/]
+[#0a93ff]███████║   ██║   ██║ ╚████║   ██║   ██║  ██║      ██║     ╚██████╔╝███████╗███████║███████╗[/]
+[#0a93ff]╚══════╝   ╚═╝   ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝       ╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝[/]""",
+        "banner_hero": """[#009dff]⠀⠀⠀⢀⣠⣤⣤⣶⣶⣶⣤⣤⣄⡀⠀⠀⠀[/]
+[#009dff]⠀⠀⣴⡿⠛⠉⠉⠉⠉⠉⠉⠛⢿⣦⠀⠀[/]
+[#3dd3ff]⠀⢼⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣧⠀[/]
+[#3dd3ff]⢠⣿⠁⠀⣰⡄⠀⠀⠀⣠⣦⠀⠘⣿⡄[/]
+[#3dd3ff]⢸⣿⠀⠀⣿⢿⣦⣠⣾⠟⣿⡆⠀⣿⡇[/]
+[#0a93ff]⢸⣿⠀⠀⠹⣿⠏⠿⠋⠀⢸⣿⠀⣿⡇[/]
+[#0a93ff]⠘⣿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⠃[/]
+[#0a93ff]⠀⠙⢿⣷⣦⣤⣤⣤⣤⣴⣾⡿⠋⠀⠀[/]
+[#009dff]⠀⠀⠀⠈⠙⠛⠿⠿⠛⠋⠁⠀⠀⠀⠀[/]
+[dim #1e293b]⠀⠀wave · pulse · flow⠀⠀[/]""",
+    },
 }
 
 
@@ -650,7 +726,7 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
 # =============================================================================
 
 _active_skin: Optional[SkinConfig] = None
-_active_skin_name: str = "default"
+_active_skin_name: str = "synthpulse"
 
 
 def _skins_dir() -> Path:
