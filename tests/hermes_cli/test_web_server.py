@@ -258,6 +258,18 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_get_status(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "version" in data
+        assert "hermes_home" in data
+        assert "active_sessions" in data
+        assert data["can_update_hermes"] is True
+
     @pytest.mark.requires_wal
     def test_get_sessions_poll_preserves_pending_wal(self):
         """Repeated GET-only polls must not checkpoint another writer's WAL."""
@@ -4200,6 +4212,24 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     gateway_url = env.get("HERMES_TUI_GATEWAY_URL", "")
     assert gateway_url.startswith("ws://127.0.0.1:9119/api/ws?")
     assert "token=" in gateway_url
+
+
+def test_resolve_chat_argv_injects_dashboard_governance_context(monkeypatch):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+    from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    payload = '{"access":{"mode":"enforce"}}'
+
+    _argv, _cwd, env = ws._resolve_chat_argv(governance_context_env=payload)
+
+    assert env is not None
+    assert env[GOVERNANCE_CONTEXT_ENV] == payload
 
 
 class TestDashboardPluginStaticAssetAllowlist:
