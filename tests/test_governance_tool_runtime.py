@@ -22,6 +22,7 @@ def _access(
     file_denied_globs=(),
     cli_commands=(),
     cli_workdir_roots=(),
+    usage_caps=None,
 ) -> EffectiveAccess:
     grants = GrantSet(
         tools=frozenset(tools),
@@ -33,6 +34,7 @@ def _access(
         file_denied_globs=frozenset(file_denied_globs),
         cli_commands=frozenset(cli_commands),
         cli_workdir_roots=frozenset(cli_workdir_roots),
+        usage_caps=dict(usage_caps or {}),
     )
     return EffectiveAccess(
         subject=GovernanceSubject(email="operator@example.test"),
@@ -272,3 +274,57 @@ class TestGovernanceToolDispatch:
 
         assert result["error"] == "Tool denied by dashboard governance: cli_command_not_allowed"
         assert result["governance"]["tool"] == "terminal"
+
+    def test_enforce_mode_blocks_tool_call_after_daily_cap(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["web_search"], usage_caps={"daily_tool_calls": 1}),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "web")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="web", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            first = json.loads(model_tools.handle_function_call("web_search", {"query": "one"}))
+            second = json.loads(model_tools.handle_function_call("web_search", {"query": "two"}))
+
+        assert first == {"ok": True}
+        assert second["error"] == "Tool denied by dashboard governance: daily_tool_calls_exceeded"
+        assert second["governance"]["tool"] == "web_search"
+
+    def test_enforce_mode_blocks_file_write_after_daily_cap(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        allowed_root = tmp_path / "allowed"
+        allowed_root.mkdir()
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(
+                tools=["write_file"],
+                file_write_roots=[str(allowed_root)],
+                usage_caps={"daily_file_writes": 1},
+            ),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "file")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="file", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            first = json.loads(model_tools.handle_function_call("write_file", {"path": str(allowed_root / "one.txt"), "content": "x"}))
+            second = json.loads(model_tools.handle_function_call("write_file", {"path": str(allowed_root / "two.txt"), "content": "x"}))
+
+        assert first == {"ok": True}
+        assert second["error"] == "Tool denied by dashboard governance: daily_file_writes_exceeded"
+        assert second["governance"]["tool"] == "write_file"
