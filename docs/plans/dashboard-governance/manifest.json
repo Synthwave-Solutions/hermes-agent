@@ -1,0 +1,14 @@
+{
+  "folder": "/home/synthwavehq/work/hermes-webui-governance-build",
+  "files": [
+    "01-research-findings.md",
+    "02-governance-architecture.md",
+    "03-policy-schema.yaml",
+    "04-admin-ui-spec.md",
+    "05-implementation-plan.md",
+    "06-test-rollout-plan.md",
+    "07-route-enforcement-map.md",
+    "README.md"
+  ],
+  "count": 8
+}

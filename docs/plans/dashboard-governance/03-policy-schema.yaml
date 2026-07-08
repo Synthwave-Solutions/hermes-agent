@@ -1,0 +1,364 @@
+# 03. Proposed whitelist-first governance policy for Hermes Dashboard
+# Location: ~/.hermes/dashboard-governance.yaml
+# Secrets must NOT be stored here. SSO/OIDC client secrets stay in .env.
+
+version: 1
+mode: enforce                 # off | report_only | enforce
+default_effect: deny          # v1 only supports deny-by-default
+
+bootstrap_admins:
+  - michael@synthwave.solutions
+
+identity:
+  provider: google            # google | oidc | trusted_header | local_dev
+  allowed_domains:
+    - synthwave.solutions
+  claims:
+    email: email
+    display_name: name
+    roles: roles              # supports nested e.g. user.roles
+    groups: groups            # supports nested e.g. user.memberOf
+  group_sync:
+    enabled: true
+    strict: true              # remove local memberships not present in IdP claims
+    jit_create_groups: false  # safer default; admin creates mappable groups first
+    claim_separator: ","
+  role_sync:
+    enabled: true
+    allowed_roles:
+      - hermes-user
+      - hermes-admin
+    admin_roles:
+      - hermes-admin
+
+# Global resource catalogs. Admin UI can populate these from runtime discovery.
+catalogs:
+  profiles:
+    source: hermes_profiles
+  skills:
+    source: hermes_skills
+  mcp_servers:
+    source: hermes_config_mcp_servers
+  tools:
+    source: hermes_tool_registry
+  models:
+    source: hermes_model_catalog
+  settings:
+    source: hermes_config_schema
+
+roles:
+  owner:
+    description: Full dashboard owner. Use sparingly.
+    grants:
+      routes: ["*"]
+      profiles: ["*"]
+      permissions: ["*"]
+      settings: ["*"]
+      models:
+        providers: ["*"]
+        models: ["*"]
+      tools:
+        builtins: ["*"]
+        toolsets: ["*"]
+      mcp:
+        servers: ["*"]
+        tools: ["*"]
+      skills:
+        view: ["*"]
+        load: ["*"]
+        manage: ["*"]
+      files:
+        read_roots: ["*"]
+        write_roots: ["*"]
+      cli:
+        commands: ["*"]
+      usage_caps:
+        daily_usd: null
+        monthly_usd: null
+
+  operator:
+    description: Operational user with constrained profiles and tools.
+    grants:
+      routes:
+        - /api/status
+        - /api/auth/me
+        - /api/governance/me
+        - /api/profiles
+        - /api/sessions
+        - /api/skills
+        - /api/tools/toolsets
+        - /api/mcp
+        - /api/model/info
+        - /api/model/options
+        - /api/analytics
+        - /api/logs
+      profiles:
+        - default
+        - eng-ops
+      permissions:
+        - chat:use
+        - sessions:read
+        - logs:read
+        - analytics:read
+        - skills:read
+        - mcp:read
+        - model:read
+        - files:read
+        - files:write
+        - terminal:run
+      settings:
+        read:
+          - model.default
+          - model.provider
+          - terminal.backend
+          - terminal.cwd
+          - agent.max_turns
+        write: []
+      models:
+        providers:
+          - openrouter
+          - anthropic
+        models:
+          - anthropic/claude-sonnet-4
+          - anthropic/claude-haiku-4
+          - openai/gpt-5.5
+        capabilities:
+          tools: true
+          vision: false
+          reasoning: true
+        max_context_tokens: 400000
+        max_output_tokens: 12000
+      tools:
+        toolsets:
+          - web
+          - file
+          - terminal
+          - skills
+          - session_search
+        builtins:
+          - web_search
+          - web_extract
+          - read_file
+          - search_files
+          - write_file
+          - patch
+          - terminal
+          - skill_view
+          - skills_list
+      mcp:
+        servers:
+          - n8n_local
+          - notion_ops
+        tools:
+          n8n_local:
+            - search_workflows
+            - get_workflow_details
+            - execute_workflow
+          notion_ops:
+            - search_pages
+            - get_page_markdown
+        sampling:
+          enabled: false
+      skills:
+        view:
+          - hermes-agent
+          - native-mcp
+          - google-workspace
+          - senior-engineering
+        load:
+          - hermes-agent
+          - native-mcp
+        manage: []
+      files:
+        read_roots:
+          - /home/synthwavehq/work
+          - /home/synthwavehq/ObsidianVault/20_Projects
+        write_roots:
+          - /home/synthwavehq/work
+        denied_globs:
+          - "**/.env"
+          - "**/auth.json"
+          - "**/*secret*"
+      cli:
+        default_shell: bash
+        workdir_roots:
+          - /home/synthwavehq/work
+        allow_shell_operators: false
+        commands:
+          - id: git-readonly
+            argv0: git
+            subcommands: [status, diff, log, show, branch]
+          - id: pytest
+            argv0: python
+            pattern: "^-m pytest( |$)"
+          - id: npm-readonly
+            argv0: npm
+            subcommands: [test, run]
+          - id: node-readonly
+            argv0: node
+            pattern: "^--version$|^-v$"
+        forbidden_patterns:
+          - "sudo"
+          - "rm -rf"
+          - "systemctl"
+          - "hermes gateway restart"
+          - 'curl .*\|.*sh'
+      usage_caps:
+        daily_usd: 5.0
+        monthly_usd: 75.0
+        daily_model_tokens: 2000000
+        daily_tool_calls: 500
+        daily_terminal_seconds: 900
+        max_background_processes: 2
+
+  viewer:
+    description: Read-only dashboard user.
+    grants:
+      routes:
+        - /api/status
+        - /api/auth/me
+        - /api/governance/me
+        - /api/profiles
+        - /api/sessions
+        - /api/analytics
+      profiles:
+        - default
+      permissions:
+        - sessions:read
+        - analytics:read
+      models:
+        providers: []
+        models: []
+      tools:
+        toolsets: []
+        builtins: []
+      mcp:
+        servers: []
+        tools: {}
+      skills:
+        view: []
+        load: []
+        manage: []
+      files:
+        read_roots: []
+        write_roots: []
+      cli:
+        commands: []
+      usage_caps:
+        daily_usd: 0
+        monthly_usd: 0
+
+# Groups may be manually defined and optionally synced from SSO group claims.
+groups:
+  sw-hermes-admins:
+    description: Admins managed from Google Workspace / IdP group claim.
+    sso_groups:
+      - hermes-admins
+      - gcp-hermes-admins
+    roles: [owner]
+    share_visibility: no_one
+
+  sw-engineering-ops:
+    description: Engineering operations group.
+    sso_groups:
+      - engineering
+      - hermes-eng-ops
+    roles: [operator]
+    grants:
+      profiles:
+        - eng-ops
+      skills:
+        view:
+          - senior-engineering
+          - systematic-debugging
+          - test-driven-development
+        load:
+          - senior-engineering
+          - systematic-debugging
+      mcp:
+        servers:
+          - github
+          - n8n_local
+      settings:
+        read:
+          - delegation.*
+          - terminal.*
+        write:
+          - agent.max_turns
+
+  sw-readonly-audit:
+    description: Read-only auditors.
+    sso_groups:
+      - auditors
+    roles: [viewer]
+    share_visibility: no_one
+
+users:
+  michael@synthwave.solutions:
+    roles: [owner]
+    groups: [sw-hermes-admins]
+
+  yaser@synthwave.solutions:
+    groups: [sw-engineering-ops]
+    grants:
+      profiles:
+        - default
+        - eng-ops
+
+resources:
+  profiles:
+    default:
+      label: Default profile
+      sensitivity: internal
+    eng-ops:
+      label: Engineering Ops
+      sensitivity: high
+    client-support:
+      label: Client Support
+      sensitivity: client_data
+
+  folders:
+    work:
+      path: /home/synthwavehq/work
+      sensitivity: internal
+    obsidian-projects:
+      path: /home/synthwavehq/ObsidianVault/20_Projects
+      sensitivity: high
+
+  settings_catalog_overrides:
+    approvals.mode:
+      sensitivity: critical
+      write_permission: governance:security_settings:write
+    terminal.backend:
+      sensitivity: critical
+      write_permission: governance:terminal_settings:write
+    mcp_servers.*:
+      sensitivity: critical
+      write_permission: governance:mcp_settings:write
+    model.*:
+      sensitivity: cost_data
+      write_permission: model:write
+
+admin_ui:
+  enabled: true
+  preview_access: true
+  policy_editor: true
+  report_only_diff: true
+  require_reauth_for_sensitive_changes: true
+
+audit:
+  enabled: true
+  file: ~/.hermes/dashboard-governance.audit.jsonl
+  redact:
+    command_args: true
+    env_values: true
+    file_content: true
+  retention_days: 180
+
+usage:
+  enabled: true
+  db: ~/.hermes/dashboard-governance.usage.sqlite
+  warn_thresholds: [0.8, 0.9, 1.0]
+  windows:
+    daily: UTC
+    monthly: UTC
