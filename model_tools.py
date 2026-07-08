@@ -366,6 +366,31 @@ def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any])
         return None
 
 
+def _governance_usage_decision(tool_name: str):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.usage import check_usage_caps
+        return check_usage_caps(ctx, tool_name)
+    except Exception as exc:
+        logger.debug("dashboard governance usage cap check failed for %s: %s", tool_name, exc)
+        try:
+            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_usage_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+def _governance_record_tool_usage(tool_name: str) -> None:
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.usage import record_tool_usage
+        record_tool_usage(ctx, tool_name)
+    except Exception as exc:
+        logger.debug("dashboard governance usage recording failed for %s: %s", tool_name, exc)
+
+
 def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ctx = _current_dashboard_governance_context()
     if ctx is None or getattr(ctx.access, "mode", "off") != "enforce":
@@ -1443,6 +1468,19 @@ def handle_function_call(
             },
         }, ensure_ascii=False)
 
+    _usage_decision = _governance_usage_decision(function_name)
+    if _usage_decision is not None and not _usage_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        return json.dumps({
+            "error": f"Tool denied by dashboard governance: {_usage_decision.reason}",
+            "governance": {
+                "mode": _governance_mode,
+                "tool": function_name,
+                "reason": _usage_decision.reason,
+            },
+        }, ensure_ascii=False)
+
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
         try:
@@ -1627,6 +1665,7 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        _governance_record_tool_usage(function_name)
 
         _emit_post_tool_call_hook(
             function_name=function_name,
