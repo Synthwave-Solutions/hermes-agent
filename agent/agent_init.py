@@ -490,6 +490,27 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _enforce_dashboard_governance_model_policy(agent) -> None:
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.model_policy import decide_model_access
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return
+        decision = decide_model_access(ctx.access, provider=agent.provider, model=agent.model)
+    except Exception as exc:
+        try:
+            ctx = current_governance_context()  # type: ignore[name-defined]
+            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+                raise PermissionError("dashboard governance denied model: governance_model_policy_error") from exc
+        except NameError:
+            pass
+        return
+    if not decision.allowed:
+        raise PermissionError(f"dashboard governance denied model: {decision.reason}")
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -744,6 +765,8 @@ def init_agent(
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
     except Exception:
         pass
+
+    _enforce_dashboard_governance_model_policy(agent)
 
     # GPT-5.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still

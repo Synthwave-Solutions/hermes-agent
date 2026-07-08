@@ -190,3 +190,106 @@ def test_policy_route_allows_governance_reader(governed_client, isolated_profile
     body = resp.json()
     assert body["policy"]["mode"] == "enforce"
     assert body["effective_access"]["permissions"] == ["governance:read"]
+
+
+def test_model_options_are_filtered_by_provider_and_model_grants(
+    governed_client, isolated_profiles, monkeypatch
+):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["model:read"],
+            "profiles": ["default"],
+            "routes": ["/api/model/options"],
+            "models": {
+                "providers": ["openrouter"],
+                "models": ["anthropic/claude-sonnet-4.6"],
+            },
+        },
+    )
+    _login(governed_client)
+
+    def fake_payload(*_args, **_kwargs):
+        return {
+            "providers": [
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "models": ["anthropic/claude-sonnet-4.6", "openai/gpt-5.5"],
+                    "authenticated": True,
+                },
+                {
+                    "slug": "anthropic",
+                    "name": "Anthropic",
+                    "models": ["claude-opus-4-6"],
+                    "authenticated": True,
+                },
+            ]
+        }
+
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: {})
+    monkeypatch.setattr("hermes_cli.inventory.build_models_payload", fake_payload)
+
+    resp = governed_client.get("/api/model/options")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [provider["slug"] for provider in body["providers"]] == ["openrouter"]
+    assert body["providers"][0]["models"] == ["anthropic/claude-sonnet-4.6"]
+
+
+def test_model_set_blocks_ungranted_provider_model(
+    governed_client, isolated_profiles, monkeypatch
+):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["model:write"],
+            "profiles": ["default"],
+            "routes": ["/api/model/set"],
+            "models": {
+                "providers": ["openrouter"],
+                "models": ["anthropic/claude-sonnet-4.6"],
+            },
+        },
+    )
+    _login(governed_client)
+    monkeypatch.setattr("hermes_cli.model_cost_guard.expensive_model_warning", lambda *_a, **_k: None)
+
+    resp = governed_client.post(
+        "/api/model/set",
+        json={"scope": "main", "provider": "anthropic", "model": "claude-opus-4-6"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["reason"] == "model_provider_not_allowed"
+
+
+def test_model_set_allows_granted_provider_model(
+    governed_client, isolated_profiles, monkeypatch
+):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["model:write"],
+            "profiles": ["default"],
+            "routes": ["/api/model/set"],
+            "models": {
+                "providers": ["openrouter"],
+                "models": ["anthropic/claude-sonnet-4.6"],
+            },
+        },
+    )
+    _login(governed_client)
+    monkeypatch.setattr("hermes_cli.model_cost_guard.expensive_model_warning", lambda *_a, **_k: None)
+
+    resp = governed_client.post(
+        "/api/model/set",
+        json={"scope": "main", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["provider"] == "openrouter"
+    assert body["model"] == "anthropic/claude-sonnet-4.6"
