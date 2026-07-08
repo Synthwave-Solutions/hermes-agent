@@ -4175,7 +4175,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 
 
 @app.get("/api/model/options")
-def get_model_options(profile: Optional[str] = None, refresh: bool = False):
+def get_model_options(request: Request, profile: Optional[str] = None, refresh: bool = False):
     """Return authenticated providers + their curated model lists.
 
     REST equivalent of the ``model.options`` JSON-RPC on tui_gateway, so the
@@ -4203,7 +4203,7 @@ def get_model_options(profile: Optional[str] = None, refresh: bool = False):
         # `auth_type`/`key_env`/`warning` so the GUI can render a setup
         # affordance instead of hiding the provider entirely.
         with _profile_scope(profile):
-            return build_models_payload(
+            payload = build_models_payload(
                 load_picker_context(),
                 include_unconfigured=True,
                 picker_hints=True,
@@ -4212,6 +4212,11 @@ def get_model_options(profile: Optional[str] = None, refresh: bool = False):
                 capabilities=True,
                 refresh=bool(refresh),
             )
+        access = getattr(request.state, "governance_access", None)
+        if access is not None:
+            from hermes_cli.dashboard_governance.model_policy import filter_model_options_payload
+            payload = filter_model_options_payload(payload, access)
+        return payload
     except HTTPException:
         raise
     except Exception:
@@ -4403,7 +4408,7 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
 
 
 @app.post("/api/model/set")
-async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = None):
+async def set_model_assignment(body: ModelAssignment, request: Request, profile: Optional[str] = None):
     """Assign a model to the main slot or an auxiliary task slot.
 
     Writes to ``~/.hermes/config.yaml`` — applies to **new** sessions only.
@@ -4449,10 +4454,12 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                     "confirm_message": warning.message,
                 }
 
+        access = getattr(request.state, "governance_access", None)
+
         def _apply_assignment():
             with _profile_scope(body.profile or profile):
                 return _apply_model_assignment_sync(
-                    scope, provider, model, task, base_url, api_key
+                    scope, provider, model, task, base_url, api_key, governance_access=access
                 )
 
         return await asyncio.to_thread(_apply_assignment)
@@ -4464,7 +4471,13 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
 
 
 def _apply_model_assignment_sync(
-    scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
+    scope: str,
+    provider: str,
+    model: str,
+    task: str,
+    base_url: str,
+    api_key: str = "",
+    governance_access=None,
 ):
     """Synchronous body of POST /api/model/set.
 
@@ -4474,10 +4487,23 @@ def _apply_model_assignment_sync(
     """
     cfg = load_config()
 
+    def _ensure_model_allowed(target_provider: str, target_model: str) -> None:
+        if governance_access is None:
+            return
+        from hermes_cli.dashboard_governance.model_policy import decide_model_access
+        decision = decide_model_access(
+            governance_access,
+            provider=target_provider,
+            model=target_model,
+        )
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail={"reason": decision.reason})
+
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
         provider, model = _normalize_main_model_assignment(provider, model)
+        _ensure_model_allowed(provider, model)
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -4596,6 +4622,7 @@ def _apply_model_assignment_sync(
 
     if not provider:
         raise HTTPException(status_code=400, detail="provider required for auxiliary")
+    _ensure_model_allowed(provider, model)
 
     targets = [task] if task else list(_AUX_TASK_SLOTS)
     for slot in targets:
