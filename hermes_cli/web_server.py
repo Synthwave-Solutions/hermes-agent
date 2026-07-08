@@ -632,6 +632,19 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def _dashboard_governance_gate(request: Request, call_next):
+    """Whitelist-first dashboard governance gate.
+
+    Registered after the plugin runtime gate but before the OAuth/token gates,
+    so middleware execution sees authenticated request.state principals before
+    handlers run while keeping public auth-bootstrap routes reachable.
+    """
+    from hermes_cli.dashboard_governance.enforcement import governance_middleware
+
+    return await governance_middleware(request, call_next)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard OAuth auth gate — engaged only when start_server flags the
 # bind as non-loopback-without-insecure.  No-op pass-through in loopback
@@ -13497,6 +13510,61 @@ from hermes_cli.web_routers.profiles import (  # noqa: E402,F401 — legacy re-e
     describe_profile_auto_endpoint,
 )
 
+@app.get("/api/governance/effective-access")
+@app.get("/api/governance/me")
+async def get_governance_me(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        serialize_effective_access,
+    )
+
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    return {"effective_access": serialize_effective_access(access)}
+
+
+@app.get("/api/governance/policy")
+async def get_governance_policy(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        policy_for_request,
+        safe_policy_payload,
+        serialize_effective_access,
+    )
+
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    return {
+        "policy": safe_policy_payload(policy_for_request(request)),
+        "effective_access": serialize_effective_access(access),
+    }
+
+
+@app.put("/api/governance/policy")
+async def put_governance_policy(request: Request, body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        policy_for_request,
+        safe_policy_payload,
+        serialize_effective_access,
+    )
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, save_governance_policy
+
+    try:
+        path = save_governance_policy(body)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("PUT /api/governance/policy failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    access = effective_access_for_request(request)
+    return {
+        "ok": True,
+        "path": str(path),
+        "policy": safe_policy_payload(policy_for_request(request)),
+        "effective_access": serialize_effective_access(access),
+    }
+
+
 
 
 
@@ -14690,7 +14758,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
+                info = consume_internal_credential(internal)
+                try:
+                    ws.state.auth_info = dict(info)
+                except Exception:
+                    pass
                 return None, "internal"
             except TicketInvalid as exc:
                 audit_log(
@@ -14706,7 +14778,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            try:
+                ws.state.auth_info = dict(info)
+            except Exception:
+                pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14721,6 +14797,13 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     if not token:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        try:
+            ws.state.auth_info = {
+                "user_id": "dashboard-session-token",
+                "provider": "dashboard-token",
+            }
+        except Exception:
+            pass
         return None, "token"
     return "token_mismatch", "token"
 
@@ -14728,6 +14811,63 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 def _ws_auth_ok(ws: "WebSocket") -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
     return _ws_auth_reason(ws)[0] is None
+
+
+def _dashboard_governance_context_env_for_ws(
+    ws: "WebSocket",
+    *,
+    credential: str,
+    profile: Optional[str],
+    resume: Optional[str],
+    channel: Optional[str],
+) -> Optional[str]:
+    """Serialize the accepted WS principal's effective governance for PTY children."""
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext,
+            serialize_context_for_env,
+        )
+        from hermes_cli.dashboard_governance.loader import load_governance_policy
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+
+        loader = getattr(ws.app.state, "governance_policy_loader", None)
+        policy = loader() if callable(loader) else load_governance_policy()
+        if not getattr(policy, "enabled", False):
+            return None
+
+        info = getattr(ws.state, "auth_info", {}) or {}
+        if not isinstance(info, dict):
+            info = {}
+        user_id = str(info.get("user_id") or "")
+        provider = str(info.get("provider") or "")
+        if not user_id and credential == "token":
+            user_id = "dashboard-session-token"
+        if not provider and credential == "token":
+            provider = "dashboard-token"
+        token_scopes = ("dashboard",) if credential in {"token", "internal"} else ()
+        subject = GovernanceSubject(
+            email=user_id if "@" in user_id else "",
+            display_name=user_id,
+            provider=provider,
+            user_id=user_id,
+            token_scopes=token_scopes,
+        )
+        access = resolve_effective_access(policy, subject)
+        requested_profile = (profile or "").strip()
+        active_profile = requested_profile if requested_profile and requested_profile.lower() != "current" else "default"
+        ctx = DashboardGovernanceContext(
+            subject=subject,
+            access=access,
+            active_profile=active_profile,
+            session_id=resume or "",
+            request_id=channel or "",
+        )
+        return serialize_context_for_env(ctx)
+    except Exception:
+        _log.debug("failed to build dashboard governance context for WS child", exc_info=True)
+        return None
+
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -14742,6 +14882,7 @@ def _resolve_chat_argv(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    governance_context_env: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -14841,6 +14982,13 @@ def _resolve_chat_argv(
     if active_session_file:
         env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
 
+    if governance_context_env:
+        try:
+            from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV
+            env[GOVERNANCE_CONTEXT_ENV] = governance_context_env
+        except Exception:
+            _log.debug("Failed to inject dashboard governance context into chat env", exc_info=True)
+
     # Profile-scoped chats must NOT attach to the dashboard's in-memory
     # gateway — it runs under the dashboard's own profile. Without the
     # attach URL, gatewayClient spawns its own `tui_gateway.entry`, which
@@ -14928,6 +15076,7 @@ async def _resolve_chat_argv_async(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    governance_context_env: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv without blocking the dashboard event loop.
 
@@ -14946,6 +15095,8 @@ async def _resolve_chat_argv_async(
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if governance_context_env is not None:
+        kwargs["governance_context_env"] = governance_context_env
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(
@@ -15702,6 +15853,15 @@ async def pty_ws(ws: WebSocket) -> None:
     }
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
+    governance_context_env = _dashboard_governance_context_env_for_ws(
+        ws,
+        credential=cred,
+        profile=profile,
+        resume=resume,
+        channel=channel,
+    )
+    if governance_context_env:
+        resolve_kwargs["governance_context_env"] = governance_context_env
 
     try:
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)

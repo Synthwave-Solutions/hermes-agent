@@ -781,7 +781,7 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {
+    payload = {
         "user_id": sess.user_id,
         "email": sess.email,
         "display_name": sess.display_name,
@@ -789,6 +789,17 @@ async def api_auth_me(request: Request):
         "provider": sess.provider,
         "expires_at": sess.expires_at,
     }
+    try:
+        from hermes_cli.dashboard_governance.enforcement import (
+            effective_access_for_request,
+            serialize_effective_access,
+        )
+
+        access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+        payload["governance"] = serialize_effective_access(access)
+    except Exception:
+        _log.exception("dashboard-auth: failed to attach governance summary to /api/auth/me")
+    return payload
 
 
 # ---------------------------------------------------------------------------
