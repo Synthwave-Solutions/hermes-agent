@@ -3835,6 +3835,68 @@ class TestRunConversation:
         assert result["final_response"] == "Part 1 Part 2"
         assert requested_caps == [65536, 65536]
 
+    def test_truncated_tool_args_with_tool_calls_finish_reason_retries(self, agent):
+        """Routers can hide output-cap truncation behind finish_reason='tool_calls'.
+
+        If tool arguments are cut off but the router reports ``tool_calls``
+        instead of ``length``, Hermes must retry with a larger output budget
+        rather than surfacing the recurring "Response truncated..." error.
+        """
+        self._setup_agent(agent)
+        requested_caps = []
+
+        def _fake_build_api_kwargs(api_messages):
+            ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+            if ephemeral is not None:
+                agent._ephemeral_max_output_tokens = None
+            cap = ephemeral if ephemeral is not None else 4096
+            requested_caps.append(cap)
+            return {"model": agent.model, "messages": api_messages, "max_tokens": cap}
+
+        truncated_tool = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="web_search",
+                    arguments='{"query": "long diagnostic output',
+                    call_id="c1",
+                )
+            ],
+        )
+        retried_tool = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="web_search",
+                    arguments='{"query": "long diagnostic output"}',
+                    call_id="c2",
+                )
+            ],
+        )
+        final = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            truncated_tool,
+            retried_tool,
+            final,
+        ]
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=_fake_build_api_kwargs),
+            patch("run_agent.handle_function_call", return_value="search result") as handle_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert agent.client.chat.completions.create.call_count == 3
+        handle_call.assert_called_once()
+        assert requested_caps[:2] == [4096, 8192]
+
     def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
         """Ollama-hosted GLM responses can misreport truncated output as stop."""
         self._setup_agent(agent)
