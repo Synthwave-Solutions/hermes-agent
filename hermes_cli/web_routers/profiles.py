@@ -775,14 +775,20 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
 
 
 @router.get("/api/profiles")
-async def list_profiles_endpoint():
+async def list_profiles_endpoint(request):
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        filter_profiles_for_access,
+    )
     try:
         profiles = await run_in_threadpool(profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        result = [_profile_to_dict(p) for p in profiles]
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        result = _fallback_profile_dicts(profiles_mod)
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    return {"profiles": filter_profiles_for_access(result, access)}
 
 
 @router.post("/api/profiles")
