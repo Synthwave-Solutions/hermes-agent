@@ -14,8 +14,10 @@ export default function GovernancePage() {
   const [policyText, setPolicyText] = useState("{}");
   const [audit, setAudit] = useState<GovernanceAuditEvent[]>([]);
   const [usage, setUsage] = useState<Record<string, unknown>>({});
+  const [preview, setPreview] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   const canWrite = hasPermission("governance:write");
@@ -54,6 +56,21 @@ export default function GovernancePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canAudit, canUsage]);
 
+  async function previewPolicy() {
+    setPreviewing(true);
+    setMessage(null);
+    try {
+      const parsed = JSON.parse(policyText) as Record<string, unknown>;
+      const res = await api.previewGovernancePolicy(parsed, access?.subject ?? {});
+      setPreview(pretty(res.effective_access));
+      setMessage("Preview updated.");
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
   async function savePolicy() {
     setSaving(true);
     setMessage(null);
@@ -86,9 +103,14 @@ export default function GovernancePage() {
           <section className="rounded-lg border border-current/15 bg-background/60 p-4">
             <div className="mb-3 flex items-center justify-between gap-3">
               <h2 className="font-sans text-display text-sm tracking-[0.12em]">Policy JSON</h2>
-              <Button disabled={!canWrite || saving} onClick={savePolicy} size="sm">
-                {saving ? "Saving…" : "Save policy"}
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button disabled={previewing} onClick={previewPolicy} size="sm">
+                  {previewing ? "Previewing…" : "Preview"}
+                </Button>
+                <Button disabled={!canWrite || saving} onClick={savePolicy} size="sm">
+                  {saving ? "Saving…" : "Save policy"}
+                </Button>
+              </div>
             </div>
             <textarea
               className="min-h-[22rem] w-full rounded border border-current/15 bg-background-base p-3 font-mono text-xs text-text-primary outline-none focus:ring-1 focus:ring-midground disabled:opacity-60"
@@ -98,6 +120,12 @@ export default function GovernancePage() {
               value={policyText}
             />
             {message && <p className="mt-2 text-sm text-text-secondary">{message}</p>}
+            {preview && (
+              <div className="mt-4 rounded border border-current/15 bg-background-base p-3">
+                <h3 className="mb-2 font-sans text-display text-xs tracking-[0.12em] text-text-secondary">Preview for current subject</h3>
+                <pre className="max-h-80 overflow-auto whitespace-pre-wrap font-mono text-xs text-text-secondary">{preview}</pre>
+              </div>
+            )}
           </section>
 
           <section className="grid gap-4 lg:grid-cols-2">

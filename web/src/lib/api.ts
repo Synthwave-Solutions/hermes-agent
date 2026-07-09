@@ -378,6 +378,15 @@ export const api = {
     });
     return res;
   },
+  previewGovernancePolicy: async (
+    policy: Record<string, unknown>,
+    subject: GovernanceEffectiveAccessResponse["subject"],
+  ) =>
+    fetchJSON<GovernancePreviewResponse>("/api/governance/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ policy, subject }),
+    }),
   getGovernanceAudit: (limit = 100) =>
     fetchJSON<GovernanceAuditResponse>(`/api/governance/audit?limit=${limit}`),
   getGovernanceUsage: () => fetchJSON<GovernanceUsageResponse>("/api/governance/usage"),
@@ -2225,6 +2234,12 @@ export interface GovernanceAuditEvent {
 
 export interface GovernanceAuditResponse {
   events: GovernanceAuditEvent[];
+}
+
+export interface GovernancePreviewResponse {
+  ok: boolean;
+  policy: Record<string, unknown>;
+  effective_access: GovernanceEffectiveAccessResponse;
 }
 
 export interface GovernanceUsageResponse {

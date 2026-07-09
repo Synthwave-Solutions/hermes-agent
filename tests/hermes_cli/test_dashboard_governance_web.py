@@ -192,6 +192,52 @@ def test_policy_route_allows_governance_reader(governed_client, isolated_profile
     assert body["effective_access"]["permissions"] == ["governance:read"]
 
 
+def test_governance_preview_returns_effective_access_without_saving(governed_client, isolated_profiles):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["governance:preview"],
+            "profiles": ["default"],
+            "routes": ["/api/governance/preview"],
+        },
+    )
+    _login(governed_client)
+    policy_path = isolated_profiles["default"] / "dashboard-governance.yaml"
+    before = policy_path.read_text(encoding="utf-8")
+
+    resp = governed_client.post(
+        "/api/governance/preview",
+        json={
+            "policy": {
+                "version": 1,
+                "mode": "enforce",
+                "default_effect": "deny",
+                "users": {
+                    "operator@example.test": {
+                        "grants": {
+                            "permissions": ["files:read"],
+                            "profiles": ["worker_alpha"],
+                            "routes": ["/api/files"],
+                        }
+                    }
+                },
+            },
+            "subject": {
+                "email": "operator@example.test",
+                "provider": "stub",
+                "user_id": "operator-1",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["effective_access"]["mode"] == "enforce"
+    assert body["effective_access"]["permissions"] == ["files:read"]
+    assert body["effective_access"]["profiles"] == ["worker_alpha"]
+    assert policy_path.read_text(encoding="utf-8") == before
+
+
 def test_model_options_are_filtered_by_provider_and_model_grants(
     governed_client, isolated_profiles, monkeypatch
 ):
