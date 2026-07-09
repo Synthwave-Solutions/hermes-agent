@@ -192,6 +192,86 @@ def test_policy_route_allows_governance_reader(governed_client, isolated_profile
     assert body["effective_access"]["permissions"] == ["governance:read"]
 
 
+def test_governance_users_and_groups_endpoints_return_structured_policy(governed_client, isolated_profiles):
+    policy_path = isolated_profiles["default"] / "dashboard-governance.yaml"
+    policy_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "mode": "enforce",
+                "default_effect": "deny",
+                "groups": {
+                    "operators": {
+                        "roles": ["reader"],
+                        "sso_groups": ["ops@example.test"],
+                        "grants": {"profiles": ["default"]},
+                    }
+                },
+                "users": {
+                    "stub@example.test": {
+                        "grants": {
+                            "permissions": ["governance:read"],
+                            "profiles": ["default"],
+                            "routes": ["/api/governance/users", "/api/governance/groups"],
+                        }
+                    },
+                    "operator@example.test": {"groups": ["operators"]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _login(governed_client)
+
+    users = governed_client.get("/api/governance/users")
+    groups = governed_client.get("/api/governance/groups")
+
+    assert users.status_code == 200
+    assert groups.status_code == 200
+    assert users.json()["users"]["operator@example.test"]["groups"] == ["operators"]
+    assert groups.json()["groups"]["operators"]["roles"] == ["reader"]
+
+
+def test_governance_simulate_returns_route_decision(governed_client, isolated_profiles):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["governance:preview"],
+            "profiles": ["default"],
+            "routes": ["/api/governance/simulate"],
+        },
+    )
+    _login(governed_client)
+
+    resp = governed_client.post(
+        "/api/governance/simulate",
+        json={
+            "policy": {
+                "version": 1,
+                "mode": "enforce",
+                "default_effect": "deny",
+                "users": {
+                    "operator@example.test": {
+                        "grants": {
+                            "permissions": ["config:read"],
+                            "profiles": ["default"],
+                            "routes": ["/api/config"],
+                        }
+                    }
+                },
+            },
+            "subject": {"email": "operator@example.test", "user_id": "operator-1"},
+            "request": {"path": "/api/config", "method": "GET", "profile": "default"},
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["allowed"] is True
+    assert body["reason"] == "allowed"
+    assert body["required_permission"] == "config:read"
+
+
 def test_governance_preview_returns_effective_access_without_saving(governed_client, isolated_profiles):
     _write_policy(
         isolated_profiles["default"],
