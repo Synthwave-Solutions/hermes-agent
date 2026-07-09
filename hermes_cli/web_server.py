@@ -13593,6 +13593,24 @@ async def put_governance_policy(request: Request, body: Dict[str, Any]):
     }
 
 
+@app.get("/api/governance/users")
+async def get_governance_users(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import policy_for_request
+
+    policy = policy_for_request(request)
+    raw_users = policy.raw.get("users") if isinstance(policy.raw.get("users"), dict) else {}
+    return {"users": raw_users or {}}
+
+
+@app.get("/api/governance/groups")
+async def get_governance_groups(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import policy_for_request
+
+    policy = policy_for_request(request)
+    raw_groups = policy.raw.get("groups") if isinstance(policy.raw.get("groups"), dict) else {}
+    return {"groups": raw_groups or {}}
+
+
 @app.post("/api/governance/preview")
 async def post_governance_preview(body: Dict[str, Any]):
     from hermes_cli.dashboard_governance.enforcement import (
@@ -13629,6 +13647,67 @@ async def post_governance_preview(body: Dict[str, Any]):
         "ok": True,
         "policy": safe_policy_payload(policy),
         "effective_access": serialize_effective_access(access),
+    }
+
+
+@app.post("/api/governance/simulate")
+async def post_governance_simulate(body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, parse_governance_policy
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+    from hermes_cli.dashboard_governance.route_catalog import route_permission
+
+    raw_policy = body.get("policy") if isinstance(body, dict) else None
+    raw_subject = body.get("subject") if isinstance(body, dict) else None
+    raw_request = body.get("request") if isinstance(body, dict) else None
+    if not isinstance(raw_policy, dict):
+        raise HTTPException(status_code=400, detail="policy must be an object")
+    if not isinstance(raw_subject, dict):
+        raise HTTPException(status_code=400, detail="subject must be an object")
+    if not isinstance(raw_request, dict):
+        raise HTTPException(status_code=400, detail="request must be an object")
+    try:
+        policy = parse_governance_policy(raw_policy)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    subject = GovernanceSubject(
+        email=str(raw_subject.get("email") or ""),
+        display_name=str(raw_subject.get("display_name") or raw_subject.get("name") or ""),
+        provider=str(raw_subject.get("provider") or ""),
+        user_id=str(raw_subject.get("user_id") or ""),
+        org_id=str(raw_subject.get("org_id") or ""),
+        roles=tuple(str(role) for role in raw_subject.get("roles") or [] if str(role).strip()),
+        groups=tuple(str(group) for group in raw_subject.get("groups") or [] if str(group).strip()),
+    )
+    access = resolve_effective_access(policy, subject)
+    path = str(raw_request.get("path") or "")
+    method = str(raw_request.get("method") or "GET").upper()
+    target_profile = str(raw_request.get("profile") or "")
+    required_permission = route_permission(path, method)
+    allowed = True
+    reason = "allowed"
+    if not policy.enabled:
+        reason = "governance_off"
+    elif not subject.user_id and not subject.email:
+        allowed = False
+        reason = "unauthenticated"
+    elif not access.is_route_allowed(path):
+        allowed = False
+        reason = "route_not_allowed"
+    elif required_permission is None and path not in {"/api/auth/me", "/api/governance/me", "/api/governance/effective-access"}:
+        allowed = False
+        reason = "unknown_route"
+    elif required_permission and not access.has_permission(required_permission):
+        allowed = False
+        reason = "permission_not_allowed"
+    elif target_profile and not access.is_profile_allowed(target_profile):
+        allowed = False
+        reason = "profile_not_allowed"
+    return {
+        "allowed": allowed,
+        "reason": reason,
+        "required_permission": required_permission,
     }
 
 
