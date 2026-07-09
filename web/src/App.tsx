@@ -72,6 +72,7 @@ import { ProfileProvider } from "@/contexts/ProfileProvider";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { ProfileSwitcher } from "@/components/ProfileSwitcher";
 import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
+import { useGovernance } from "@/contexts/useGovernance";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
 // Route pages are lazy-loaded so the initial dashboard shell does not pay for
@@ -95,6 +96,28 @@ const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
+import ConfigPage from "@/pages/ConfigPage";
+import DocsPage from "@/pages/DocsPage";
+import EnvPage from "@/pages/EnvPage";
+import FilesPage from "@/pages/FilesPage";
+import SessionsPage from "@/pages/SessionsPage";
+import LogsPage from "@/pages/LogsPage";
+import AnalyticsPage from "@/pages/AnalyticsPage";
+import ModelsPage from "@/pages/ModelsPage";
+import CronPage from "@/pages/CronPage";
+import ProfilesPage from "@/pages/ProfilesPage";
+import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
+import SkillsPage from "@/pages/SkillsPage";
+import PluginsPage from "@/pages/PluginsPage";
+import McpPage from "@/pages/McpPage";
+import PairingPage from "@/pages/PairingPage";
+import ChannelsPage from "@/pages/ChannelsPage";
+import WebhooksPage from "@/pages/WebhooksPage";
+import SystemPage from "@/pages/SystemPage";
+import GovernancePage from "@/pages/GovernancePage";
+import AccessDeniedPage from "@/pages/AccessDeniedPage";
+import ChatPage from "@/pages/ChatPage";
+
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -141,6 +164,42 @@ const CHAT_NAV_ITEM: NavItem = {
   icon: Terminal,
 };
 
+const ROUTE_PERMISSION_MAP: Record<string, string> = {
+  "/sessions": "sessions:read",
+  "/files": "files:read",
+  "/analytics": "analytics:read",
+  "/models": "model:read",
+  "/logs": "logs:read",
+  "/cron": "cron:read",
+  "/skills": "skills:read",
+  "/plugins": "plugins:read",
+  "/mcp": "mcp:read",
+  "/channels": "channels:read",
+  "/webhooks": "webhooks:read",
+  "/pairing": "pairing:admin",
+  "/profiles": "profiles:read",
+  "/profiles/new": "profiles:admin",
+  "/config": "config:read",
+  "/env": "env:read",
+  "/system": "system:read",
+  "/governance": "governance:read",
+  "/docs": "status:read",
+  "/chat": "chat:use",
+};
+
+function permissionForNavPath(path: string): string | undefined {
+  return ROUTE_PERMISSION_MAP[path];
+}
+
+function GuardedRoute({ path, children }: { path: string; children: ReactNode }) {
+  const { hasPermission } = useGovernance();
+  const permission = permissionForNavPath(path);
+  if (permission && !hasPermission(permission)) {
+    return <AccessDeniedPage />;
+  }
+  return <>{children}</>;
+}
+
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
  * <Routes>) when embedded — see the persistent chat host block rendered
@@ -167,6 +226,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/channels": ChannelsPage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
+  "/governance": GovernancePage,
   "/profiles": ProfilesPage,
   "/profiles/new": ProfileBuilderPage,
   "/config": ConfigPage,
@@ -214,6 +274,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
   { path: "/system", label: "System", icon: Wrench },
+  { path: "/governance", label: "Governance", icon: ShieldCheck },
   {
     path: "/docs",
     labelKey: "documentation",
@@ -337,7 +398,7 @@ function buildRoutes(
         element: <PluginPage name={om.name} />,
       });
     } else {
-      routes.push({ key: `builtin:${path}`, path, element: <Component /> });
+      routes.push({ key: `builtin:${path}`, path, element: <GuardedRoute path={path}><Component /></GuardedRoute> });
     }
   }
 
@@ -373,6 +434,7 @@ export default function App() {
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
+  const { hasPermission } = useGovernance();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
 
@@ -459,10 +521,14 @@ export default function App() {
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
       : BUILTIN_NAV_REST;
-    return showTokenAnalytics
+    return (showTokenAnalytics
       ? base
-      : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+      : base.filter((n) => n.path !== "/analytics"))
+      .filter((n) => {
+        const permission = permissionForNavPath(n.path);
+        return !permission || hasPermission(permission);
+      });
+  }, [embeddedChat, hasPermission, showTokenAnalytics]);
 
   const sidebarNav = useMemo(
     () => partitionSidebarNav(builtinNav, manifests),

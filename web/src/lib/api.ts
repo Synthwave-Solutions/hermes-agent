@@ -358,6 +358,25 @@ export const api = {
     fetchJSON<AuthMeResponse>("/api/auth/me", undefined, {
       allowUnauthorized: true,
     }),
+  getGovernanceEffectiveAccess: async () => {
+    const res = await fetchJSON<{ effective_access: GovernanceEffectiveAccessResponse }>("/api/governance/effective-access");
+    return res.effective_access;
+  },
+  getGovernancePolicy: async () => {
+    const res = await fetchJSON<{ policy: Record<string, unknown> }>("/api/governance/policy");
+    return res.policy;
+  },
+  saveGovernancePolicy: async (policy: Record<string, unknown>) => {
+    const res = await fetchJSON<{ ok: boolean; policy: Record<string, unknown> }>("/api/governance/policy", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(policy),
+    });
+    return res;
+  },
+  getGovernanceAudit: (limit = 100) =>
+    fetchJSON<GovernanceAuditResponse>(`/api/governance/audit?limit=${limit}`),
+  getGovernanceUsage: () => fetchJSON<GovernanceUsageResponse>("/api/governance/usage"),
   logout: () =>
     fetch(`${BASE}/auth/logout`, {
       method: "POST",
@@ -2115,6 +2134,45 @@ export interface ProfileDescribeAutoResult {
   reason: string;
   description: string | null;
   description_auto: boolean;
+}
+
+export interface GovernanceEffectiveAccessResponse {
+  mode: "off" | "report_only" | "enforce" | string;
+  subject: {
+    email?: string;
+    display_name?: string;
+    provider?: string;
+    user_id?: string;
+    org_id?: string;
+  };
+  roles: string[];
+  groups: string[];
+  permissions: string[];
+  profiles: string[];
+  routes: string[];
+  grant_sources: string[];
+  is_admin: boolean;
+}
+
+export interface GovernanceAuditEvent {
+  ts: string;
+  event: string;
+  subject_email_hash?: string;
+  subject_user_id_hash?: string;
+  path?: string;
+  method?: string;
+  reason?: string;
+  mode?: string;
+  report_only?: boolean;
+  extra?: Record<string, unknown>;
+}
+
+export interface GovernanceAuditResponse {
+  events: GovernanceAuditEvent[];
+}
+
+export interface GovernanceUsageResponse {
+  usage: Record<string, unknown>;
 }
 
 export interface ProfileInfo {
