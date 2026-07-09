@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,8 +19,16 @@ def _usage_file() -> Path:
     return get_hermes_home() / "dashboard-governance-usage.json"
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _now().strftime("%Y-%m-%d")
+
+
+def _month() -> str:
+    return _now().strftime("%Y-%m")
 
 
 def _subject_key(ctx: DashboardGovernanceContext) -> str:
@@ -40,20 +47,33 @@ def _load_state(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _counter_bucket(state: dict[str, Any], ctx: DashboardGovernanceContext) -> dict[str, int]:
-    day = _today()
+def _empty_counters() -> dict[str, int]:
+    return {
+        "tool_calls": 0,
+        "file_writes": 0,
+        "mcp_calls": 0,
+        "background_processes": 0,
+    }
+
+
+def _counter_bucket(state: dict[str, Any], ctx: DashboardGovernanceContext, period: str) -> dict[str, int]:
+    if period == "months":
+        key = _month()
+    else:
+        period = "days"
+        key = _today()
     subject = _subject_key(ctx)
-    days = state.setdefault("days", {})
-    if not isinstance(days, dict):
-        state["days"] = days = {}
-    day_bucket = days.setdefault(day, {})
-    if not isinstance(day_bucket, dict):
-        days[day] = day_bucket = {}
-    counters = day_bucket.setdefault(subject, {})
+    periods = state.setdefault(period, {})
+    if not isinstance(periods, dict):
+        state[period] = periods = {}
+    period_bucket = periods.setdefault(key, {})
+    if not isinstance(period_bucket, dict):
+        periods[key] = period_bucket = {}
+    counters = period_bucket.setdefault(subject, {})
     if not isinstance(counters, dict):
-        day_bucket[subject] = counters = {}
-    counters.setdefault("tool_calls", 0)
-    counters.setdefault("file_writes", 0)
+        period_bucket[subject] = counters = {}
+    for name, value in _empty_counters().items():
+        counters.setdefault(name, value)
     return counters
 
 
@@ -71,13 +91,34 @@ def _cap(caps: dict[str, Any], *names: str) -> int | None:
     return None
 
 
-def _usage_counter_for_tool(tool_name: str) -> str:
+def _usage_counters_for_tool(tool_name: str, args: dict[str, Any] | None = None) -> tuple[str, ...]:
+    counters = ["tool_calls"]
     if tool_name in _FILE_WRITE_TOOLS:
-        return "file_writes"
-    return "tool_calls"
+        counters.append("file_writes")
+    if tool_name.startswith("mcp_"):
+        counters.append("mcp_calls")
+    if tool_name == "terminal" and isinstance(args, dict) and bool(args.get("background")):
+        counters.append("background_processes")
+    return tuple(counters)
 
 
-def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str) -> AccessDecision:
+def read_usage_state() -> dict[str, Any]:
+    return _load_state(_usage_file())
+
+
+def _check_counter_cap(caps: dict[str, Any], counters: dict[str, int], counter: str, prefix: str) -> AccessDecision | None:
+    cap = _cap(
+        caps,
+        f"{prefix}_{counter}",
+        f"max_{prefix}_{counter}",
+        f"{counter}_{prefix}",
+    )
+    if cap is not None and int(counters.get(counter, 0)) >= cap:
+        return AccessDecision(False, f"{prefix}_{counter}_exceeded")
+    return None
+
+
+def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any] | None = None) -> AccessDecision:
     if ctx is None or ctx.access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
     caps = dict(ctx.access.grants.usage_caps or {})
@@ -85,21 +126,17 @@ def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str) -> 
         return AccessDecision(True, "usage_caps_inactive")
 
     state = _load_state(_usage_file())
-    counters = _counter_bucket(state, ctx)
-
-    daily_tool_calls = _cap(caps, "daily_tool_calls", "max_daily_tool_calls", "tool_calls_daily")
-    if daily_tool_calls is not None and int(counters.get("tool_calls", 0)) >= daily_tool_calls:
-        return AccessDecision(False, "daily_tool_calls_exceeded")
-
-    if tool_name in _FILE_WRITE_TOOLS:
-        daily_file_writes = _cap(caps, "daily_file_writes", "max_daily_file_writes", "file_writes_daily")
-        if daily_file_writes is not None and int(counters.get("file_writes", 0)) >= daily_file_writes:
-            return AccessDecision(False, "daily_file_writes_exceeded")
-
+    counter_names = _usage_counters_for_tool(tool_name, args)
+    for period, prefix in (("days", "daily"), ("months", "monthly")):
+        counters = _counter_bucket(state, ctx, period)
+        for counter in counter_names:
+            decision = _check_counter_cap(caps, counters, counter, prefix)
+            if decision is not None:
+                return decision
     return AccessDecision(True, "usage_allowed")
 
 
-def record_tool_usage(ctx: DashboardGovernanceContext | None, tool_name: str) -> None:
+def record_tool_usage(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any] | None = None) -> None:
     if ctx is None or ctx.access.mode != "enforce":
         return
     if not dict(ctx.access.grants.usage_caps or {}):
@@ -107,8 +144,8 @@ def record_tool_usage(ctx: DashboardGovernanceContext | None, tool_name: str) ->
     path = _usage_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     state = _load_state(path)
-    counters = _counter_bucket(state, ctx)
-    counters["tool_calls"] = int(counters.get("tool_calls", 0)) + 1
-    if _usage_counter_for_tool(tool_name) == "file_writes":
-        counters["file_writes"] = int(counters.get("file_writes", 0)) + 1
+    for period in ("days", "months"):
+        counters = _counter_bucket(state, ctx, period)
+        for counter in _usage_counters_for_tool(tool_name, args):
+            counters[counter] = int(counters.get(counter, 0)) + 1
     atomic_json_write(path, state)

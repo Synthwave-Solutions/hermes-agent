@@ -15162,6 +15162,21 @@ async def put_governance_policy(request: Request, body: Dict[str, Any]):
     }
 
 
+@app.get("/api/governance/audit")
+async def get_governance_audit(limit: int = 100):
+    from hermes_cli.dashboard_governance.audit import read_audit_events
+
+    safe_limit = max(1, min(int(limit or 100), 500))
+    return {"events": read_audit_events(limit=safe_limit)}
+
+
+@app.get("/api/governance/usage")
+async def get_governance_usage():
+    from hermes_cli.dashboard_governance.usage import read_usage_state
+
+    return {"usage": read_usage_state()}
+
+
 @app.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
     from hermes_cli import profiles as profiles_mod

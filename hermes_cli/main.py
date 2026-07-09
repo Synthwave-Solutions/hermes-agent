@@ -15361,6 +15361,12 @@ def main():
     build_import_cmd_parser(subparsers, cmd_import=cmd_import)
 
     # =========================================================================
+    # governance command — dashboard RBAC policy management
+    # =========================================================================
+    from hermes_cli.dashboard_governance.cli import register_cli as _register_governance_cli
+    _register_governance_cli(subparsers)
+
+    # =========================================================================
     # config command  (parser built in hermes_cli/subcommands/config.py)
     # =========================================================================
     build_config_parser(subparsers, cmd_config=cmd_config)
