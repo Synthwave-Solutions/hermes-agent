@@ -12273,12 +12273,18 @@ def main():
 
     # =========================================================================
     # import-agent command  (parser: hermes_cli/subcommands/import_agent.py)
-    # =========================================================================
+    # =================================================================
     def cmd_import_agent(args):
         from hermes_cli.agent_import import import_agent_command
         import_agent_command(args)
 
     build_import_agent_parser(subparsers, cmd_import_agent=cmd_import_agent)
+
+    # governance command: dashboard RBAC policy management
+    # =========================================================================
+    from hermes_cli.dashboard_governance.cli import register_cli as _register_governance_cli
+    _register_governance_cli(subparsers)
+
 
     # =========================================================================
     # config command  (parser built in hermes_cli/subcommands/config.py)

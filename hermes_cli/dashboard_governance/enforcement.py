@@ -12,13 +12,14 @@ from .models import EffectiveAccess, GovernancePolicy, GovernanceSubject
 from .resolver import resolve_effective_access
 
 
+from .route_catalog import route_permission
+
 _SELF_ROUTES: frozenset[str] = frozenset({
     "/api/auth/me",
     "/api/governance/me",
     "/api/governance/effective-access",
 })
 _PUBLIC_GOVERNANCE_BYPASS: frozenset[str] = PUBLIC_API_PATHS | frozenset({"/api/auth/providers"})
-_MUTATION_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
 def _safe_str(value: Any) -> str:
@@ -99,74 +100,6 @@ def serialize_effective_access(access: EffectiveAccess) -> dict[str, Any]:
     }
 
 
-def _route_permission(path: str, method: str) -> str | None:
-    method = method.upper()
-    if path in _SELF_ROUTES:
-        return None
-    if path.startswith("/api/governance/policy"):
-        return "governance:write" if method in _MUTATION_METHODS else "governance:read"
-    if path.startswith("/api/governance/preview") or path.startswith("/api/governance/simulate"):
-        return "governance:preview"
-    if path.startswith("/api/governance/audit"):
-        return "governance:audit:read"
-    if path.startswith("/api/governance/usage"):
-        return "governance:usage:read"
-    if path.startswith("/api/governance"):
-        return "governance:write" if method in _MUTATION_METHODS else "governance:read"
-    if path == "/api/profiles" or path == "/api/profiles/active":
-        return "profiles:admin" if method in _MUTATION_METHODS else "profiles:read"
-    if path.startswith("/api/profiles"):
-        return "profiles:admin" if method in _MUTATION_METHODS else "profiles:read"
-    if path.startswith("/api/sessions"):
-        return "sessions:write" if method in _MUTATION_METHODS else "sessions:read"
-    if path.startswith("/api/chat") or path in {"/api/pty", "/api/ws", "/api/pub", "/api/events"}:
-        return "chat:use"
-    if path.startswith("/api/files"):
-        return "files:write" if method in _MUTATION_METHODS else "files:read"
-    if path.startswith("/api/logs"):
-        return "logs:read"
-    if path.startswith("/api/analytics"):
-        return "analytics:read"
-    if path == "/api/config" or path.startswith("/api/config/"):
-        return "config:write" if method in _MUTATION_METHODS else "config:read"
-    if path == "/api/config/schema" or path == "/api/config/defaults":
-        return "config:read"
-    if path.startswith("/api/env"):
-        return "env:write" if method in _MUTATION_METHODS else "env:read"
-    if path.startswith("/api/model/set"):
-        return "model:write"
-    if path.startswith("/api/model/auxiliary"):
-        return "model:write" if method in _MUTATION_METHODS else "model:read"
-    if path.startswith("/api/model"):
-        return "model:write" if method in _MUTATION_METHODS else "model:read"
-    if path.startswith("/api/skills"):
-        return "skills:write" if method in _MUTATION_METHODS else "skills:read"
-    if path.startswith("/api/tools/toolsets"):
-        return "tools:write" if method in _MUTATION_METHODS else "tools:read"
-    if path.startswith("/api/mcp"):
-        return "mcp:write" if method in _MUTATION_METHODS else "mcp:read"
-    if path.startswith("/api/plugins") or path.startswith("/api/dashboard/agent-plugins"):
-        return "plugins:write" if method in _MUTATION_METHODS else "plugins:read"
-    if path.startswith("/api/cron"):
-        if method == "POST" and path.endswith("/run"):
-            return "cron:run"
-        return "cron:write" if method in _MUTATION_METHODS else "cron:read"
-    if path.startswith("/api/webhooks"):
-        return "webhooks:write" if method in _MUTATION_METHODS else "webhooks:read"
-    if path.startswith("/api/channels"):
-        return "channels:write" if method in _MUTATION_METHODS else "channels:read"
-    if path.startswith("/api/pairing"):
-        return "pairing:admin"
-    if path == "/api/gateway/restart":
-        return "gateway:restart"
-    if path.startswith("/api/gateway"):
-        return "gateway:read"
-    if path.startswith("/api/system"):
-        return "system:ops" if method in _MUTATION_METHODS else "system:read"
-    if path == "/api/status":
-        return "status:read"
-    return None
-
 
 def _target_profile_from_request(request: Request) -> str:
     raw = request.query_params.get("profile", "")
@@ -185,6 +118,26 @@ def _target_profile_from_request(request: Request) -> str:
     return ""
 
 
+def _audit_governance_decision(request: Request, access: EffectiveAccess, reason: str, *, report_only: bool) -> None:
+    try:
+        from .audit import append_audit_event
+
+        append_audit_event(
+            "would_deny" if report_only else "deny",
+            subject_email=access.subject.email,
+            subject_user_id=access.subject.user_id,
+            path=request.url.path,
+            method=request.method,
+            reason=reason,
+            mode=access.mode,
+            report_only=report_only,
+        )
+    except Exception:
+        # Authorization must not become unavailable because the audit sink is
+        # temporarily unwritable. The denial still happens in enforce mode.
+        return
+
+
 def governance_decision(request: Request) -> tuple[bool, str, EffectiveAccess]:
     policy = policy_for_request(request)
     access = resolve_effective_access(policy, subject_from_request(request))
@@ -201,7 +154,7 @@ def governance_decision(request: Request) -> tuple[bool, str, EffectiveAccess]:
     if not access.is_route_allowed(path):
         return False, "route_not_allowed", access
 
-    required_permission = _route_permission(path, request.method)
+    required_permission = route_permission(path, request.method)
     if required_permission is None and path not in _SELF_ROUTES:
         return False, "unknown_route", access
     if required_permission and not access.has_permission(required_permission):
@@ -230,8 +183,10 @@ async def governance_middleware(request: Request, call_next):
     if allowed or access.mode == "report_only":
         if not allowed:
             request.state.governance_report_only_denial = reason
+            _audit_governance_decision(request, access, reason, report_only=True)
         return await call_next(request)
 
+    _audit_governance_decision(request, access, reason, report_only=False)
     if reason == "unauthenticated":
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     return JSONResponse({"detail": "Forbidden"}, status_code=403)

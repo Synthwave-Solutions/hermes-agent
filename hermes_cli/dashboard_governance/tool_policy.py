@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 
 from .context import DashboardGovernanceContext
 from .models import AccessDecision, EffectiveAccess
+
+_SHELL_OPERATOR_RE = re.compile(r"(;|&&|\|\||\||`|\$\(|<\(|>\(|\s[<>]{1,2}\s|\d[<>])")
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,7 @@ def _mcp_tool_allowed(access: EffectiveAccess, identity: ToolIdentity) -> bool:
         allowed_names = grants.mcp_tools.get(key)
         if allowed_names and ("*" in allowed_names or identity.name in allowed_names or identity.mcp_tool in allowed_names):
             return True
-    return not grants.mcp_tools
+    return False
 
 
 def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry: Any) -> AccessDecision:
@@ -75,11 +78,15 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
     identity = identify_tool(tool_name, registry)
     grants = access.grants
     if _contains(grants.tools, tool_name):
+        if identity.mcp_server and not _mcp_tool_allowed(access, identity):
+            return AccessDecision(False, "tool_not_allowed")
         return AccessDecision(True, "tool_allowed")
+    if identity.mcp_server:
+        if _mcp_tool_allowed(access, identity):
+            return AccessDecision(True, "mcp_tool_allowed")
+        return AccessDecision(False, "tool_not_allowed")
     if identity.toolset and _contains(grants.toolsets, identity.toolset):
         return AccessDecision(True, "toolset_allowed")
-    if identity.mcp_server and _mcp_tool_allowed(access, identity):
-        return AccessDecision(True, "mcp_tool_allowed")
     return AccessDecision(False, "tool_not_allowed")
 
 
@@ -130,11 +137,22 @@ def _command_id(command: Any) -> tuple[str, str]:
     return argv0, os.path.basename(argv0)
 
 
+def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
+    skill = str(name or "").strip()
+    return bool(skill) and ("*" in values or skill in values)
+
+
 def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
     if access is None or access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
     grants = access.grants
-    if tool_name in {"read_file", "search_files"}:
+    if tool_name == "skill_view":
+        if not _skill_name_allowed(grants.skills_view, args.get("name")):
+            return AccessDecision(False, "skill_not_allowed")
+    elif tool_name == "skill_manage":
+        if not _skill_name_allowed(grants.skills_manage, args.get("name")):
+            return AccessDecision(False, "skill_manage_not_allowed")
+    elif tool_name in {"read_file", "search_files"}:
         path = args.get("path") or "."
         if _matches_denied_glob(str(path), grants.file_denied_globs):
             return AccessDecision(False, "file_denied_glob")
@@ -149,6 +167,8 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
                 return AccessDecision(False, "file_write_root_not_allowed")
     elif tool_name == "terminal":
         command = args.get("command")
+        if _SHELL_OPERATOR_RE.search(str(command or "")):
+            return AccessDecision(False, "cli_shell_operator_not_allowed")
         argv0, basename = _command_id(command)
         if grants.cli_commands and "*" not in grants.cli_commands:
             if argv0 not in grants.cli_commands and basename not in grants.cli_commands:

@@ -275,6 +275,26 @@ class TestGovernanceToolDispatch:
         assert result["error"] == "Tool denied by dashboard governance: cli_command_not_allowed"
         assert result["governance"]["tool"] == "terminal"
 
+    def test_enforce_mode_blocks_shell_operator_even_for_allowed_command(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["terminal"], cli_commands=["git"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("terminal", {"command": "git status && rm -rf /tmp/nope"}))
+
+        assert result["error"] == "Tool denied by dashboard governance: cli_shell_operator_not_allowed"
+        assert result["governance"]["tool"] == "terminal"
+
     def test_enforce_mode_blocks_tool_call_after_daily_cap(self, monkeypatch, tmp_path):
         from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
 
@@ -328,3 +348,86 @@ class TestGovernanceToolDispatch:
         assert first == {"ok": True}
         assert second["error"] == "Tool denied by dashboard governance: daily_file_writes_exceeded"
         assert second["governance"]["tool"] == "write_file"
+
+    def test_enforce_mode_requires_mcp_server_and_tool_allowlist(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(toolsets=["mcp-github"], mcp_servers=["github"], mcp_tools={"github": ["list_issues"]}),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "mcp-github")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="mcp-github", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            allowed = json.loads(model_tools.handle_function_call("mcp_github_list_issues", {}))
+            denied = json.loads(model_tools.handle_function_call("mcp_github_delete_repo", {}))
+
+        assert allowed == {"ok": True}
+        assert denied["error"] == "Tool denied by dashboard governance: tool_not_allowed"
+
+    def test_mcp_toolset_grant_alone_does_not_bypass_mcp_policy(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(toolsets=["mcp-github"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "mcp-github")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="mcp-github", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("mcp_github_list_issues", {}))
+
+        assert result["error"] == "Tool denied by dashboard governance: tool_not_allowed"
+
+    def test_skill_view_requires_skill_name_grant(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        grants = GrantSet(tools=frozenset({"skill_view"}), skills_view=frozenset({"allowed-skill"}))
+        access = EffectiveAccess(subject=GovernanceSubject(email="operator@example.test"), mode="enforce", grants=grants)
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=access,
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "skills")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="skills", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("skill_view", {"name": "blocked-skill"}))
+
+        assert result["error"] == "Tool denied by dashboard governance: skill_not_allowed"
+
+    def test_skill_manage_requires_manage_grant(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        grants = GrantSet(tools=frozenset({"skill_manage"}), skills_manage=frozenset({"allowed-skill"}))
+        access = EffectiveAccess(subject=GovernanceSubject(email="operator@example.test"), mode="enforce", grants=grants)
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=access,
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "skills")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="skills", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("skill_manage", {"name": "blocked-skill", "action": "patch"}))
+
+        assert result["error"] == "Tool denied by dashboard governance: skill_manage_not_allowed"
