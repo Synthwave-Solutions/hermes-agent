@@ -13593,6 +13593,45 @@ async def put_governance_policy(request: Request, body: Dict[str, Any]):
     }
 
 
+@app.post("/api/governance/preview")
+async def post_governance_preview(body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.enforcement import (
+        safe_policy_payload,
+        serialize_effective_access,
+    )
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, parse_governance_policy
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+
+    raw_policy = body.get("policy") if isinstance(body, dict) else None
+    raw_subject = body.get("subject") if isinstance(body, dict) else None
+    if not isinstance(raw_policy, dict):
+        raise HTTPException(status_code=400, detail="policy must be an object")
+    if raw_subject is not None and not isinstance(raw_subject, dict):
+        raise HTTPException(status_code=400, detail="subject must be an object")
+    try:
+        policy = parse_governance_policy(raw_policy)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    subject_data = raw_subject or {}
+    subject = GovernanceSubject(
+        email=str(subject_data.get("email") or ""),
+        display_name=str(subject_data.get("display_name") or subject_data.get("name") or ""),
+        provider=str(subject_data.get("provider") or ""),
+        user_id=str(subject_data.get("user_id") or ""),
+        org_id=str(subject_data.get("org_id") or ""),
+        roles=tuple(str(role) for role in subject_data.get("roles") or [] if str(role).strip()),
+        groups=tuple(str(group) for group in subject_data.get("groups") or [] if str(group).strip()),
+    )
+    access = resolve_effective_access(policy, subject)
+    return {
+        "ok": True,
+        "policy": safe_policy_payload(policy),
+        "effective_access": serialize_effective_access(access),
+    }
+
+
 @app.get("/api/governance/audit")
 async def get_governance_audit(limit: int = 100):
     from hermes_cli.dashboard_governance.audit import read_audit_events
