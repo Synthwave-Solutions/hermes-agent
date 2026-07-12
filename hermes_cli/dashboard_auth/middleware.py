@@ -17,7 +17,7 @@ binds.
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Mapping
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -84,6 +84,24 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
+
+
+def _attach_session_state(request: Request, session) -> None:
+    """Attach the verified session and its governance identity facets.
+
+    ``dashboard_governance.enforcement.subject_from_request`` reads
+    ``request.state.groups`` / ``request.state.roles`` /
+    ``request.state.claims`` (via getattr with empty defaults), so this is
+    the single choke point where the Session's optional SSO facets become
+    visible to the governance resolver. Providers whose sessions predate the
+    optional fields (or that never populate them) degrade to empty values.
+    Never attach tokens here: only identity facets leave the Session.
+    """
+    request.state.session = session
+    request.state.groups = tuple(getattr(session, "groups", ()) or ())
+    request.state.roles = tuple(getattr(session, "roles", ()) or ())
+    claims = getattr(session, "claims", None)
+    request.state.claims = dict(claims) if isinstance(claims, Mapping) else {}
 
 
 def _client_ip(request: Request) -> str:
@@ -469,7 +487,7 @@ async def gated_auth_middleware(
             )
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
-            request.state.session = new_session
+            _attach_session_state(request, new_session)
             response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
@@ -516,7 +534,7 @@ async def gated_auth_middleware(
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
-    request.state.session = session
+    _attach_session_state(request, session)
     response = await call_next(request)
     if not provider_hint and session.provider:
         from hermes_cli.dashboard_auth.cookies import detect_https
