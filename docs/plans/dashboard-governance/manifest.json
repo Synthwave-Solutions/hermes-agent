@@ -8,7 +8,8 @@
     "05-implementation-plan.md",
     "06-test-rollout-plan.md",
     "07-route-enforcement-map.md",
+    "08-rollout-runbook.md",
     "README.md"
   ],
-  "count": 8
+  "count": 9
 }
