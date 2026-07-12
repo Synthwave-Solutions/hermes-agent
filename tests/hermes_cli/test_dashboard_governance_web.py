@@ -51,12 +51,12 @@ def governed_client(isolated_profiles):
         web_server.app.state.auth_required = prev_required
 
 
-def _write_policy(home: Path, user_grants: dict, *, roles: dict | None = None) -> None:
+def _write_policy(home: Path, user_grants: dict, *, roles: dict | None = None, mode: str = "enforce") -> None:
     (home / "dashboard-governance.yaml").write_text(
         yaml.safe_dump(
             {
                 "version": 1,
-                "mode": "enforce",
+                "mode": mode,
                 "default_effect": "deny",
                 "roles": roles or {},
                 "users": {
@@ -419,3 +419,343 @@ def test_model_set_allows_granted_provider_model(
     assert body["ok"] is True
     assert body["provider"] == "openrouter"
     assert body["model"] == "anthropic/claude-sonnet-4.6"
+
+
+def _write_admin_policy(home: Path) -> None:
+    _write_policy(
+        home,
+        {
+            "permissions": ["governance:write"],
+            "profiles": ["default"],
+            "routes": [
+                "/api/governance/policy",
+                "/api/governance/groups",
+                "/api/governance/groups/*",
+                "/api/governance/users/*",
+            ],
+        },
+    )
+
+
+def _read_policy(home: Path) -> dict:
+    return yaml.safe_load((home / "dashboard-governance.yaml").read_text(encoding="utf-8"))
+
+
+def _policy_change_events(*, action: str | None = None) -> list[dict]:
+    from hermes_cli.dashboard_governance.audit import read_audit_events
+
+    events = [event for event in read_audit_events(limit=100) if event["event"] == "policy_change"]
+    if action is not None:
+        events = [event for event in events if event["extra"]["action"] == action]
+    return events
+
+
+def test_governance_group_create_update_delete_happy_path(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    created = governed_client.post(
+        "/api/governance/groups",
+        json={"name": "operators", "group": {"roles": ["reader"], "grants": {"profiles": ["default"]}}},
+    )
+    assert created.status_code == 200
+    assert created.json()["ok"] is True
+    assert _read_policy(isolated_profiles["default"])["groups"]["operators"]["roles"] == ["reader"]
+
+    updated = governed_client.put(
+        "/api/governance/groups/operators",
+        json={"roles": ["reader", "writer"], "grants": {"profiles": ["default", "worker_alpha"]}},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["groups"]["operators"]["roles"] == ["reader", "writer"]
+    assert _read_policy(isolated_profiles["default"])["groups"]["operators"]["roles"] == ["reader", "writer"]
+
+    deleted = governed_client.delete("/api/governance/groups/operators")
+    assert deleted.status_code == 200
+    assert deleted.json()["groups"] == {}
+    assert _read_policy(isolated_profiles["default"])["groups"] == {}
+
+    assert len(_policy_change_events(action="group_create")) == 1
+    assert len(_policy_change_events(action="group_update")) == 1
+    assert len(_policy_change_events(action="group_delete")) == 1
+
+
+def test_governance_group_create_writes_policy_change_audit_event(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    resp = governed_client.post(
+        "/api/governance/groups",
+        json={"name": "operators", "group": {"roles": ["reader"]}},
+    )
+
+    assert resp.status_code == 200
+    events = _policy_change_events(action="group_create")
+    assert len(events) == 1
+    event = events[0]
+    assert event["method"] == "POST"
+    assert event["path"] == "/api/governance/groups"
+    assert event["reason"] == "group_create"
+    assert event["extra"]["target"] == "operators"
+    assert event["extra"]["before"] is None
+    assert event["extra"]["after"] == {"roles": ["reader"]}
+    assert event["subject_email_hash"]
+    assert "stub@example.test" not in str(event)
+
+
+def test_governance_group_mutations_forbidden_for_non_admin(governed_client, isolated_profiles):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["governance:read"],
+            "profiles": ["default"],
+            "routes": [
+                "/api/governance/groups",
+                "/api/governance/groups/*",
+                "/api/governance/users/*",
+            ],
+        },
+    )
+    _login(governed_client)
+
+    created = governed_client.post("/api/governance/groups", json={"name": "operators"})
+    upserted = governed_client.put("/api/governance/users/other@example.test", json={"roles": []})
+
+    assert created.status_code == 403
+    assert created.json()["detail"] == "Forbidden"
+    assert upserted.status_code == 403
+    assert upserted.json()["detail"] == "Forbidden"
+    assert _policy_change_events() == []
+
+
+def test_governance_mutations_forbidden_for_non_admin_in_report_only_mode(governed_client, isolated_profiles):
+    """report_only must stay a dry-run: denied requests pass the middleware,
+    but policy mutations must never execute without governance:write."""
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["governance:read"],
+            "profiles": ["default"],
+            "routes": ["*"],
+        },
+        mode="report_only",
+    )
+    _login(governed_client)
+    before = (isolated_profiles["default"] / "dashboard-governance.yaml").read_text(encoding="utf-8")
+
+    created = governed_client.post("/api/governance/groups", json={"name": "operators"})
+    upserted = governed_client.put(
+        "/api/governance/users/stub@example.test",
+        json={"grants": {"permissions": ["governance:write"]}},
+    )
+    replaced = governed_client.put(
+        "/api/governance/policy",
+        json={"version": 1, "mode": "enforce", "default_effect": "deny"},
+    )
+
+    assert created.status_code == 403
+    assert upserted.status_code == 403
+    assert replaced.status_code == 403
+    assert (isolated_profiles["default"] / "dashboard-governance.yaml").read_text(encoding="utf-8") == before
+    assert _policy_change_events() == []
+
+
+def test_governance_mutations_allowed_for_admin_in_report_only_mode(governed_client, isolated_profiles):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["governance:write"],
+            "profiles": ["default"],
+            "routes": ["*"],
+        },
+        mode="report_only",
+    )
+    _login(governed_client)
+
+    created = governed_client.post("/api/governance/groups", json={"name": "operators"})
+
+    assert created.status_code == 200
+    assert _read_policy(isolated_profiles["default"])["groups"]["operators"] == {}
+
+
+def test_governance_mutations_forbidden_without_policy_file(governed_client, isolated_profiles):
+    """With governance off (no policy file), a session-holder must not be able
+    to bootstrap a policy that grants themselves governance:write."""
+    _login(governed_client)
+
+    replaced = governed_client.put(
+        "/api/governance/policy",
+        json={"version": 1, "mode": "enforce", "default_effect": "deny"},
+    )
+    created = governed_client.post("/api/governance/groups", json={"name": "operators"})
+
+    assert replaced.status_code == 403
+    assert created.status_code == 403
+    assert not (isolated_profiles["default"] / "dashboard-governance.yaml").exists()
+
+
+def test_put_governance_policy_if_match_precondition(governed_client, isolated_profiles):
+    _write_policy(
+        isolated_profiles["default"],
+        {
+            "permissions": ["governance:read", "governance:write"],
+            "profiles": ["default"],
+            "routes": ["/api/governance/policy"],
+        },
+    )
+    _login(governed_client)
+
+    loaded = governed_client.get("/api/governance/policy")
+    assert loaded.status_code == 200
+    etag = loaded.json()["etag"]
+    assert etag
+
+    body = _read_policy(isolated_profiles["default"])
+    body["groups"] = {"operators": {"roles": ["reader"]}}
+
+    stale = governed_client.put(
+        "/api/governance/policy",
+        json=body,
+        headers={"If-Match": "0" * 64},
+    )
+    assert stale.status_code == 412
+    assert stale.json()["detail"]["error"] == "policy_conflict"
+    assert "operators" not in (_read_policy(isolated_profiles["default"]).get("groups") or {})
+
+    fresh = governed_client.put("/api/governance/policy", json=body, headers={"If-Match": etag})
+    assert fresh.status_code == 200
+    assert fresh.json()["etag"] != etag
+    assert _read_policy(isolated_profiles["default"])["groups"]["operators"]["roles"] == ["reader"]
+
+
+def test_governance_group_create_rejects_invalid_payload(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+    before = (isolated_profiles["default"] / "dashboard-governance.yaml").read_text(encoding="utf-8")
+
+    missing_name = governed_client.post("/api/governance/groups", json={"group": {"roles": []}})
+    bad_roles = governed_client.post(
+        "/api/governance/groups",
+        json={"name": "operators", "group": {"roles": "reader"}},
+    )
+    bad_grants = governed_client.post(
+        "/api/governance/groups",
+        json={"name": "operators", "group": {"grants": ["profiles"]}},
+    )
+
+    assert missing_name.status_code == 400
+    assert missing_name.json()["detail"]["error"] == "invalid_payload"
+    assert bad_roles.status_code == 400
+    assert bad_roles.json()["detail"]["error"] == "invalid_payload"
+    assert bad_grants.status_code == 400
+    assert bad_grants.json()["detail"]["error"] == "invalid_payload"
+    assert (isolated_profiles["default"] / "dashboard-governance.yaml").read_text(encoding="utf-8") == before
+    assert _policy_change_events() == []
+
+
+def test_governance_group_create_conflicts_on_existing_group(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    first = governed_client.post("/api/governance/groups", json={"name": "operators"})
+    second = governed_client.post("/api/governance/groups", json={"name": "operators"})
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"]["error"] == "group_exists"
+
+
+def test_governance_group_update_and_delete_unknown_group_returns_404(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    updated = governed_client.put("/api/governance/groups/ghost", json={"roles": []})
+    deleted = governed_client.delete("/api/governance/groups/ghost")
+
+    assert updated.status_code == 404
+    assert updated.json()["detail"]["error"] == "group_not_found"
+    assert deleted.status_code == 404
+    assert deleted.json()["detail"]["error"] == "group_not_found"
+    assert _policy_change_events() == []
+
+
+def test_governance_user_upsert_and_delete_happy_path(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    created = governed_client.put(
+        "/api/governance/users/Operator@Example.Test",
+        json={"roles": ["reader"], "groups": ["operators"], "grants": {"profiles": ["default"]}},
+    )
+    assert created.status_code == 200
+    assert created.json()["ok"] is True
+    saved = _read_policy(isolated_profiles["default"])["users"]["operator@example.test"]
+    assert saved["roles"] == ["reader"]
+    assert saved["groups"] == ["operators"]
+
+    updated = governed_client.put(
+        "/api/governance/users/operator@example.test",
+        json={"roles": ["writer"]},
+    )
+    assert updated.status_code == 200
+    assert _read_policy(isolated_profiles["default"])["users"]["operator@example.test"] == {"roles": ["writer"]}
+
+    deleted = governed_client.delete("/api/governance/users/operator@example.test")
+    assert deleted.status_code == 200
+    assert "operator@example.test" not in _read_policy(isolated_profiles["default"])["users"]
+
+    assert len(_policy_change_events(action="user_create")) == 1
+    assert len(_policy_change_events(action="user_update")) == 1
+    events = _policy_change_events(action="user_delete")
+    assert len(events) == 1
+    assert events[0]["extra"]["target"] == "operator@example.test"
+    assert events[0]["extra"]["before"] == {"roles": ["writer"]}
+    assert events[0]["extra"]["after"] is None
+
+
+def test_governance_user_upsert_rejects_invalid_payload(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    bad_email = governed_client.put("/api/governance/users/notanemail", json={"roles": []})
+    bad_groups = governed_client.put(
+        "/api/governance/users/operator@example.test",
+        json={"groups": "operators"},
+    )
+
+    assert bad_email.status_code == 400
+    assert bad_email.json()["detail"]["error"] == "invalid_payload"
+    assert bad_groups.status_code == 400
+    assert bad_groups.json()["detail"]["error"] == "invalid_payload"
+    assert _policy_change_events() == []
+
+
+def test_governance_user_delete_unknown_user_returns_404(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+
+    resp = governed_client.delete("/api/governance/users/ghost@example.test")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "user_not_found"
+    assert _policy_change_events() == []
+
+
+def test_put_governance_policy_writes_policy_change_audit_event(governed_client, isolated_profiles):
+    _write_admin_policy(isolated_profiles["default"])
+    _login(governed_client)
+    body = _read_policy(isolated_profiles["default"])
+    body["groups"] = {"operators": {"roles": ["reader"]}}
+
+    resp = governed_client.put("/api/governance/policy", json=body)
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    events = _policy_change_events(action="policy_replace")
+    assert len(events) == 1
+    event = events[0]
+    assert event["extra"]["target"] == "policy"
+    assert event["extra"]["before"]["groups"] == []
+    assert event["extra"]["after"]["groups"] == ["operators"]
+    assert event["extra"]["before"]["mode"] == "enforce"
+    assert event["extra"]["after"]["mode"] == "enforce"
