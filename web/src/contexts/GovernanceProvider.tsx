@@ -1,5 +1,4 @@
 import {
-  createContext,
   useCallback,
   useEffect,
   useMemo,
@@ -7,38 +6,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, type GovernanceEffectiveAccessResponse } from "@/lib/api";
-
-interface GovernanceContextValue {
-  access: GovernanceEffectiveAccessResponse | null;
-  loading: boolean;
-  error: string | null;
-  refresh: () => Promise<void>;
-  hasPermission: (permission: string) => boolean;
-  canRoute: (path: string) => boolean;
-  canProfile: (profile: string) => boolean;
-}
-
-const fallbackAccess: GovernanceEffectiveAccessResponse = {
-  mode: "off",
-  subject: {},
-  roles: [],
-  groups: [],
-  permissions: ["*"],
-  profiles: ["*"],
-  routes: ["*"],
-  grant_sources: [],
-  is_admin: true,
-};
-
-export const GovernanceContext = createContext<GovernanceContextValue>({
-  access: fallbackAccess,
-  loading: false,
-  error: null,
-  refresh: async () => {},
-  hasPermission: () => true,
-  canRoute: () => true,
-  canProfile: () => true,
-});
+import { GovernanceContext, fallbackAccess } from "@/contexts/governance-context";
 
 function setAllows(values: Set<string>, value: string): boolean {
   if (values.has("*")) return true;
@@ -51,11 +19,13 @@ export function GovernanceProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // All state updates happen after the fetch settles (never synchronously in
+  // the mount effect); `loading` starts true and only flips off here.
   const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
     try {
-      setAccess(await api.getGovernanceEffectiveAccess());
+      const next = await api.getGovernanceEffectiveAccess();
+      setAccess(next);
+      setError(null);
     } catch (err) {
       // Governance is optional/backwards compatible. If the endpoint is missing
       // or unavailable, fail open in the SPA; the backend remains authoritative.
@@ -67,7 +37,9 @@ export function GovernanceProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    // Defer to a microtask so no setState runs synchronously in the effect
+    // body (react-hooks/set-state-in-effect).
+    void Promise.resolve().then(refresh);
   }, [refresh]);
 
   const value = useMemo(() => {
