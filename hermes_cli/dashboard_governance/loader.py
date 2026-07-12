@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -130,10 +132,26 @@ def save_governance_policy(
     parse_governance_policy(data)
     policy_path = Path(path).expanduser() if path is not None else resolve_policy_path(config=config, hermes_home=hermes_home)
     policy_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = policy_path.with_suffix(policy_path.suffix + ".tmp")
-    tmp.write_text(
-        yaml.safe_dump(dict(data), sort_keys=False, default_flow_style=False),
-        encoding="utf-8",
+    # Unique temp name per writer: with a fixed ``<policy>.yaml.tmp`` two
+    # concurrent writers (the dashboard and the ``hermes governance`` CLI, or
+    # two dashboard workers) truncate the SAME temp file mid-write and can
+    # publish interleaved content. mkstemp gives each writer its own file, so
+    # concurrent saves degrade to last-write-wins of complete snapshots.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(policy_path.parent),
+        prefix=f".{policy_path.name}.",
+        suffix=".tmp",
     )
-    tmp.replace(policy_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(dict(data), handle, sort_keys=False, default_flow_style=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, policy_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return policy_path
