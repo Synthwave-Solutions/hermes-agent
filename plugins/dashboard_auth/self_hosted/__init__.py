@@ -66,6 +66,29 @@ same precedence convention as the ``nous`` plugin)::
     HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
                                         # (the .env file is the canonical home —
                                         # it's a secret, not a behavioural setting)
+    HERMES_DASHBOARD_OIDC_GROUP_CLAIM   # optional; ID-token claim carrying the
+                                        # user's SSO groups (default "groups")
+    HERMES_DASHBOARD_OIDC_ROLE_CLAIM    # optional; ID-token claim carrying the
+                                        # user's roles (default unset: roles
+                                        # are NOT extracted)
+
+Governance group mapping: the dashboard-governance layer maps SSO groups to
+roles, so the provider surfaces the verified ID token's group memberships on
+``Session.groups``. The claim name is configurable via
+``dashboard.governance.sso_group_claim`` in config.yaml (or the
+``HERMES_DASHBOARD_OIDC_GROUP_CLAIM`` env override), defaulting to
+``groups``. Google's ID tokens carry no groups claim at all, only ``hd``
+(the Workspace domain) and ``email``, so both are always appended as
+pseudo-groups a governance policy can match on.
+
+Role ingestion is opt-in: ``Session.roles`` names are seeded directly into
+the governance resolver's effective role set, so an IDP-emitted role string
+that happens to collide with a policy role name (e.g. Azure AD app roles in
+``roles``) would silently receive that role's grants. The provider therefore
+extracts roles ONLY when the operator names a claim explicitly via
+``dashboard.governance.sso_role_claim`` (or the
+``HERMES_DASHBOARD_OIDC_ROLE_CLAIM`` env override); with no role claim
+configured, ``Session.roles`` stays empty.
 
 Skip reasons: when the plugin loads but can't register (missing issuer /
 client_id), it writes a human-readable reason to the module-level
@@ -106,6 +129,44 @@ logger = logging.getLogger(__name__)
 # OIDC core scopes. ``openid`` is mandatory (without it the IDP won't issue an
 # ID token); ``profile``/``email`` populate the Session's display_name/email.
 _DEFAULT_SCOPES = "openid profile email"
+
+# Default ID-token claim carrying the user's SSO group memberships. Keycloak,
+# Authentik, Zitadel and Okta all emit ``groups`` when the client is mapped;
+# operators whose IDP uses another name (e.g. Azure AD emits ``roles`` or a
+# ``wids`` list) set ``dashboard.governance.sso_group_claim`` instead.
+_DEFAULT_GROUP_CLAIM = "groups"
+
+# There is deliberately NO default role claim. Unlike groups (which only take
+# effect through an explicit ``sso_groups`` mapping or a name collision the
+# operator controls), ``Session.roles`` names are seeded directly into the
+# governance resolver's effective role set, so blindly ingesting an IDP's
+# ``roles`` claim would let any IDP-emitted role string that collides with a
+# policy role name (e.g. "admin") silently pick up that role's grants. Role
+# extraction is opt-in via ``dashboard.governance.sso_role_claim``.
+_DEFAULT_ROLE_CLAIM = ""
+
+# ID-token claims that are pure protocol plumbing, not identity. These are
+# stripped before the claims dict is attached to ``Session.claims`` so the
+# governance layer only ever sees identity facets (and nothing resembling a
+# credential: ``nonce``/``at_hash``/``c_hash`` are token-binding artefacts).
+_PROTOCOL_CLAIMS = frozenset(
+    {
+        "exp",
+        "iat",
+        "nbf",
+        "aud",
+        "iss",
+        "jti",
+        "azp",
+        "nonce",
+        "at_hash",
+        "c_hash",
+        "sid",
+        "auth_time",
+        "acr",
+        "amr",
+    }
+)
 
 # Signing algorithms we accept on the ID token. RS256 is the OIDC default;
 # ES256 is common on modern self-hosted IDPs (Zitadel, newer Keycloak realms).
@@ -184,6 +245,8 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        group_claim: str = _DEFAULT_GROUP_CLAIM,
+        role_claim: str = _DEFAULT_ROLE_CLAIM,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -202,6 +265,15 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # provisioned-but-blank secret can't flip us into a broken confidential
         # mode that sends an empty client_secret. Non-empty ⇒ confidential.
         self._client_secret = (client_secret or "").strip()
+        # ID-token claim carrying SSO group memberships (governance mapping).
+        # Empty/whitespace falls back to the default so a blank config value
+        # can't silently disable group extraction.
+        self._group_claim = (group_claim or "").strip() or _DEFAULT_GROUP_CLAIM
+        # ID-token claim carrying role names. Empty (the default) DISABLES
+        # role extraction: roles map 1:1 onto governance policy role names,
+        # so ingesting them must be an explicit operator opt-in (see
+        # _DEFAULT_ROLE_CLAIM).
+        self._role_claim = (role_claim or "").strip()
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -661,6 +733,66 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
 
     # ---- internals: mapping + misc ----------------------------------------
 
+    @staticmethod
+    def _claim_values(value: Any) -> tuple[str, ...]:
+        """Normalise a groups/roles claim value to a tuple of strings.
+
+        Accepts the shapes IDPs actually emit: a JSON list (Keycloak,
+        Authentik, Okta), a comma- or space-separated string (some Azure AD
+        and ADFS mappers), or a single bare string. Anything else (None,
+        numbers, objects) yields the empty tuple.
+        """
+        if isinstance(value, list):
+            return tuple(str(v).strip() for v in value if str(v).strip())
+        if isinstance(value, str):
+            parts = value.replace(",", " ").split()
+            return tuple(p for p in parts if p)
+        return ()
+
+    def _governance_facets(
+        self, claims: Dict[str, Any], *, email: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...], Dict[str, Any]]:
+        """Derive ``(groups, roles, identity_claims)`` from verified claims.
+
+        Groups come from the configured group claim (default ``groups``),
+        plus two pseudo-groups a governance policy can always match on:
+        Google's ``hd`` (Workspace hosted domain; Google ID tokens carry no
+        groups claim at all) and the user's ``email``. Duplicates are
+        removed order-preservingly.
+
+        Roles come from the configured role claim and ONLY when one is set:
+        role names land directly in the governance resolver's effective role
+        set, so extraction without an explicit operator opt-in would let a
+        colliding IDP role string (e.g. an Azure AD app role named "admin")
+        silently inherit a policy role's grants.
+
+        The returned claims dict is a filtered copy: protocol claims
+        (exp/iat/aud/nonce/at_hash/...) are stripped so only identity facets
+        reach the governance layer. Tokens are never included; the input is
+        the decoded ID-token payload, which by construction carries no
+        credential material beyond the hashes stripped here.
+        """
+        groups: list[str] = list(self._claim_values(claims.get(self._group_claim)))
+        hd = str(claims.get("hd", "") or "").strip()
+        if hd:
+            groups.append(hd)
+        if email:
+            groups.append(email)
+        deduped = tuple(dict.fromkeys(groups))
+
+        roles = (
+            tuple(dict.fromkeys(self._claim_values(claims.get(self._role_claim))))
+            if self._role_claim
+            else ()
+        )
+
+        identity_claims = {
+            key: value
+            for key, value in claims.items()
+            if key not in _PROTOCOL_CLAIMS
+        }
+        return deduped, roles, identity_claims
+
     def _session_from_tokens(
         self,
         *,
@@ -698,6 +830,14 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 org_id = ",".join(str(g) for g in groups)
         org_id = str(org_id or "")
 
+        # Governance identity facets: SSO groups (configurable claim name,
+        # plus Google ``hd`` / email pseudo-groups), roles, and the filtered
+        # identity-claims dict. Re-derived on every verify_session because
+        # the session is stateless (the ID token IS the session).
+        session_groups, session_roles, identity_claims = self._governance_facets(
+            claims, email=email
+        )
+
         return Session(
             user_id=user_id,
             email=email,
@@ -707,6 +847,9 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             expires_at=int(claims["exp"]),
             access_token=id_token,
             refresh_token=refresh_token,
+            groups=session_groups,
+            roles=session_roles,
+            claims=identity_claims,
         )
 
     def _validate_redirect_uri(self, redirect_uri: str) -> None:
@@ -774,6 +917,27 @@ def _oidc_subsection(oauth_section: dict) -> dict:
     return sub if isinstance(sub, dict) else {}
 
 
+def _load_config_governance_section() -> dict:
+    """Return the ``dashboard.governance`` block from config.yaml, or ``{}``.
+
+    Same robustness contract as :func:`_load_config_oauth_section`: any load
+    failure or non-dict shape falls through to ``{}``.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+    except Exception as exc:  # noqa: BLE001 (broad catch is intentional)
+        logger.debug(
+            "dashboard-auth-self-hosted: load_config() raised %s; "
+            "falling back to env-only governance configuration",
+            exc,
+        )
+        return {}
+    section = cfg_get(cfg, "dashboard", "governance", default=None)
+    return section if isinstance(section, dict) else {}
+
+
 def _resolve_setting(env_var: str, cfg_value: Any) -> str:
     """env-wins-config with empty-is-unset precedence.
 
@@ -822,6 +986,24 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    # Governance group mapping: which verified ID-token claim carries the
+    # user's SSO groups. Lives under dashboard.governance (not .oauth) because
+    # it configures the governance layer's input, not the OAuth handshake.
+    governance_cfg = _load_config_governance_section()
+    group_claim = (
+        _resolve_setting(
+            "HERMES_DASHBOARD_OIDC_GROUP_CLAIM",
+            governance_cfg.get("sso_group_claim"),
+        )
+        or _DEFAULT_GROUP_CLAIM
+    )
+    # No default fallback: unset means role extraction stays disabled (roles
+    # map directly onto governance policy role names, so ingesting an IDP
+    # claim is an explicit operator opt-in).
+    role_claim = _resolve_setting(
+        "HERMES_DASHBOARD_OIDC_ROLE_CLAIM",
+        governance_cfg.get("sso_role_claim"),
+    )
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -842,6 +1024,8 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            group_claim=group_claim,
+            role_claim=role_claim,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
@@ -853,10 +1037,13 @@ def register(ctx) -> None:
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
         "dashboard-auth-self-hosted: registered provider "
-        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s)",
+        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s, "
+        "group_claim=%s, role_claim=%s)",
         issuer,
         client_id,
         scopes,
         # Log only whether a secret is present, never the secret itself.
         bool(client_secret),
+        group_claim,
+        role_claim or "<disabled>",
     )
