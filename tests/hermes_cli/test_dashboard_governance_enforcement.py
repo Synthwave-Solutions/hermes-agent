@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import ModuleType, SimpleNamespace
-import importlib
+import importlib.util
 import sys
 
 
@@ -18,8 +18,12 @@ def _load_enforcement(monkeypatch):
     fake_responses.JSONResponse = JSONResponse
     monkeypatch.setitem(sys.modules, "fastapi", fake_fastapi)
     monkeypatch.setitem(sys.modules, "fastapi.responses", fake_responses)
-    sys.modules.pop("hermes_cli.dashboard_governance.enforcement", None)
-    return importlib.import_module("hermes_cli.dashboard_governance.enforcement")
+    # Load a private copy without touching sys.modules for the enforcement
+    # module itself: other tests must keep importing the real-fastapi version.
+    spec = importlib.util.find_spec("hermes_cli.dashboard_governance.enforcement")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class _Session:
