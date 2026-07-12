@@ -224,6 +224,11 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    # Serializes governance-policy read-modify-write cycles so two concurrent
+    # /api/governance mutations can never interleave and silently drop each
+    # other's entry edits (the loader's atomic replace only protects a single
+    # writer's snapshot, not the read-then-write sequence).
+    app.state.governance_policy_lock = asyncio.Lock()
 
     # Import hermes_cli.gateway eagerly *before* the lifespan yield so the
     # GIL-heavy .pyc compilation and Defender scan cost is absorbed during
@@ -299,6 +304,20 @@ def _get_chat_argv_lock(app: "FastAPI") -> asyncio.Lock:
     except AttributeError:
         app.state.chat_argv_lock = asyncio.Lock()
         return app.state.chat_argv_lock
+
+
+def _get_governance_policy_lock(app: "FastAPI") -> asyncio.Lock:
+    """Return the governance-policy mutation lock from app.state.
+
+    Mirrors :func:`_get_chat_argv_lock`: prefers the lifespan-initialised Lock
+    (created on the correct event loop) but lazily initialises it for
+    non-``with`` TestClient usages.
+    """
+    try:
+        return app.state.governance_policy_lock
+    except AttributeError:
+        app.state.governance_policy_lock = asyncio.Lock()
+        return app.state.governance_policy_lock
 
 
 def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
@@ -13560,8 +13579,10 @@ async def get_governance_policy(request: Request):
     )
 
     access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    payload = safe_policy_payload(policy_for_request(request))
     return {
-        "policy": safe_policy_payload(policy_for_request(request)),
+        "policy": payload,
+        "etag": _governance_policy_etag(payload),
         "effective_access": serialize_effective_access(access),
     }
 
@@ -13576,19 +13597,44 @@ async def put_governance_policy(request: Request, body: Dict[str, Any]):
     )
     from hermes_cli.dashboard_governance.loader import GovernancePolicyError, save_governance_policy
 
-    try:
-        path = save_governance_policy(body)
-    except GovernancePolicyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception:
-        _log.exception("PUT /api/governance/policy failed")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    _require_governance_admin(request)
+    async with _get_governance_policy_lock(request.app):
+        current = safe_policy_payload(policy_for_request(request))
+        # Optimistic concurrency: a client that echoes the etag it loaded
+        # (If-Match) cannot silently revert entry edits that landed between
+        # its GET and this full-replace PUT.
+        expected_etag = str(request.headers.get("if-match") or "").strip().strip('"')
+        if expected_etag and expected_etag != _governance_policy_etag(current):
+            raise HTTPException(
+                status_code=412,
+                detail={
+                    "error": "policy_conflict",
+                    "message": "policy changed since it was loaded; reload and retry",
+                },
+            )
+        before = _governance_policy_summary(current)
+        try:
+            path = save_governance_policy(body)
+        except GovernancePolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception:
+            _log.exception("PUT /api/governance/policy failed")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
+    _audit_governance_policy_change(
+        request,
+        action="policy_replace",
+        target="policy",
+        before=before,
+        after=_governance_policy_summary(body),
+    )
     access = effective_access_for_request(request)
+    payload = safe_policy_payload(policy_for_request(request))
     return {
         "ok": True,
         "path": str(path),
-        "policy": safe_policy_payload(policy_for_request(request)),
+        "policy": payload,
+        "etag": _governance_policy_etag(payload),
         "effective_access": serialize_effective_access(access),
     }
 
@@ -13609,6 +13655,235 @@ async def get_governance_groups(request: Request):
     policy = policy_for_request(request)
     raw_groups = policy.raw.get("groups") if isinstance(policy.raw.get("groups"), dict) else {}
     return {"groups": raw_groups or {}}
+
+
+def _require_governance_admin(request: Request) -> None:
+    """Defense-in-depth gate for policy-mutating governance endpoints.
+
+    The governance middleware only hard-denies in ``enforce`` mode: in
+    ``report_only`` (the documented Stage 1 rollout mode) denied requests are
+    audited as ``would_deny`` and still reach the handler, and with mode
+    ``off`` / no policy file every request passes with reason
+    ``governance_off``. Policy mutations must never execute for subjects
+    without ``governance:write`` regardless of mode, otherwise any
+    authenticated session-holder could persist grants for themselves during a
+    dry-run rollout (or bootstrap a policy file that flips mode to enforce).
+    """
+    from hermes_cli.dashboard_governance.enforcement import effective_access_for_request
+
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    if not access.has_permission("governance:write"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def _governance_policy_etag(raw: Any) -> str:
+    """Content hash of a policy payload for optimistic-concurrency checks."""
+    payload = raw if isinstance(raw, dict) else {}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _governance_policy_summary(raw: Any) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    users = data.get("users") if isinstance(data.get("users"), dict) else {}
+    groups = data.get("groups") if isinstance(data.get("groups"), dict) else {}
+    roles = data.get("roles") if isinstance(data.get("roles"), dict) else {}
+    return {
+        "version": data.get("version"),
+        "mode": str(data.get("mode") or ""),
+        "users": sorted(str(key) for key in users),
+        "groups": sorted(str(key) for key in groups),
+        "roles": sorted(str(key) for key in roles),
+    }
+
+
+def _audit_governance_policy_change(
+    request: Request,
+    *,
+    action: str,
+    target: str = "",
+    before: Any = None,
+    after: Any = None,
+) -> None:
+    try:
+        from hermes_cli.dashboard_governance.audit import append_audit_event
+        from hermes_cli.dashboard_governance.enforcement import effective_access_for_request
+
+        access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+        append_audit_event(
+            "policy_change",
+            subject_email=access.subject.email,
+            subject_user_id=access.subject.user_id,
+            path=request.url.path,
+            method=request.method,
+            reason=action,
+            mode=access.mode,
+            extra={"action": action, "target": target, "before": before, "after": after},
+        )
+    except Exception:
+        # Policy writes must not fail because the audit sink is temporarily
+        # unwritable; the mutation itself has already been persisted.
+        return
+
+
+def _validated_governance_entry(raw_entry: Any, *, kind: str) -> Dict[str, Any]:
+    if raw_entry is None:
+        return {}
+    if not isinstance(raw_entry, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": f"{kind} entry must be an object"},
+        )
+    for field_name in ("roles", "groups", "sso_groups"):
+        value = raw_entry.get(field_name)
+        if value is not None and not isinstance(value, list):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "invalid_payload", "message": f"{kind} {field_name} must be a list"},
+            )
+    grants = raw_entry.get("grants")
+    if grants is not None and not isinstance(grants, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": f"{kind} grants must be an object"},
+        )
+    return dict(raw_entry)
+
+
+def _governance_raw_policy(request: Request) -> Dict[str, Any]:
+    from hermes_cli.dashboard_governance.enforcement import policy_for_request
+
+    return dict(policy_for_request(request).raw or {})
+
+
+def _save_governance_raw_policy(raw: Dict[str, Any], *, label: str) -> Path:
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, save_governance_policy
+
+    try:
+        return save_governance_policy(raw)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_policy", "message": str(exc)})
+    except Exception:
+        _log.exception("%s failed", label)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/governance/groups")
+async def post_governance_group(request: Request, body: Dict[str, Any]):
+    _require_governance_admin(request)
+    name = str(body.get("name") or "").strip() if isinstance(body, dict) else ""
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": "name must be a non-empty string"},
+        )
+    entry = _validated_governance_entry(body.get("group"), kind="group")
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        groups = dict(raw.get("groups")) if isinstance(raw.get("groups"), dict) else {}
+        if name in groups:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "group_exists", "message": f"group already exists: {name}"},
+            )
+        groups[name] = entry
+        raw["groups"] = groups
+        path = _save_governance_raw_policy(raw, label="POST /api/governance/groups")
+    _audit_governance_policy_change(request, action="group_create", target=name, before=None, after=entry)
+    return {"ok": True, "path": str(path), "groups": groups}
+
+
+@app.put("/api/governance/groups/{name}")
+async def put_governance_group(request: Request, name: str, body: Dict[str, Any]):
+    _require_governance_admin(request)
+    group_name = str(name or "").strip()
+    entry = _validated_governance_entry(body, kind="group")
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        groups = dict(raw.get("groups")) if isinstance(raw.get("groups"), dict) else {}
+        if group_name not in groups:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "group_not_found", "message": f"unknown group: {group_name}"},
+            )
+        before = groups.get(group_name)
+        groups[group_name] = entry
+        raw["groups"] = groups
+        path = _save_governance_raw_policy(raw, label="PUT /api/governance/groups/{name}")
+    _audit_governance_policy_change(request, action="group_update", target=group_name, before=before, after=entry)
+    return {"ok": True, "path": str(path), "groups": groups}
+
+
+@app.delete("/api/governance/groups/{name}")
+async def delete_governance_group(request: Request, name: str):
+    _require_governance_admin(request)
+    group_name = str(name or "").strip()
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        groups = dict(raw.get("groups")) if isinstance(raw.get("groups"), dict) else {}
+        if group_name not in groups:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "group_not_found", "message": f"unknown group: {group_name}"},
+            )
+        before = groups.pop(group_name)
+        raw["groups"] = groups
+        path = _save_governance_raw_policy(raw, label="DELETE /api/governance/groups/{name}")
+    _audit_governance_policy_change(request, action="group_delete", target=group_name, before=before, after=None)
+    return {"ok": True, "path": str(path), "groups": groups}
+
+
+@app.put("/api/governance/users/{email}")
+async def put_governance_user(request: Request, email: str, body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.models import _norm_email
+
+    _require_governance_admin(request)
+    normalized = _norm_email(email)
+    if not normalized or "@" not in normalized:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": "email must be a valid address"},
+        )
+    entry = _validated_governance_entry(body, kind="user")
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        users = dict(raw.get("users")) if isinstance(raw.get("users"), dict) else {}
+        before = None
+        for existing_key in list(users):
+            if _norm_email(str(existing_key)) == normalized:
+                before = users.pop(existing_key)
+        users[normalized] = entry
+        raw["users"] = users
+        path = _save_governance_raw_policy(raw, label="PUT /api/governance/users/{email}")
+    action = "user_update" if before is not None else "user_create"
+    _audit_governance_policy_change(request, action=action, target=normalized, before=before, after=entry)
+    return {"ok": True, "path": str(path), "users": users}
+
+
+@app.delete("/api/governance/users/{email}")
+async def delete_governance_user(request: Request, email: str):
+    from hermes_cli.dashboard_governance.models import _norm_email
+
+    _require_governance_admin(request)
+    normalized = _norm_email(email)
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        users = dict(raw.get("users")) if isinstance(raw.get("users"), dict) else {}
+        before = None
+        found = False
+        for existing_key in list(users):
+            if _norm_email(str(existing_key)) == normalized:
+                before = users.pop(existing_key)
+                found = True
+        if not found:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "user_not_found", "message": f"unknown user: {normalized}"},
+            )
+        raw["users"] = users
+        path = _save_governance_raw_policy(raw, label="DELETE /api/governance/users/{email}")
+    _audit_governance_policy_change(request, action="user_delete", target=normalized, before=before, after=None)
+    return {"ok": True, "path": str(path), "users": users}
 
 
 @app.post("/api/governance/preview")
