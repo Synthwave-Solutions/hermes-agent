@@ -57,6 +57,69 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+def _extract_omniroute_route(http_response) -> tuple[str, str] | None:
+    """Extract the provider and model routed by OmniRoute response headers."""
+    headers = getattr(http_response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        model = headers.get("x-omniroute-model")
+        provider = headers.get("x-omniroute-provider")
+    except Exception:
+        return None
+    if model and provider:
+        return provider, model
+    return None
+
+
+def capture_omniroute_route(agent, response) -> None:
+    """Update context compression for the model actually selected by OmniRoute."""
+    route_info = getattr(agent, "_omniroute_route_info", None)
+    agent._omniroute_route_info = None
+    if route_info:
+        provider, model = route_info
+        resolved_model = f"{provider}/{model}"
+    else:
+        resolved_model = getattr(response, "model", None) if response else None
+
+    if not resolved_model or resolved_model == agent.model:
+        return
+    if getattr(agent, "_effective_routed_model", None) == resolved_model:
+        return
+
+    from agent.model_metadata import get_model_context_length
+
+    try:
+        context_length = get_model_context_length(
+            resolved_model,
+            base_url=agent.base_url,
+            api_key=agent.api_key,
+            provider=agent.provider,
+        )
+    except Exception:
+        logger.debug(
+            "Failed to resolve context length for routed model %r",
+            resolved_model,
+            exc_info=True,
+        )
+        return
+    if context_length is None:
+        logger.debug("No context length resolved for routed model %r", resolved_model)
+        return
+
+    agent._effective_routed_model = resolved_model
+    agent._effective_context_length = context_length
+    agent.context_compressor.update_model(
+        model=resolved_model,
+        context_length=context_length,
+        base_url=agent.base_url or "",
+        api_key=agent.api_key or "",
+        provider=agent.provider or "",
+        api_mode=agent.api_mode or "",
+        max_tokens=getattr(agent, "max_tokens", None),
+    )
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -429,7 +492,12 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    raw_response = request_client.chat.completions.with_raw_response.create(**api_kwargs)
+    response = raw_response.parse()
+    omniroute_route = _extract_omniroute_route(raw_response)
+    if omniroute_route:
+        agent._omniroute_route_info = omniroute_route
+    return response
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2854,6 +2922,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Log OpenRouter response cache status when present.
         agent._check_openrouter_cache_status(getattr(stream, "response", None))
+
+        omniroute_route = _extract_omniroute_route(getattr(stream, "response", None))
+        if omniroute_route:
+            agent._omniroute_route_info = omniroute_route
 
         content_parts: list = []
         tool_calls_acc: dict = {}
