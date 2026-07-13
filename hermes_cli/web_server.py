@@ -16,6 +16,7 @@ import base64
 import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import hmac
 import importlib.util
 import json
@@ -33,6 +34,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
@@ -175,6 +177,11 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    # Serializes governance-policy read-modify-write cycles so two concurrent
+    # /api/governance mutations can never interleave and silently drop each
+    # other's entry edits (the loader's atomic replace only protects a single
+    # writer's snapshot, not the read-then-write sequence).
+    app.state.governance_policy_lock = asyncio.Lock()
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
@@ -235,6 +242,20 @@ def _get_chat_argv_lock(app: "FastAPI") -> asyncio.Lock:
     except AttributeError:
         app.state.chat_argv_lock = asyncio.Lock()
         return app.state.chat_argv_lock
+
+
+def _get_governance_policy_lock(app: "FastAPI") -> asyncio.Lock:
+    """Return the governance-policy mutation lock from app.state.
+
+    Mirrors :func:`_get_chat_argv_lock`: prefers the lifespan-initialised Lock
+    (created on the correct event loop) but lazily initialises it for
+    non-``with`` TestClient usages.
+    """
+    try:
+        return app.state.governance_policy_lock
+    except AttributeError:
+        app.state.governance_policy_lock = asyncio.Lock()
+        return app.state.governance_policy_lock
 
 
 def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
@@ -474,6 +495,86 @@ async def host_header_middleware(request: Request, call_next):
                 },
             )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _plugin_api_runtime_gate(request: Request, call_next):
+    """Block requests to disabled plugin API routes at request time.
+
+    :func:`_mount_plugin_api_routes` gates at import time, but if a plugin
+    is disabled *after* the dashboard is already running, its FastAPI router
+    remains mounted until restart.  This middleware enforces the enabled/
+    disabled policy on every request to ``/api/plugins/{name}/...`` so that
+    runtime config changes take effect immediately.
+
+    Registered BEFORE the auth middlewares (so it executes AFTER them): a
+    request that hasn't cleared auth must get auth's 401 first, never this
+    gate's 404 — otherwise an unauthenticated caller could fingerprint which
+    plugins are installed/enabled by reading the status code. We only reach
+    the enabled/disabled check for a request that auth already let through.
+    """
+    path = request.url.path
+    if path.startswith("/api/plugins/"):
+        # Only gate authenticated requests. Unauthenticated ones fall
+        # through so auth_middleware / the OAuth gate return 401 first and
+        # this route can't be used as a plugin-name oracle.
+        _authed = (
+            getattr(request.state, "token_authenticated", False)
+            or getattr(request.app.state, "auth_required", False)
+            or _has_valid_session_token(request)
+            or _has_valid_query_token(request, path)
+        )
+        if _authed:
+            # Extract plugin name from /api/plugins/<name>/...
+            parts = path.split("/")
+            # parts: ['', 'api', 'plugins', '<name>', ...]
+            if len(parts) >= 4:
+                plugin_name = parts[3]
+                if plugin_name:
+                    try:
+                        from hermes_cli.plugins_cmd import (
+                            _get_enabled_set,
+                            _get_disabled_set,
+                        )
+                        enabled_set = _get_enabled_set()
+                        disabled_set = _get_disabled_set()
+                    except Exception:
+                        enabled_set = set()
+                        disabled_set = set()
+                    # Determine plugin source.  Check the cached plugin list;
+                    # if not found, assume user plugin (safe default — blocks).
+                    plugins = _get_dashboard_plugins()
+                    plugin = next(
+                        (p for p in plugins if p.get("name") == plugin_name),
+                        None,
+                    )
+                    source = plugin.get("source") if plugin else "user"
+                    if source == "user":
+                        if plugin_name in disabled_set or plugin_name not in enabled_set:
+                            return JSONResponse(
+                                status_code=404,
+                                content={"detail": "Plugin not found"},
+                            )
+                    elif source == "bundled":
+                        if plugin_name in disabled_set:
+                            return JSONResponse(
+                                status_code=404,
+                                content={"detail": "Plugin not found"},
+                            )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _dashboard_governance_gate(request: Request, call_next):
+    """Whitelist-first dashboard governance gate.
+
+    Registered after the plugin runtime gate but before the OAuth/token gates,
+    so middleware execution sees authenticated request.state principals before
+    handlers run while keeping public auth-bootstrap routes reachable.
+    """
+    from hermes_cli.dashboard_governance.enforcement import governance_middleware
+
+    return await governance_middleware(request, call_next)
 
 
 # ---------------------------------------------------------------------------
@@ -1910,6 +2011,169 @@ async def fs_default_cwd():
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
 
 
+# ---------------------------------------------------------------------------
+# Git ops — the remote half of the desktop coding rail + review pane.
+#
+# The desktop runs these as Electron-local git on the user's machine; over a
+# remote gateway that's the wrong filesystem, so we mirror them here (same auth
+# gate + path hardening as /api/fs). Logic lives in ``hermes_cli.web_git``;
+# these are thin, executor-offloaded wrappers (git/gh can block).
+# ---------------------------------------------------------------------------
+
+from hermes_cli import web_git as _web_git  # noqa: E402
+
+
+async def _git_op(fn, *args):
+    """Run a (blocking) git op off the event loop; map a failed mutation to 400."""
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, fn, *args)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "git operation failed")
+
+
+def _git_path(path: str) -> str:
+    return str(_fs_path(path))
+
+
+class GitPathBody(BaseModel):
+    path: str
+
+
+class GitFileBody(BaseModel):
+    path: str
+    file: Optional[str] = None
+
+
+class GitCommitBody(BaseModel):
+    path: str
+    message: str
+    push: bool = False
+
+
+class GitWorktreeAddBody(BaseModel):
+    path: str
+    name: Optional[str] = None
+    branch: Optional[str] = None
+    base: Optional[str] = None
+    existingBranch: Optional[str] = None
+
+
+class GitWorktreeRemoveBody(BaseModel):
+    path: str
+    worktreePath: str
+    force: bool = False
+
+
+class GitBranchSwitchBody(BaseModel):
+    path: str
+    branch: str
+
+
+@app.get("/api/git/status")
+async def git_status_route(path: str):
+    return await _git_op(_web_git.repo_status, _git_path(path))
+
+
+@app.get("/api/git/worktrees")
+async def git_worktrees_route(path: str):
+    return {"worktrees": await _git_op(_web_git.worktree_list, _git_path(path))}
+
+
+@app.get("/api/git/branches")
+async def git_branches_route(path: str):
+    return {"branches": await _git_op(_web_git.branch_list, _git_path(path))}
+
+
+@app.get("/api/git/review/list")
+async def git_review_list_route(path: str, scope: str = "uncommitted", base: Optional[str] = None):
+    return await _git_op(_web_git.review_list, _git_path(path), scope, base)
+
+
+@app.get("/api/git/review/diff")
+async def git_review_diff_route(
+    path: str, file: str, scope: str = "uncommitted", base: Optional[str] = None, staged: bool = False
+):
+    return {"diff": await _git_op(_web_git.review_diff, _git_path(path), file, scope, base, staged)}
+
+
+@app.get("/api/git/file-diff")
+async def git_file_diff_route(path: str, file: str):
+    return {"diff": await _git_op(_web_git.file_diff_vs_head, _git_path(path), file)}
+
+
+@app.get("/api/git/review/commit-context")
+async def git_commit_context_route(path: str):
+    return await _git_op(_web_git.review_commit_context, _git_path(path))
+
+
+@app.get("/api/git/review/rev-parse")
+async def git_rev_parse_route(path: str, ref: Optional[str] = None):
+    return {"sha": await _git_op(_web_git.review_rev_parse, _git_path(path), ref)}
+
+
+@app.get("/api/git/review/ship-info")
+async def git_ship_info_route(path: str):
+    return await _git_op(_web_git.review_ship_info, _git_path(path))
+
+
+@app.post("/api/git/review/stage")
+async def git_stage_route(body: GitFileBody):
+    return await _git_op(_web_git.review_stage, _git_path(body.path), body.file)
+
+
+@app.post("/api/git/review/unstage")
+async def git_unstage_route(body: GitFileBody):
+    return await _git_op(_web_git.review_unstage, _git_path(body.path), body.file)
+
+
+@app.post("/api/git/review/revert")
+async def git_revert_route(body: GitFileBody):
+    return await _git_op(_web_git.review_revert, _git_path(body.path), body.file)
+
+
+@app.post("/api/git/review/commit")
+async def git_commit_route(body: GitCommitBody):
+    return await _git_op(_web_git.review_commit, _git_path(body.path), body.message, body.push)
+
+
+@app.post("/api/git/review/push")
+async def git_push_route(body: GitPathBody):
+    return await _git_op(_web_git.review_push, _git_path(body.path))
+
+
+@app.post("/api/git/review/create-pr")
+async def git_create_pr_route(body: GitPathBody):
+    return await _git_op(_web_git.review_create_pr, _git_path(body.path))
+
+
+@app.post("/api/git/worktree/add")
+async def git_worktree_add_route(body: GitWorktreeAddBody):
+    options = {
+        key: value
+        for key, value in {
+            "name": body.name,
+            "branch": body.branch,
+            "base": body.base,
+            "existingBranch": body.existingBranch,
+        }.items()
+        if value
+    }
+    return await _git_op(_web_git.worktree_add, _git_path(body.path), options)
+
+
+@app.post("/api/git/worktree/remove")
+async def git_worktree_remove_route(body: GitWorktreeRemoveBody):
+    return await _git_op(
+        _web_git.worktree_remove, _git_path(body.path), _git_path(body.worktreePath), body.force
+    )
+
+
+@app.post("/api/git/branch/switch")
+async def git_branch_switch_route(body: GitBranchSwitchBody):
+    return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -2286,6 +2550,70 @@ async def run_curator():
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to run curator: {exc}")
     return {"ok": True, "pid": proc.pid, "name": "curator-run"}
+
+
+@app.get("/api/learning/graph")
+async def get_learning_graph(profile: Optional[str] = None):
+    """Learning graph payload for the desktop panel.
+
+    Profile-scoped view of learned, non-base skills plus memory chunks, with
+    graph links derived from skill relations and memory-skill overlap.
+    """
+    try:
+        from agent.learning_graph import build_learning_graph
+
+        with _profile_scope(profile):
+            return build_learning_graph()
+    except Exception:
+        _log.exception("GET /api/learning/graph failed")
+        raise HTTPException(status_code=500, detail="Failed to build learning graph")
+
+
+class LearningNodeRef(BaseModel):
+    id: str
+    profile: Optional[str] = None
+
+
+class LearningNodeEdit(BaseModel):
+    id: str
+    content: str
+    profile: Optional[str] = None
+
+
+@app.get("/api/learning/node")
+async def get_learning_node(id: str, profile: Optional[str] = None):
+    """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""
+    from agent.learning_mutations import node_detail
+
+    with _profile_scope(profile):
+        res = node_detail(id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
+    return res
+
+
+@app.delete("/api/learning/node")
+async def delete_learning_node(body: LearningNodeRef):
+    """Delete a journey node — skills are archived (restorable), memories removed."""
+    from agent.learning_mutations import delete_node
+
+    with _profile_scope(body.profile):
+        res = delete_node(body.id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
+    return res
+
+
+@app.put("/api/learning/node")
+async def update_learning_node(body: LearningNodeEdit):
+    """Rewrite a journey node's content (SKILL.md or memory chunk)."""
+    from agent.learning_mutations import edit_node
+
+    with _profile_scope(body.profile):
+        res = edit_node(body.id, body.content)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
+    return res
 
 
 def _safe_call(mod, fn_name: str, default):
@@ -2704,8 +3032,15 @@ async def gateway_drain(request: Request):
             detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
         )
 
-    payload = write_drain_request(principal=str(principal))
-    _log.info("Gateway drain BEGIN requested by %s", principal)
+    payload = write_drain_request(
+        principal=str(principal),
+        suppress_notification=bool((body or {}).get("suppress_notification", False)),
+    )
+    _log.info(
+        "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
+        principal,
+        payload["suppress_notification"],
+    )
     return {
         "ok": True,
         "action": "drain",
@@ -2713,6 +3048,7 @@ async def gateway_drain(request: Request):
         # Echo so a caller polling /api/status knows the marker is now set;
         # the gateway watcher flips gateway_state -> draining within ~1s.
         "draining": drain_requested(),
+        "suppress_notification": payload["suppress_notification"],
     }
 
 
@@ -2983,6 +3319,28 @@ def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
     return f"{name} ({category})" if category else name
 
 
+# Collapses repeated identical ElevenLabs voice-list failures (the desktop
+# re-polls on every settings open/focus) to a single log line. Re-arms on
+# success or when the error signature changes, so a real new failure is seen.
+_voice_list_last_error: Optional[str] = None
+
+
+def _voice_list_error_logged_once(signature: Optional[str]) -> bool:
+    """Return True if ``signature`` is new and should be logged now.
+
+    Passing ``None`` clears the latch (call on success). Idempotent per
+    signature: the same error logs once until it changes.
+    """
+    global _voice_list_last_error
+    if signature is None:
+        _voice_list_last_error = None
+        return False
+    if signature == _voice_list_last_error:
+        return False
+    _voice_list_last_error = signature
+    return True
+
+
 @app.get("/api/audio/elevenlabs/voices")
 async def get_elevenlabs_voices():
     """Return ElevenLabs voices when an API key is configured.
@@ -3010,9 +3368,27 @@ async def get_elevenlabs_voices():
                 return json.loads(response.read().decode("utf-8"))
 
         payload = await loop.run_in_executor(None, _fetch)
-    except Exception as exc:
-        _log.warning("ElevenLabs voice list failed: %s", exc)
+    except urllib.error.HTTPError as exc:
+        # An auth failure (bad/expired/scoped key) is a persistent,
+        # user-fixable state, not a transient blip — the desktop polls this on
+        # every settings open/focus, so a per-poll WARNING floods the log
+        # (#voice-list-401-spam). Treat 401/403 as "integration unavailable":
+        # report it to the UI with a 200 and log at most once until the error
+        # signature changes (see _voice_list_error_logged_once).
+        if exc.code in (401, 403):
+            if _voice_list_error_logged_once(f"http-{exc.code}"):
+                _log.info(
+                    "ElevenLabs voices unavailable: %s — check ELEVENLABS_API_KEY", exc
+                )
+            return {"available": False, "voices": [], "error": "unauthorized"}
+        if _voice_list_error_logged_once(f"http-{exc.code}"):
+            _log.warning("ElevenLabs voice list failed: %s", exc)
         raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
+    except Exception as exc:
+        if _voice_list_error_logged_once(str(exc)):
+            _log.warning("ElevenLabs voice list failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
+    _voice_list_error_logged_once(None)  # success — re-arm logging for next failure
 
     voices = []
     for voice in payload.get("voices") or []:
@@ -3226,7 +3602,7 @@ async def get_sessions(
 
 
 @app.get("/api/profiles/sessions")
-async def get_profiles_sessions(
+def get_profiles_sessions(
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -3819,7 +4195,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 
 
 @app.get("/api/model/options")
-def get_model_options(profile: Optional[str] = None, refresh: bool = False):
+def get_model_options(request: Request, profile: Optional[str] = None, refresh: bool = False):
     """Return authenticated providers + their curated model lists.
 
     REST equivalent of the ``model.options`` JSON-RPC on tui_gateway, so the
@@ -3847,7 +4223,7 @@ def get_model_options(profile: Optional[str] = None, refresh: bool = False):
         # `auth_type`/`key_env`/`warning` so the GUI can render a setup
         # affordance instead of hiding the provider entirely.
         with _profile_scope(profile):
-            return build_models_payload(
+            payload = build_models_payload(
                 load_picker_context(),
                 include_unconfigured=True,
                 picker_hints=True,
@@ -3856,6 +4232,11 @@ def get_model_options(profile: Optional[str] = None, refresh: bool = False):
                 capabilities=True,
                 refresh=bool(refresh),
             )
+        access = getattr(request.state, "governance_access", None)
+        if access is not None:
+            from hermes_cli.dashboard_governance.model_policy import filter_model_options_payload
+            payload = filter_model_options_payload(payload, access)
+        return payload
     except HTTPException:
         raise
     except Exception:
@@ -4047,7 +4428,7 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
 
 
 @app.post("/api/model/set")
-async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = None):
+async def set_model_assignment(body: ModelAssignment, request: Request, profile: Optional[str] = None):
     """Assign a model to the main slot or an auxiliary task slot.
 
     Writes to ``~/.hermes/config.yaml`` — applies to **new** sessions only.
@@ -4093,10 +4474,12 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                     "confirm_message": warning.message,
                 }
 
+        access = getattr(request.state, "governance_access", None)
+
         def _apply_assignment():
             with _profile_scope(body.profile or profile):
                 return _apply_model_assignment_sync(
-                    scope, provider, model, task, base_url, api_key
+                    scope, provider, model, task, base_url, api_key, governance_access=access
                 )
 
         return await asyncio.to_thread(_apply_assignment)
@@ -4108,7 +4491,13 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
 
 
 def _apply_model_assignment_sync(
-    scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
+    scope: str,
+    provider: str,
+    model: str,
+    task: str,
+    base_url: str,
+    api_key: str = "",
+    governance_access=None,
 ):
     """Synchronous body of POST /api/model/set.
 
@@ -4118,10 +4507,23 @@ def _apply_model_assignment_sync(
     """
     cfg = load_config()
 
+    def _ensure_model_allowed(target_provider: str, target_model: str) -> None:
+        if governance_access is None:
+            return
+        from hermes_cli.dashboard_governance.model_policy import decide_model_access
+        decision = decide_model_access(
+            governance_access,
+            provider=target_provider,
+            model=target_model,
+        )
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail={"reason": decision.reason})
+
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
         provider, model = _normalize_main_model_assignment(provider, model)
+        _ensure_model_allowed(provider, model)
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -4240,6 +4642,7 @@ def _apply_model_assignment_sync(
 
     if not provider:
         raise HTTPException(status_code=400, detail="provider required for auxiliary")
+    _ensure_model_allowed(provider, model)
 
     targets = [task] if task else list(_AUX_TASK_SLOTS)
     for slot in targets:
@@ -4503,6 +4906,25 @@ def _catalog_provider_env_metadata() -> dict:
                     "advanced": existing.get("advanced", True),
                     "category": "provider",
                 }
+
+        # Vertex AI authenticates via OAuth2 (service-account JSON or ADC), not a
+        # pasted API key, so it also has no api_key_env_vars. Tag its credential
+        # env var to the provider card so it appears on the Keys tab (otherwise
+        # Vertex — a `hermes model` provider — would be invisible in the desktop
+        # app). The value is a filesystem path, not a secret string, so it is
+        # not a password field.
+        if d.auth_type == "vertex":
+            existing = meta.get("VERTEX_CREDENTIALS_PATH", {})
+            meta["VERTEX_CREDENTIALS_PATH"] = {
+                "provider": d.slug,
+                "provider_label": d.label,
+                "description": existing.get("description")
+                or f"{d.label} — service account JSON path (or use ADC)",
+                "url": existing.get("url"),
+                "is_password": False,
+                "advanced": existing.get("advanced", True),
+                "category": "provider",
+            }
     return meta
 
 
@@ -4513,7 +4935,7 @@ async def get_env_vars(profile: Optional[str] = None):
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
 
-    def _row(var_name: str, info: dict) -> dict:
+    def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
         value = env_on_disk.get(var_name)
         cat_meta = catalog_meta.get(var_name) or {}
         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
@@ -4536,6 +4958,12 @@ async def get_env_vars(profile: Optional[str] = None):
             # CLI `hermes model` picker uses (not desktop-only prefix guesses).
             "provider": cat_meta.get("provider", ""),
             "provider_label": cat_meta.get("provider_label", ""),
+            # True when this key exists in the user's .env but is NOT in any
+            # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
+            # arbitrary/custom env var the user added directly. Surfaced so the
+            # Keys page can list (and let the user manage) them instead of
+            # hiding everything it doesn't recognise.
+            "custom": custom,
         }
 
     result = {}
@@ -4547,6 +4975,19 @@ async def get_env_vars(profile: Optional[str] = None):
     for var_name in catalog_meta:
         if var_name not in result:
             result[var_name] = _row(var_name, {})
+    # Surface arbitrary/custom keys the user set in .env that aren't in any
+    # catalog. These are always "set" (they're on disk). Treated as secrets by
+    # default (is_password=True → redacted, reveal-gated) since an unrecognised
+    # key could hold anything. Channel-managed credentials are excluded — those
+    # belong to the Channels page. This makes the "add a custom key" surface
+    # round-trip: a key added there reappears here under its own section.
+    for var_name in env_on_disk:
+        if var_name in result or var_name in channel_keys:
+            continue
+        row = _row(var_name, {}, custom=True)
+        row["category"] = "custom"
+        row["is_password"] = True
+        result[var_name] = row
     return result
 
 
@@ -9428,17 +9869,63 @@ class BackupRequest(BaseModel):
     output: Optional[str] = None
 
 
+def _dashboard_backup_dir() -> Path:
+    return get_hermes_home() / "backups"
+
+
+def _new_dashboard_backup_path() -> Path:
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return _dashboard_backup_dir() / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
+
+
 @app.post("/api/ops/backup")
 async def run_backup(body: BackupRequest):
     args = ["backup"]
+    archive: Optional[Path] = None
     if body.output:
         args.append(body.output.strip())
+    else:
+        archive = _new_dashboard_backup_path()
+        try:
+            archive.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not create backup directory: {exc}",
+            )
+        args.append(str(archive))
     try:
         proc = _spawn_hermes_action(args, "backup")
     except Exception as exc:
         _log.exception("Failed to spawn backup")
         raise HTTPException(status_code=500, detail=f"Failed to run backup: {exc}")
-    return {"ok": True, "pid": proc.pid, "name": "backup"}
+    response = {"ok": True, "pid": proc.pid, "name": "backup"}
+    if archive is not None:
+        response["archive"] = str(archive)
+    return response
+
+
+@app.get("/api/ops/backup/download")
+async def download_dashboard_backup(archive: str):
+    try:
+        backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
+        target = Path(archive).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="Invalid backup path")
+
+    if not _path_is_under(backup_dir, target):
+        raise HTTPException(status_code=403, detail="Backup is outside the dashboard backup directory")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Backup not found")
+
+    return FileResponse(
+        path=str(target),
+        media_type="application/zip",
+        filename=target.name,
+        content_disposition_type="attachment",
+    )
 
 
 class ImportRequest(BaseModel):
@@ -9469,6 +9956,94 @@ async def run_import(body: ImportRequest):
         _log.exception("Failed to spawn import")
         raise HTTPException(status_code=500, detail=f"Failed to run import: {exc}")
     return {"ok": True, "pid": proc.pid, "name": "import"}
+
+
+def _safe_backup_upload_name(filename: str | None) -> str:
+    name = Path(filename or "backup.zip").name.strip()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    if not name:
+        name = "backup.zip"
+    if not name.lower().endswith(".zip"):
+        name = f"{name}.zip"
+    return name
+
+
+@app.post("/api/ops/import-upload")
+async def run_import_upload(
+    file: UploadFile = File(...),
+    force: bool = Form(False),
+):
+    staging_dir = _dashboard_backup_dir()
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create import staging directory: {exc}",
+        )
+
+    safe_name = _safe_backup_upload_name(file.filename)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = staging_dir / f"dashboard-import-{stamp}-{secrets.token_hex(4)}-{safe_name}"
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".upload",
+        dir=str(staging_dir),
+    )
+    tmp_path = Path(tmp_name)
+    total = 0
+    renamed = False
+    try:
+        with os.fdopen(tmp_fd, "wb") as out:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MANAGED_FILE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="Archive is too large")
+                out.write(chunk)
+        os.replace(tmp_path, target)
+        renamed = True
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Import staging directory is not writable",
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not write uploaded archive: {exc}",
+        )
+    finally:
+        if not renamed:
+            tmp_path.unlink(missing_ok=True)
+        await file.close()
+
+    if not zipfile.is_zipfile(target):
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded archive is not a valid zip file",
+        )
+
+    args = ["import", str(target)]
+    if force:
+        args.append("--force")
+    try:
+        proc = _spawn_hermes_action(args, "import")
+    except Exception as exc:
+        _log.exception("Failed to spawn import")
+        raise HTTPException(status_code=500, detail=f"Failed to run import: {exc}")
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "import",
+        "archive": str(target),
+        "uploaded_bytes": total,
+    }
 
 
 @app.get("/api/ops/hooks")
@@ -10359,13 +10934,465 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
 
 
 @app.get("/api/profiles")
-async def list_profiles_endpoint():
+async def list_profiles_endpoint(request: Request):
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        filter_profiles_for_access,
+    )
     try:
-        return {"profiles": [_profile_to_dict(p) for p in profiles_mod.list_profiles()]}
+        loop = asyncio.get_running_loop()
+        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        result = [_profile_to_dict(p) for p in profiles]
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        result = _fallback_profile_dicts(profiles_mod)
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    return {"profiles": filter_profiles_for_access(result, access)}
+
+
+@app.get("/api/governance/effective-access")
+@app.get("/api/governance/me")
+async def get_governance_me(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        serialize_effective_access,
+    )
+
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    return {"effective_access": serialize_effective_access(access)}
+
+
+@app.get("/api/governance/policy")
+async def get_governance_policy(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        policy_for_request,
+        safe_policy_payload,
+        serialize_effective_access,
+    )
+
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    payload = safe_policy_payload(policy_for_request(request))
+    return {
+        "policy": payload,
+        "etag": _governance_policy_etag(payload),
+        "effective_access": serialize_effective_access(access),
+    }
+
+
+@app.put("/api/governance/policy")
+async def put_governance_policy(request: Request, body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request,
+        policy_for_request,
+        safe_policy_payload,
+        serialize_effective_access,
+    )
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, save_governance_policy
+
+    _require_governance_admin(request)
+    async with _get_governance_policy_lock(request.app):
+        current = safe_policy_payload(policy_for_request(request))
+        # Optimistic concurrency: a client that echoes the etag it loaded
+        # (If-Match) cannot silently revert entry edits that landed between
+        # its GET and this full-replace PUT.
+        expected_etag = str(request.headers.get("if-match") or "").strip().strip('"')
+        if expected_etag and expected_etag != _governance_policy_etag(current):
+            raise HTTPException(
+                status_code=412,
+                detail={
+                    "error": "policy_conflict",
+                    "message": "policy changed since it was loaded; reload and retry",
+                },
+            )
+        before = _governance_policy_summary(current)
+        try:
+            path = save_governance_policy(body)
+        except GovernancePolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception:
+            _log.exception("PUT /api/governance/policy failed")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+    _audit_governance_policy_change(
+        request,
+        action="policy_replace",
+        target="policy",
+        before=before,
+        after=_governance_policy_summary(body),
+    )
+    access = effective_access_for_request(request)
+    payload = safe_policy_payload(policy_for_request(request))
+    return {
+        "ok": True,
+        "path": str(path),
+        "policy": payload,
+        "etag": _governance_policy_etag(payload),
+        "effective_access": serialize_effective_access(access),
+    }
+
+
+@app.get("/api/governance/users")
+async def get_governance_users(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import policy_for_request
+
+    policy = policy_for_request(request)
+    raw_users = policy.raw.get("users") if isinstance(policy.raw.get("users"), dict) else {}
+    return {"users": raw_users or {}}
+
+
+@app.get("/api/governance/groups")
+async def get_governance_groups(request: Request):
+    from hermes_cli.dashboard_governance.enforcement import policy_for_request
+
+    policy = policy_for_request(request)
+    raw_groups = policy.raw.get("groups") if isinstance(policy.raw.get("groups"), dict) else {}
+    return {"groups": raw_groups or {}}
+
+
+def _require_governance_admin(request: Request) -> None:
+    """Defense-in-depth gate for policy-mutating governance endpoints.
+
+    The governance middleware only hard-denies in ``enforce`` mode: in
+    ``report_only`` (the documented Stage 1 rollout mode) denied requests are
+    audited as ``would_deny`` and still reach the handler, and with mode
+    ``off`` / no policy file every request passes with reason
+    ``governance_off``. Policy mutations must never execute for subjects
+    without ``governance:write`` regardless of mode, otherwise any
+    authenticated session-holder could persist grants for themselves during a
+    dry-run rollout (or bootstrap a policy file that flips mode to enforce).
+    """
+    from hermes_cli.dashboard_governance.enforcement import effective_access_for_request
+
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    if not access.has_permission("governance:write"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def _governance_policy_etag(raw: Any) -> str:
+    """Content hash of a policy payload for optimistic-concurrency checks."""
+    payload = raw if isinstance(raw, dict) else {}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _governance_policy_summary(raw: Any) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    users = data.get("users") if isinstance(data.get("users"), dict) else {}
+    groups = data.get("groups") if isinstance(data.get("groups"), dict) else {}
+    roles = data.get("roles") if isinstance(data.get("roles"), dict) else {}
+    return {
+        "version": data.get("version"),
+        "mode": str(data.get("mode") or ""),
+        "users": sorted(str(key) for key in users),
+        "groups": sorted(str(key) for key in groups),
+        "roles": sorted(str(key) for key in roles),
+    }
+
+
+def _audit_governance_policy_change(
+    request: Request,
+    *,
+    action: str,
+    target: str = "",
+    before: Any = None,
+    after: Any = None,
+) -> None:
+    try:
+        from hermes_cli.dashboard_governance.audit import append_audit_event
+        from hermes_cli.dashboard_governance.enforcement import effective_access_for_request
+
+        access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+        append_audit_event(
+            "policy_change",
+            subject_email=access.subject.email,
+            subject_user_id=access.subject.user_id,
+            path=request.url.path,
+            method=request.method,
+            reason=action,
+            mode=access.mode,
+            extra={"action": action, "target": target, "before": before, "after": after},
+        )
+    except Exception:
+        # Policy writes must not fail because the audit sink is temporarily
+        # unwritable; the mutation itself has already been persisted.
+        return
+
+
+def _validated_governance_entry(raw_entry: Any, *, kind: str) -> Dict[str, Any]:
+    if raw_entry is None:
+        return {}
+    if not isinstance(raw_entry, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": f"{kind} entry must be an object"},
+        )
+    for field_name in ("roles", "groups", "sso_groups"):
+        value = raw_entry.get(field_name)
+        if value is not None and not isinstance(value, list):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "invalid_payload", "message": f"{kind} {field_name} must be a list"},
+            )
+    grants = raw_entry.get("grants")
+    if grants is not None and not isinstance(grants, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": f"{kind} grants must be an object"},
+        )
+    return dict(raw_entry)
+
+
+def _governance_raw_policy(request: Request) -> Dict[str, Any]:
+    from hermes_cli.dashboard_governance.enforcement import policy_for_request
+
+    return dict(policy_for_request(request).raw or {})
+
+
+def _save_governance_raw_policy(raw: Dict[str, Any], *, label: str) -> Path:
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, save_governance_policy
+
+    try:
+        return save_governance_policy(raw)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_policy", "message": str(exc)})
+    except Exception:
+        _log.exception("%s failed", label)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/governance/groups")
+async def post_governance_group(request: Request, body: Dict[str, Any]):
+    _require_governance_admin(request)
+    name = str(body.get("name") or "").strip() if isinstance(body, dict) else ""
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": "name must be a non-empty string"},
+        )
+    entry = _validated_governance_entry(body.get("group"), kind="group")
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        groups = dict(raw.get("groups")) if isinstance(raw.get("groups"), dict) else {}
+        if name in groups:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "group_exists", "message": f"group already exists: {name}"},
+            )
+        groups[name] = entry
+        raw["groups"] = groups
+        path = _save_governance_raw_policy(raw, label="POST /api/governance/groups")
+    _audit_governance_policy_change(request, action="group_create", target=name, before=None, after=entry)
+    return {"ok": True, "path": str(path), "groups": groups}
+
+
+@app.put("/api/governance/groups/{name}")
+async def put_governance_group(request: Request, name: str, body: Dict[str, Any]):
+    _require_governance_admin(request)
+    group_name = str(name or "").strip()
+    entry = _validated_governance_entry(body, kind="group")
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        groups = dict(raw.get("groups")) if isinstance(raw.get("groups"), dict) else {}
+        if group_name not in groups:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "group_not_found", "message": f"unknown group: {group_name}"},
+            )
+        before = groups.get(group_name)
+        groups[group_name] = entry
+        raw["groups"] = groups
+        path = _save_governance_raw_policy(raw, label="PUT /api/governance/groups/{name}")
+    _audit_governance_policy_change(request, action="group_update", target=group_name, before=before, after=entry)
+    return {"ok": True, "path": str(path), "groups": groups}
+
+
+@app.delete("/api/governance/groups/{name}")
+async def delete_governance_group(request: Request, name: str):
+    _require_governance_admin(request)
+    group_name = str(name or "").strip()
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        groups = dict(raw.get("groups")) if isinstance(raw.get("groups"), dict) else {}
+        if group_name not in groups:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "group_not_found", "message": f"unknown group: {group_name}"},
+            )
+        before = groups.pop(group_name)
+        raw["groups"] = groups
+        path = _save_governance_raw_policy(raw, label="DELETE /api/governance/groups/{name}")
+    _audit_governance_policy_change(request, action="group_delete", target=group_name, before=before, after=None)
+    return {"ok": True, "path": str(path), "groups": groups}
+
+
+@app.put("/api/governance/users/{email}")
+async def put_governance_user(request: Request, email: str, body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.models import _norm_email
+
+    _require_governance_admin(request)
+    normalized = _norm_email(email)
+    if not normalized or "@" not in normalized:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_payload", "message": "email must be a valid address"},
+        )
+    entry = _validated_governance_entry(body, kind="user")
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        users = dict(raw.get("users")) if isinstance(raw.get("users"), dict) else {}
+        before = None
+        for existing_key in list(users):
+            if _norm_email(str(existing_key)) == normalized:
+                before = users.pop(existing_key)
+        users[normalized] = entry
+        raw["users"] = users
+        path = _save_governance_raw_policy(raw, label="PUT /api/governance/users/{email}")
+    action = "user_update" if before is not None else "user_create"
+    _audit_governance_policy_change(request, action=action, target=normalized, before=before, after=entry)
+    return {"ok": True, "path": str(path), "users": users}
+
+
+@app.delete("/api/governance/users/{email}")
+async def delete_governance_user(request: Request, email: str):
+    from hermes_cli.dashboard_governance.models import _norm_email
+
+    _require_governance_admin(request)
+    normalized = _norm_email(email)
+    async with _get_governance_policy_lock(request.app):
+        raw = _governance_raw_policy(request)
+        users = dict(raw.get("users")) if isinstance(raw.get("users"), dict) else {}
+        before = None
+        found = False
+        for existing_key in list(users):
+            if _norm_email(str(existing_key)) == normalized:
+                before = users.pop(existing_key)
+                found = True
+        if not found:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "user_not_found", "message": f"unknown user: {normalized}"},
+            )
+        raw["users"] = users
+        path = _save_governance_raw_policy(raw, label="DELETE /api/governance/users/{email}")
+    _audit_governance_policy_change(request, action="user_delete", target=normalized, before=before, after=None)
+    return {"ok": True, "path": str(path), "users": users}
+
+
+@app.post("/api/governance/preview")
+async def post_governance_preview(body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.enforcement import (
+        safe_policy_payload,
+        serialize_effective_access,
+    )
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, parse_governance_policy
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+
+    raw_policy = body.get("policy") if isinstance(body, dict) else None
+    raw_subject = body.get("subject") if isinstance(body, dict) else None
+    if not isinstance(raw_policy, dict):
+        raise HTTPException(status_code=400, detail="policy must be an object")
+    if raw_subject is not None and not isinstance(raw_subject, dict):
+        raise HTTPException(status_code=400, detail="subject must be an object")
+    try:
+        policy = parse_governance_policy(raw_policy)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    subject_data = raw_subject or {}
+    subject = GovernanceSubject(
+        email=str(subject_data.get("email") or ""),
+        display_name=str(subject_data.get("display_name") or subject_data.get("name") or ""),
+        provider=str(subject_data.get("provider") or ""),
+        user_id=str(subject_data.get("user_id") or ""),
+        org_id=str(subject_data.get("org_id") or ""),
+        roles=tuple(str(role) for role in subject_data.get("roles") or [] if str(role).strip()),
+        groups=tuple(str(group) for group in subject_data.get("groups") or [] if str(group).strip()),
+    )
+    access = resolve_effective_access(policy, subject)
+    return {
+        "ok": True,
+        "policy": safe_policy_payload(policy),
+        "effective_access": serialize_effective_access(access),
+    }
+
+
+@app.post("/api/governance/simulate")
+async def post_governance_simulate(body: Dict[str, Any]):
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, parse_governance_policy
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+    from hermes_cli.dashboard_governance.route_catalog import route_permission
+
+    raw_policy = body.get("policy") if isinstance(body, dict) else None
+    raw_subject = body.get("subject") if isinstance(body, dict) else None
+    raw_request = body.get("request") if isinstance(body, dict) else None
+    if not isinstance(raw_policy, dict):
+        raise HTTPException(status_code=400, detail="policy must be an object")
+    if not isinstance(raw_subject, dict):
+        raise HTTPException(status_code=400, detail="subject must be an object")
+    if not isinstance(raw_request, dict):
+        raise HTTPException(status_code=400, detail="request must be an object")
+    try:
+        policy = parse_governance_policy(raw_policy)
+    except GovernancePolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    subject = GovernanceSubject(
+        email=str(raw_subject.get("email") or ""),
+        display_name=str(raw_subject.get("display_name") or raw_subject.get("name") or ""),
+        provider=str(raw_subject.get("provider") or ""),
+        user_id=str(raw_subject.get("user_id") or ""),
+        org_id=str(raw_subject.get("org_id") or ""),
+        roles=tuple(str(role) for role in raw_subject.get("roles") or [] if str(role).strip()),
+        groups=tuple(str(group) for group in raw_subject.get("groups") or [] if str(group).strip()),
+    )
+    access = resolve_effective_access(policy, subject)
+    path = str(raw_request.get("path") or "")
+    method = str(raw_request.get("method") or "GET").upper()
+    target_profile = str(raw_request.get("profile") or "")
+    required_permission = route_permission(path, method)
+    allowed = True
+    reason = "allowed"
+    if not policy.enabled:
+        reason = "governance_off"
+    elif not subject.user_id and not subject.email:
+        allowed = False
+        reason = "unauthenticated"
+    elif not access.is_route_allowed(path):
+        allowed = False
+        reason = "route_not_allowed"
+    elif required_permission is None and path not in {"/api/auth/me", "/api/governance/me", "/api/governance/effective-access"}:
+        allowed = False
+        reason = "unknown_route"
+    elif required_permission and not access.has_permission(required_permission):
+        allowed = False
+        reason = "permission_not_allowed"
+    elif target_profile and not access.is_profile_allowed(target_profile):
+        allowed = False
+        reason = "profile_not_allowed"
+    return {
+        "allowed": allowed,
+        "reason": reason,
+        "required_permission": required_permission,
+    }
+
+
+@app.get("/api/governance/audit")
+async def get_governance_audit(limit: int = 100):
+    from hermes_cli.dashboard_governance.audit import read_audit_events
+
+    safe_limit = max(1, min(int(limit or 100), 500))
+    return {"events": read_audit_events(limit=safe_limit)}
+
+
+@app.get("/api/governance/usage")
+async def get_governance_usage():
+    from hermes_cli.dashboard_governance.usage import read_usage_state
+
+    return {"usage": read_usage_state()}
 
 
 @app.post("/api/profiles")
@@ -11773,7 +12800,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
+                info = consume_internal_credential(internal)
+                try:
+                    ws.state.auth_info = dict(info)
+                except Exception:
+                    pass
                 return None, "internal"
             except TicketInvalid as exc:
                 audit_log(
@@ -11789,7 +12820,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            try:
+                ws.state.auth_info = dict(info)
+            except Exception:
+                pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -11804,6 +12839,13 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     if not token:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        try:
+            ws.state.auth_info = {
+                "user_id": "dashboard-session-token",
+                "provider": "dashboard-token",
+            }
+        except Exception:
+            pass
         return None, "token"
     return "token_mismatch", "token"
 
@@ -11811,6 +12853,63 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 def _ws_auth_ok(ws: "WebSocket") -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
     return _ws_auth_reason(ws)[0] is None
+
+
+def _dashboard_governance_context_env_for_ws(
+    ws: "WebSocket",
+    *,
+    credential: str,
+    profile: Optional[str],
+    resume: Optional[str],
+    channel: Optional[str],
+) -> Optional[str]:
+    """Serialize the accepted WS principal's effective governance for PTY children."""
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext,
+            serialize_context_for_env,
+        )
+        from hermes_cli.dashboard_governance.loader import load_governance_policy
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+
+        loader = getattr(ws.app.state, "governance_policy_loader", None)
+        policy = loader() if callable(loader) else load_governance_policy()
+        if not getattr(policy, "enabled", False):
+            return None
+
+        info = getattr(ws.state, "auth_info", {}) or {}
+        if not isinstance(info, dict):
+            info = {}
+        user_id = str(info.get("user_id") or "")
+        provider = str(info.get("provider") or "")
+        if not user_id and credential == "token":
+            user_id = "dashboard-session-token"
+        if not provider and credential == "token":
+            provider = "dashboard-token"
+        token_scopes = ("dashboard",) if credential in {"token", "internal"} else ()
+        subject = GovernanceSubject(
+            email=user_id if "@" in user_id else "",
+            display_name=user_id,
+            provider=provider,
+            user_id=user_id,
+            token_scopes=token_scopes,
+        )
+        access = resolve_effective_access(policy, subject)
+        requested_profile = (profile or "").strip()
+        active_profile = requested_profile if requested_profile and requested_profile.lower() != "current" else "default"
+        ctx = DashboardGovernanceContext(
+            subject=subject,
+            access=access,
+            active_profile=active_profile,
+            session_id=resume or "",
+            request_id=channel or "",
+        )
+        return serialize_context_for_env(ctx)
+    except Exception:
+        _log.debug("failed to build dashboard governance context for WS child", exc_info=True)
+        return None
+
 
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -11825,6 +12924,7 @@ def _resolve_chat_argv(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    governance_context_env: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -11901,6 +13001,13 @@ def _resolve_chat_argv(
     if active_session_file:
         env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
 
+    if governance_context_env:
+        try:
+            from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV
+            env[GOVERNANCE_CONTEXT_ENV] = governance_context_env
+        except Exception:
+            _log.debug("Failed to inject dashboard governance context into chat env", exc_info=True)
+
     # Profile-scoped chats must NOT attach to the dashboard's in-memory
     # gateway — it runs under the dashboard's own profile. Without the
     # attach URL, gatewayClient spawns its own `tui_gateway.entry`, which
@@ -11950,6 +13057,7 @@ async def _resolve_chat_argv_async(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    governance_context_env: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv without blocking the dashboard event loop.
 
@@ -11968,6 +13076,8 @@ async def _resolve_chat_argv_async(
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if governance_context_env is not None:
+        kwargs["governance_context_env"] = governance_context_env
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(
@@ -12158,6 +13268,15 @@ async def pty_ws(ws: WebSocket) -> None:
     }
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
+    governance_context_env = _dashboard_governance_context_env_for_ws(
+        ws,
+        credential=cred,
+        profile=profile,
+        resume=resume,
+        channel=channel,
+    )
+    if governance_context_env:
+        resolve_kwargs["governance_context_env"] = governance_context_env
 
     try:
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
@@ -12188,26 +13307,54 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # --- reader task: PTY master → WebSocket ----------------------------
     async def pump_pty_to_ws() -> None:
-        while True:
-            chunk = await loop.run_in_executor(
-                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-            )
-            if chunk is None:  # EOF
-                return
-            if not chunk:  # no data this tick; yield control and retry
-                await asyncio.sleep(0)
-                continue
+        try:
+            while True:
+                chunk = await loop.run_in_executor(
+                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+                )
+                if chunk is None:  # EOF
+                    return
+                if not chunk:  # no data this tick; yield control and retry
+                    await asyncio.sleep(0)
+                    continue
+                try:
+                    await ws.send_bytes(chunk)
+                except Exception:
+                    return
+        finally:
+            # The child has exited (EOF) or the send side broke.  Close the
+            # WebSocket so the writer loop's ``ws.receive()`` returns instead
+            # of blocking forever — otherwise, when the browser's socket is
+            # half-open (no FIN delivered, common on macOS/launchd) the
+            # handler never reaches its ``finally`` and the PTY's fds leak.
+            # With dashboard auto-reconnect (#52962) every dropped socket then
+            # stacks a fresh PTY on top of the orphaned one, exhausting fds.
+            #
+            # Reap the bridge here too (close() is idempotent): on child EOF the
+            # writer loop's ``finally`` is the usual closer, but if the handler
+            # task is cancelled the instant we close the WS, that ``finally``
+            # can be skipped, leaking the PTY. Closing from the EOF path makes
+            # the reap independent of that cancellation race (#54028).
             try:
-                await ws.send_bytes(chunk)
+                await asyncio.to_thread(bridge.close)
             except Exception:
-                return
+                pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     try:
         while True:
-            msg = await ws.receive()
+            try:
+                msg = await ws.receive()
+            except RuntimeError:
+                # Raised when ws.receive() is called after the socket is
+                # already disconnected (e.g. closed by the reader task above).
+                break
             msg_type = msg.get("type")
             if msg_type == "websocket.disconnect":
                 break
@@ -12994,16 +14141,41 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
 
 @app.get("/api/dashboard/plugins")
 async def get_dashboard_plugins():
-    """Return discovered dashboard plugins (excludes user-hidden ones)."""
+    """Return discovered dashboard plugins (excludes user-hidden and non-enabled ones)."""
     plugins = _get_dashboard_plugins()
     # Read user's hidden plugins list from config.
     config = load_config()
     hidden: list = cfg_get(config, "dashboard", "hidden_plugins", default=[]) or []
-    # Strip internal fields before sending to frontend and filter out hidden.
+    # Gate: only serve user plugins that are in plugins.enabled and not
+    # in plugins.disabled.  This prevents the frontend from loading JS/CSS
+    # from plugins the user has not explicitly activated.  (#46435)
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        enabled_set = _get_enabled_set()
+        disabled_set = _get_disabled_set()
+    except Exception:
+        enabled_set = set()
+        disabled_set = set()
+
+    def _is_active(p: dict) -> bool:
+        name = p.get("name", "")
+        if name in hidden:
+            return False
+        if p.get("source") == "user":
+            if name in disabled_set:
+                return False
+            if name not in enabled_set:
+                return False
+        elif p.get("source") == "bundled":
+            if name in disabled_set:
+                return False
+        return True
+
+    # Strip internal fields before sending to frontend.
     return [
         {k: v for k, v in p.items() if not k.startswith("_")}
         for p in plugins
-        if p["name"] not in hidden
+        if _is_active(p)
     ]
 
 
@@ -13300,11 +14472,30 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     allowlist, anyone on the loopback port can curl the ``.py`` source
     of a private third-party plugin. Reject everything outside the
     browser-asset set.
+
+    User plugins must be in plugins.enabled before their assets are
+    served. (#46435, GHSA-mcfc-hp25-cjv7)
     """
     plugins = _get_dashboard_plugins()
     plugin = next((p for p in plugins if p["name"] == plugin_name), None)
     if not plugin:
         raise HTTPException(status_code=404, detail="Plugin not found")
+
+    # Gate: user plugins must be enabled to serve assets;
+    # bundled plugins must not be explicitly disabled.
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        enabled_set = _get_enabled_set()
+        disabled_set = _get_disabled_set()
+    except Exception:
+        enabled_set = set()
+        disabled_set = set()
+    if plugin.get("source") == "user":
+        if plugin_name in disabled_set or plugin_name not in enabled_set:
+            raise HTTPException(status_code=404, detail="Plugin not found")
+    elif plugin.get("source") == "bundled":
+        if plugin_name in disabled_set:
+            raise HTTPException(status_code=404, detail="Plugin not found")
 
     base = Path(plugin["_dir"])
     target = (base / file_path).resolve()
@@ -13365,11 +14556,52 @@ def _mount_plugin_api_routes():
     opens a malicious repo; they can extend the dashboard UI via
     static JS/CSS but their Python ``api`` file is never auto-imported
     by the web server.  See GHSA-5qr3-c538-wm9j (#29156).
+
+    Additionally, user plugins must be explicitly enabled via the
+    ``plugins.enabled`` allow-list in config.yaml before their backend
+    code is imported. Without this gate, an installed-but-not-enabled
+    plugin's Python code would execute at dashboard startup — a code
+    execution vector that bypasses the user's intent. (#46435,
+    GHSA-mcfc-hp25-cjv7)
     """
+    # Load the enabled/disabled sets once for the loop.
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        enabled_set = _get_enabled_set()
+        disabled_set = _get_disabled_set()
+    except Exception:
+        enabled_set = set()
+        disabled_set = set()
+
     for plugin in _get_dashboard_plugins():
         api_file_name = plugin.get("_api_file")
         if not api_file_name:
             continue
+        plugin_name = plugin.get("name", "")
+        # Gate: user plugins must be in plugins.enabled and not in
+        # plugins.disabled before we import their Python code.
+        # Bundled plugins are trusted (they ship with the release) but
+        # still respect an explicit disable.
+        if plugin.get("source") == "user":
+            if plugin_name in disabled_set:
+                _log.debug(
+                    "Plugin %s: skipping API mount (explicitly disabled)",
+                    plugin_name,
+                )
+                continue
+            if plugin_name not in enabled_set:
+                _log.debug(
+                    "Plugin %s: skipping API mount (not in plugins.enabled)",
+                    plugin_name,
+                )
+                continue
+        elif plugin.get("source") == "bundled":
+            if plugin_name in disabled_set:
+                _log.debug(
+                    "Plugin %s: skipping API mount (explicitly disabled)",
+                    plugin_name,
+                )
+                continue
         if plugin.get("source") == "project":
             _log.warning(
                 "Plugin %s: ignoring backend api=%s (project plugins may "
@@ -13648,6 +14880,15 @@ def start_server(
     # For explicit non-zero ports, if the port is taken uvicorn catches
     # OSError inside create_server() and exits with a clear error — no
     # separate preflight probe needed.
+    # Loopback binds are the Desktop case: a single local client, no reverse
+    # proxy in front. A GIL-heavy agent turn can stall the event loop past 20s,
+    # and uvicorn's ws keepalive ping runs on that same starved loop — so a
+    # 20s ping timeout kills an otherwise-healthy local connection over a
+    # recoverable stall (QW-1). Give loopback a longer 60s timeout / 30s
+    # interval to ride out those stalls. Non-loopback binds sit behind a
+    # Cloudflare Tunnel (idle timeout ~100s), so keep them at 20/20 to detect
+    # half-open connections promptly and stay under the tunnel's idle window.
+    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -13661,9 +14902,9 @@ def start_server(
         # Detect half-open WS connections (reverse-proxy 524, dropped
         # tunnels) within ~20-40s so WebSocketDisconnect fires the
         # disconnect→reap path.  20s stays under Cloudflare Tunnel's idle
-        # timeout, keeping it warm.
-        ws_ping_interval=20.0,
-        ws_ping_timeout=20.0,
+        # timeout, keeping it warm.  Loopback gets a longer window (see above).
+        ws_ping_interval=30.0 if _is_loopback else 20.0,
+        ws_ping_timeout=60.0 if _is_loopback else 20.0,
     )
     server = uvicorn.Server(config)
 
@@ -13685,6 +14926,48 @@ def start_server(
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
             print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+
+            # Collapse the peer-hangup teardown flood (#50005). When the Desktop
+            # forcibly closes its WebSocket mid-write, asyncio logs a full
+            # traceback per pending connection-lost callback — 50+ identical
+            # WinError 10054 (ConnectionResetError) lines per disconnect on
+            # Windows. This filter downgrades exactly that class to one debug
+            # line and passes every other loop error through unchanged.
+            try:
+                from tui_gateway.loop_noise import install_loop_noise_filter
+
+                install_loop_noise_filter(asyncio.get_running_loop())
+            except Exception as exc:  # pragma: no cover - best-effort
+                _log.debug("loop noise filter install skipped: %s", exc)
+
+            # ── Loop heartbeat watchdog (CF-1) ───────────────────────────
+            # Confirm the GIL-pressure hypothesis in production. Re-arm a 2s
+            # tick and measure the drift between when it *should* fire and
+            # when it actually does: a healthy loop drifts ~0, but a turn that
+            # holds the GIL blocks the loop and the next tick fires late by the
+            # stall duration. We log that so a stalled-loop WS drop is
+            # diagnosable from the gateway log. Uses loop.time() (monotonic)
+            # for drift, and call_later (not a task) so it dies with the loop —
+            # nothing to cancel on shutdown.
+            _hb_interval = 2.0
+            _hb_stall_threshold = 5.0
+            _hb_loop = asyncio.get_running_loop()
+
+            def _loop_heartbeat(expected: float) -> None:
+                now = _hb_loop.time()
+                drift = now - expected
+                if drift > _hb_stall_threshold:
+                    _log.warning(
+                        "event loop stalled %.1fs (GIL pressure suspected)",
+                        drift,
+                    )
+                _hb_loop.call_later(
+                    _hb_interval, _loop_heartbeat, now + _hb_interval
+                )
+
+            _hb_loop.call_later(
+                _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
+            )
 
             await server.main_loop()
             if server.started:

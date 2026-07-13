@@ -32,11 +32,17 @@ only choice that is universally correct across self-hosted IDPs. (The ``nous``
 provider verifies its *access* token because Nous Portal mints a custom JWT
 access token with the dashboard claims baked in — a non-OIDC shortcut.)
 
-Public PKCE clients only. Confidential clients (with a ``client_secret``) are
-not yet supported — see the ``# TODO(confidential-client)`` seam in
-``complete_login`` / ``refresh_session``. Self-hosters configuring a CLI/SPA
-client almost always register a public + PKCE client, which is the smaller,
-simpler surface.
+Both **public** (PKCE-only) and **confidential** (PKCE + ``client_secret``)
+clients are supported. A self-hoster who registers a public client configures
+no secret and the token-endpoint calls authenticate with PKCE alone (the
+default). A self-hoster whose IDP defaults the client to *confidential*
+(Authentik and Keycloak commonly do) sets ``client_secret`` and the provider
+additionally authenticates the client at the token endpoint, choosing
+``client_secret_basic`` (HTTP Basic header) or ``client_secret_post`` (secret
+in the form body) from the IDP's advertised
+``token_endpoint_auth_methods_supported``. PKCE is sent in **both** modes —
+the secret is client authentication layered on top, never a replacement for
+PKCE (OAuth 2.1 / RFC 9700 keep PKCE mandatory regardless).
 
 Configuration surfaces (env wins over config.yaml when set non-empty, so a
 provisioned-but-not-populated secret can't shadow a valid config.yaml entry —
@@ -50,11 +56,39 @@ same precedence convention as the ``nous`` plugin)::
           issuer: https://auth.example.com/application/o/hermes/   # required
           client_id: hermes-dashboard                              # required
           scopes: "openid profile email"                           # optional
+          # client_secret: set ONLY for a confidential client. It is a
+          # credential — prefer the env var / ~/.hermes/.env over config.yaml.
 
     # Environment overrides (Docker/Fly secret injection)
     HERMES_DASHBOARD_OIDC_ISSUER
     HERMES_DASHBOARD_OIDC_CLIENT_ID
     HERMES_DASHBOARD_OIDC_SCOPES        # optional; defaults to "openid profile email"
+    HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
+                                        # (the .env file is the canonical home —
+                                        # it's a secret, not a behavioural setting)
+    HERMES_DASHBOARD_OIDC_GROUP_CLAIM   # optional; ID-token claim carrying the
+                                        # user's SSO groups (default "groups")
+    HERMES_DASHBOARD_OIDC_ROLE_CLAIM    # optional; ID-token claim carrying the
+                                        # user's roles (default unset: roles
+                                        # are NOT extracted)
+
+Governance group mapping: the dashboard-governance layer maps SSO groups to
+roles, so the provider surfaces the verified ID token's group memberships on
+``Session.groups``. The claim name is configurable via
+``dashboard.governance.sso_group_claim`` in config.yaml (or the
+``HERMES_DASHBOARD_OIDC_GROUP_CLAIM`` env override), defaulting to
+``groups``. Google's ID tokens carry no groups claim at all, only ``hd``
+(the Workspace domain) and ``email``, so both are always appended as
+pseudo-groups a governance policy can match on.
+
+Role ingestion is opt-in: ``Session.roles`` names are seeded directly into
+the governance resolver's effective role set, so an IDP-emitted role string
+that happens to collide with a policy role name (e.g. Azure AD app roles in
+``roles``) would silently receive that role's grants. The provider therefore
+extracts roles ONLY when the operator names a claim explicitly via
+``dashboard.governance.sso_role_claim`` (or the
+``HERMES_DASHBOARD_OIDC_ROLE_CLAIM`` env override); with no role claim
+configured, ``Session.roles`` stays empty.
 
 Skip reasons: when the plugin loads but can't register (missing issuer /
 client_id), it writes a human-readable reason to the module-level
@@ -95,6 +129,44 @@ logger = logging.getLogger(__name__)
 # OIDC core scopes. ``openid`` is mandatory (without it the IDP won't issue an
 # ID token); ``profile``/``email`` populate the Session's display_name/email.
 _DEFAULT_SCOPES = "openid profile email"
+
+# Default ID-token claim carrying the user's SSO group memberships. Keycloak,
+# Authentik, Zitadel and Okta all emit ``groups`` when the client is mapped;
+# operators whose IDP uses another name (e.g. Azure AD emits ``roles`` or a
+# ``wids`` list) set ``dashboard.governance.sso_group_claim`` instead.
+_DEFAULT_GROUP_CLAIM = "groups"
+
+# There is deliberately NO default role claim. Unlike groups (which only take
+# effect through an explicit ``sso_groups`` mapping or a name collision the
+# operator controls), ``Session.roles`` names are seeded directly into the
+# governance resolver's effective role set, so blindly ingesting an IDP's
+# ``roles`` claim would let any IDP-emitted role string that collides with a
+# policy role name (e.g. "admin") silently pick up that role's grants. Role
+# extraction is opt-in via ``dashboard.governance.sso_role_claim``.
+_DEFAULT_ROLE_CLAIM = ""
+
+# ID-token claims that are pure protocol plumbing, not identity. These are
+# stripped before the claims dict is attached to ``Session.claims`` so the
+# governance layer only ever sees identity facets (and nothing resembling a
+# credential: ``nonce``/``at_hash``/``c_hash`` are token-binding artefacts).
+_PROTOCOL_CLAIMS = frozenset(
+    {
+        "exp",
+        "iat",
+        "nbf",
+        "aud",
+        "iss",
+        "jti",
+        "azp",
+        "nonce",
+        "at_hash",
+        "c_hash",
+        "sid",
+        "auth_time",
+        "acr",
+        "amr",
+    }
+)
 
 # Signing algorithms we accept on the ID token. RS256 is the OIDC default;
 # ES256 is common on modern self-hosted IDPs (Zitadel, newer Keycloak realms).
@@ -172,6 +244,9 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         issuer: str,
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
+        client_secret: str = "",
+        group_claim: str = _DEFAULT_GROUP_CLAIM,
+        role_claim: str = _DEFAULT_ROLE_CLAIM,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -186,6 +261,19 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         _require_https_or_loopback(self._issuer, field="issuer")
         self._client_id = client_id
         self._scopes = scopes.strip() or _DEFAULT_SCOPES
+        # An empty/whitespace secret means "public client" — strip so a
+        # provisioned-but-blank secret can't flip us into a broken confidential
+        # mode that sends an empty client_secret. Non-empty ⇒ confidential.
+        self._client_secret = (client_secret or "").strip()
+        # ID-token claim carrying SSO group memberships (governance mapping).
+        # Empty/whitespace falls back to the default so a blank config value
+        # can't silently disable group extraction.
+        self._group_claim = (group_claim or "").strip() or _DEFAULT_GROUP_CLAIM
+        # ID-token claim carrying role names. Empty (the default) DISABLES
+        # role extraction: roles map 1:1 onto governance policy role names,
+        # so ingesting them must be an explicit operator opt-in (see
+        # _DEFAULT_ROLE_CLAIM).
+        self._role_claim = (role_claim or "").strip()
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -245,11 +333,16 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             "client_id": self._client_id,
             "code_verifier": code_verifier,
         }
-        # TODO(confidential-client): when client_secret support lands, add it
-        # here (and switch to HTTP Basic auth if the IDP's
-        # token_endpoint_auth_methods_supported prefers client_secret_basic).
+        # Confidential clients additionally authenticate the client here (basic
+        # header or post body, per the IDP's advertised methods); public
+        # clients get ({}, {}) and authenticate with PKCE alone.
+        extra_data, extra_headers = self._token_endpoint_auth(disco)
+        data.update(extra_data)
         return self._exchange(
-            disco["token_endpoint"], data, bad_request_exc=InvalidCodeError
+            disco["token_endpoint"],
+            data,
+            bad_request_exc=InvalidCodeError,
+            extra_headers=extra_headers,
         )
 
     def refresh_session(self, *, refresh_token: str) -> Session:
@@ -265,12 +358,17 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             # identity claims (some IDPs narrow scope on refresh otherwise).
             "scope": self._scopes,
         }
-        # TODO(confidential-client): add client_secret here when supported.
+        # Same client-authentication treatment as complete_login: confidential
+        # clients must authenticate on the refresh grant too, or the IDP
+        # rejects the rotation with invalid_client.
+        extra_data, extra_headers = self._token_endpoint_auth(disco)
+        data.update(extra_data)
         return self._exchange(
             disco["token_endpoint"],
             data,
             bad_request_exc=RefreshExpiredError,
             previous_refresh_token=refresh_token,
+            extra_headers=extra_headers,
         )
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
@@ -304,15 +402,23 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         endpoint = str(disco.get("revocation_endpoint") or "").strip()
         if not endpoint:
             return None
+        data = {
+            "token": refresh_token,
+            "token_type_hint": "refresh_token",
+            "client_id": self._client_id,
+        }
+        headers = {"Accept": "application/json"}
+        # A confidential client must authenticate on revocation too (RFC 7009
+        # §2.1), or the IDP rejects it with invalid_client. Reuse the same
+        # method selection as the token endpoint; public clients add nothing.
+        extra_data, extra_headers = self._token_endpoint_auth(disco)
+        data.update(extra_data)
+        headers.update(extra_headers)
         try:
             httpx.post(
                 endpoint,
-                data={
-                    "token": refresh_token,
-                    "token_type_hint": "refresh_token",
-                    "client_id": self._client_id,
-                },
-                headers={"Accept": "application/json"},
+                data=data,
+                headers=headers,
                 timeout=_TOKEN_ENDPOINT_TIMEOUT_SEC,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
@@ -321,6 +427,50 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
 
     # ---- internals: token exchange ----------------------------------------
 
+    def _token_endpoint_auth(
+        self, disco: Dict[str, Any]
+    ) -> tuple[Dict[str, str], Dict[str, str]]:
+        """Return ``(extra_data, extra_headers)`` for token-endpoint client auth.
+
+        Public client (no ``client_secret`` configured): returns ``({}, {})`` —
+        the exchange authenticates with PKCE alone, exactly as before this
+        method existed.
+
+        Confidential client (``client_secret`` set): authenticates the client
+        per RFC 6749 §2.3.1, choosing the method from the IDP's advertised
+        ``token_endpoint_auth_methods_supported``:
+
+          * ``client_secret_post`` advertised (and ``client_secret_basic`` not)
+            → secret in the form body.
+          * otherwise → HTTP Basic ``Authorization`` header (the OIDC default;
+            also the fallback when the IDP advertises nothing).
+
+        PKCE's ``code_verifier`` is sent regardless by the callers — the secret
+        is layered on top, never a replacement.
+        """
+        if not self._client_secret:
+            return {}, {}
+
+        methods = disco.get("token_endpoint_auth_methods_supported") or []
+        prefer_post = (
+            "client_secret_post" in methods
+            and "client_secret_basic" not in methods
+        )
+        if prefer_post:
+            # Secret travels in the application/x-www-form-urlencoded body.
+            return {"client_secret": self._client_secret}, {}
+
+        # HTTP Basic: base64(urlencode(client_id) ":" urlencode(secret)).
+        # Both halves must be form-url-encoded *before* base64 per RFC 6749
+        # §2.3.1, or a secret containing ':' / reserved chars corrupts the
+        # header.
+        userpass = (
+            f"{urllib.parse.quote(self._client_id, safe='')}:"
+            f"{urllib.parse.quote(self._client_secret, safe='')}"
+        )
+        encoded = base64.b64encode(userpass.encode("utf-8")).decode("ascii")
+        return {}, {"Authorization": f"Basic {encoded}"}
+
     def _exchange(
         self,
         token_endpoint: str,
@@ -328,6 +478,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         *,
         bad_request_exc: type[Exception],
         previous_refresh_token: str = "",
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Session:
         """POST the token endpoint and turn the response into a Session.
 
@@ -335,12 +486,20 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         (refresh grant). ``bad_request_exc`` is raised on a 400 —
         ``InvalidCodeError`` for the auth-code path, ``RefreshExpiredError``
         for the refresh path — preserving the middleware's distinct handling.
+
+        ``extra_headers`` carries the confidential-client ``Authorization``
+        header when one applies (see ``_token_endpoint_auth``); it is empty for
+        a public client, so the request is byte-identical to the pre-
+        confidential-client behaviour in that case.
         """
+        headers = {"Accept": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
         try:
             response = httpx.post(
                 token_endpoint,
                 data=data,
-                headers={"Accept": "application/json"},
+                headers=headers,
                 timeout=_TOKEN_ENDPOINT_TIMEOUT_SEC,
             )
         except httpx.RequestError as exc:
@@ -483,12 +642,24 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             payload.get("revocation_endpoint", "") or ""
         ).strip()
 
+        # Client-authentication methods the IDP advertises for the token
+        # endpoint. Used to pick client_secret_basic vs client_secret_post for
+        # a confidential client (see ``_token_endpoint_auth``). Absent/garbage
+        # → empty list → we fall back to the OIDC default (basic).
+        auth_methods_raw = payload.get("token_endpoint_auth_methods_supported")
+        token_endpoint_auth_methods = (
+            [str(m) for m in auth_methods_raw]
+            if isinstance(auth_methods_raw, list)
+            else []
+        )
+
         return {
             "issuer": advertised_issuer or self._issuer,
             "authorization_endpoint": authorization_endpoint,
             "token_endpoint": token_endpoint,
             "jwks_uri": jwks_uri,
             "revocation_endpoint": revocation_endpoint,
+            "token_endpoint_auth_methods_supported": token_endpoint_auth_methods,
         }
 
     # ---- internals: JWT verification --------------------------------------
@@ -558,6 +729,66 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
 
     # ---- internals: mapping + misc ----------------------------------------
 
+    @staticmethod
+    def _claim_values(value: Any) -> tuple[str, ...]:
+        """Normalise a groups/roles claim value to a tuple of strings.
+
+        Accepts the shapes IDPs actually emit: a JSON list (Keycloak,
+        Authentik, Okta), a comma- or space-separated string (some Azure AD
+        and ADFS mappers), or a single bare string. Anything else (None,
+        numbers, objects) yields the empty tuple.
+        """
+        if isinstance(value, list):
+            return tuple(str(v).strip() for v in value if str(v).strip())
+        if isinstance(value, str):
+            parts = value.replace(",", " ").split()
+            return tuple(p for p in parts if p)
+        return ()
+
+    def _governance_facets(
+        self, claims: Dict[str, Any], *, email: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...], Dict[str, Any]]:
+        """Derive ``(groups, roles, identity_claims)`` from verified claims.
+
+        Groups come from the configured group claim (default ``groups``),
+        plus two pseudo-groups a governance policy can always match on:
+        Google's ``hd`` (Workspace hosted domain; Google ID tokens carry no
+        groups claim at all) and the user's ``email``. Duplicates are
+        removed order-preservingly.
+
+        Roles come from the configured role claim and ONLY when one is set:
+        role names land directly in the governance resolver's effective role
+        set, so extraction without an explicit operator opt-in would let a
+        colliding IDP role string (e.g. an Azure AD app role named "admin")
+        silently inherit a policy role's grants.
+
+        The returned claims dict is a filtered copy: protocol claims
+        (exp/iat/aud/nonce/at_hash/...) are stripped so only identity facets
+        reach the governance layer. Tokens are never included; the input is
+        the decoded ID-token payload, which by construction carries no
+        credential material beyond the hashes stripped here.
+        """
+        groups: list[str] = list(self._claim_values(claims.get(self._group_claim)))
+        hd = str(claims.get("hd", "") or "").strip()
+        if hd:
+            groups.append(hd)
+        if email:
+            groups.append(email)
+        deduped = tuple(dict.fromkeys(groups))
+
+        roles = (
+            tuple(dict.fromkeys(self._claim_values(claims.get(self._role_claim))))
+            if self._role_claim
+            else ()
+        )
+
+        identity_claims = {
+            key: value
+            for key, value in claims.items()
+            if key not in _PROTOCOL_CLAIMS
+        }
+        return deduped, roles, identity_claims
+
     def _session_from_tokens(
         self,
         *,
@@ -595,6 +826,14 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 org_id = ",".join(str(g) for g in groups)
         org_id = str(org_id or "")
 
+        # Governance identity facets: SSO groups (configurable claim name,
+        # plus Google ``hd`` / email pseudo-groups), roles, and the filtered
+        # identity-claims dict. Re-derived on every verify_session because
+        # the session is stateless (the ID token IS the session).
+        session_groups, session_roles, identity_claims = self._governance_facets(
+            claims, email=email
+        )
+
         return Session(
             user_id=user_id,
             email=email,
@@ -604,26 +843,25 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             expires_at=int(claims["exp"]),
             access_token=id_token,
             refresh_token=refresh_token,
+            groups=session_groups,
+            roles=session_roles,
+            claims=identity_claims,
         )
 
     def _validate_redirect_uri(self, redirect_uri: str) -> None:
         """Fast-fail obviously-broken redirect_uris before bouncing to the IDP.
 
         The IDP's own allowlist is authoritative; this just catches the common
-        operator-error case with a clear message. Mirrors the nous provider.
+        operator-error case with a clear message. We allow any ``http://`` host
+        (not just localhost) so self-hosted dashboards reached over plain HTTP —
+        LAN IPs, internal hostnames, reverse proxies that terminate TLS upstream
+        — are not rejected here; the IDP makes the final call on which
+        redirect_uris are permitted. Mirrors the nous provider.
         """
         parsed = urllib.parse.urlparse(redirect_uri)
         if parsed.scheme not in ("https", "http"):
             raise ProviderError(
                 f"redirect_uri must be http(s), got {redirect_uri!r}"
-            )
-        if parsed.scheme == "http" and parsed.hostname not in (
-            "localhost",
-            "127.0.0.1",
-        ):
-            raise ProviderError(
-                "redirect_uri may only use http:// for localhost/127.0.0.1, "
-                f"got {redirect_uri!r}"
             )
         if not parsed.path or not parsed.path.endswith("/auth/callback"):
             raise ProviderError(
@@ -675,6 +913,27 @@ def _oidc_subsection(oauth_section: dict) -> dict:
     return sub if isinstance(sub, dict) else {}
 
 
+def _load_config_governance_section() -> dict:
+    """Return the ``dashboard.governance`` block from config.yaml, or ``{}``.
+
+    Same robustness contract as :func:`_load_config_oauth_section`: any load
+    failure or non-dict shape falls through to ``{}``.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+    except Exception as exc:  # noqa: BLE001 (broad catch is intentional)
+        logger.debug(
+            "dashboard-auth-self-hosted: load_config() raised %s; "
+            "falling back to env-only governance configuration",
+            exc,
+        )
+        return {}
+    section = cfg_get(cfg, "dashboard", "governance", default=None)
+    return section if isinstance(section, dict) else {}
+
+
 def _resolve_setting(env_var: str, cfg_value: Any) -> str:
     """env-wins-config with empty-is-unset precedence.
 
@@ -717,6 +976,30 @@ def register(ctx) -> None:
         _resolve_setting("HERMES_DASHBOARD_OIDC_SCOPES", oidc_cfg.get("scopes"))
         or _DEFAULT_SCOPES
     )
+    # Optional — set only for a confidential client. A credential, so the
+    # canonical home is the env var / ~/.hermes/.env; config.yaml is supported
+    # for precedence symmetry. Empty ⇒ public client (unchanged behaviour).
+    client_secret = _resolve_setting(
+        "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
+    )
+    # Governance group mapping: which verified ID-token claim carries the
+    # user's SSO groups. Lives under dashboard.governance (not .oauth) because
+    # it configures the governance layer's input, not the OAuth handshake.
+    governance_cfg = _load_config_governance_section()
+    group_claim = (
+        _resolve_setting(
+            "HERMES_DASHBOARD_OIDC_GROUP_CLAIM",
+            governance_cfg.get("sso_group_claim"),
+        )
+        or _DEFAULT_GROUP_CLAIM
+    )
+    # No default fallback: unset means role extraction stays disabled (roles
+    # map directly onto governance policy role names, so ingesting an IDP
+    # claim is an explicit operator opt-in).
+    role_claim = _resolve_setting(
+        "HERMES_DASHBOARD_OIDC_ROLE_CLAIM",
+        governance_cfg.get("sso_role_claim"),
+    )
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -733,7 +1016,12 @@ def register(ctx) -> None:
 
     try:
         provider = SelfHostedOIDCProvider(
-            issuer=issuer, client_id=client_id, scopes=scopes
+            issuer=issuer,
+            client_id=client_id,
+            scopes=scopes,
+            client_secret=client_secret,
+            group_claim=group_claim,
+            role_claim=role_claim,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
@@ -745,8 +1033,13 @@ def register(ctx) -> None:
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
         "dashboard-auth-self-hosted: registered provider "
-        "(issuer=%s, client_id=%s, scopes=%r)",
+        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s, "
+        "group_claim=%s, role_claim=%s)",
         issuer,
         client_id,
         scopes,
+        # Log only whether a secret is present, never the secret itself.
+        bool(client_secret),
+        group_claim,
+        role_claim or "<disabled>",
     )

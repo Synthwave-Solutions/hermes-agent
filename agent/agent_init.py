@@ -163,6 +163,27 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _enforce_dashboard_governance_model_policy(agent) -> None:
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.model_policy import decide_model_access
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return
+        decision = decide_model_access(ctx.access, provider=agent.provider, model=agent.model)
+    except Exception as exc:
+        try:
+            ctx = current_governance_context()  # type: ignore[name-defined]
+            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+                raise PermissionError("dashboard governance denied model: governance_model_policy_error") from exc
+        except NameError:
+            pass
+        return
+    if not decision.allowed:
+        raise PermissionError(f"dashboard governance denied model: {decision.reason}")
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -376,6 +397,8 @@ def init_agent(
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
     except Exception:
         pass
+
+    _enforce_dashboard_governance_model_policy(agent)
 
     # GPT-5.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still
@@ -828,7 +851,7 @@ def init_agent(
                 client_kwargs["default_headers"] = build_nvidia_nim_headers(effective_base)
             elif base_url_host_matches(effective_base, "api.routermint.com"):
                 client_kwargs["default_headers"] = _ra()._routermint_headers()
-            elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
+            elif base_url_host_matches(effective_base, "githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
                 client_kwargs["default_headers"] = copilot_default_headers()
@@ -1167,6 +1190,11 @@ def init_agent(
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
     agent._end_session_on_close = True
+    # When True, this agent NEVER persists to the canonical session store
+    # (state.db) or the JSON snapshot, regardless of session_id. Set on the
+    # background skill/memory review fork so its harness turn can't leak into
+    # the user's real session and hijack the next live turn. Default False.
+    agent._persist_disabled = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1665,6 +1693,12 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
         )
+    _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
+    if callable(_bind_session_state):
+        try:
+            _bind_session_state(session_db=session_db, session_id=agent.session_id)
+        except Exception:
+            pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
 

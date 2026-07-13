@@ -39,6 +39,7 @@ from hermes_cli.dashboard_auth.base import (
 from hermes_cli.dashboard_auth.cookies import (
     clear_pkce_cookie,
     clear_session_cookies,
+    clear_sso_attempt_cookie,
     detect_https,
     read_pkce_cookie,
     read_session_cookies,
@@ -358,6 +359,9 @@ async def auth_callback(
         prefix=_prefix(request),
     )
     clear_pkce_cookie(resp, prefix=_prefix(request))
+    # Clear the one-shot auto-SSO loop-guard marker now that login succeeded,
+    # so it never lingers to suppress a future silent attempt after logout.
+    clear_sso_attempt_cookie(resp, prefix=_prefix(request))
     return resp
 
 
@@ -583,7 +587,7 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {
+    payload = {
         "user_id": sess.user_id,
         "email": sess.email,
         "display_name": sess.display_name,
@@ -591,6 +595,17 @@ async def api_auth_me(request: Request):
         "provider": sess.provider,
         "expires_at": sess.expires_at,
     }
+    try:
+        from hermes_cli.dashboard_governance.enforcement import (
+            effective_access_for_request,
+            serialize_effective_access,
+        )
+
+        access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+        payload["governance"] = serialize_effective_access(access)
+    except Exception:
+        _log.exception("dashboard-auth: failed to attach governance summary to /api/auth/me")
+    return payload
 
 
 # ---------------------------------------------------------------------------

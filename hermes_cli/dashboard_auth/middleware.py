@@ -17,7 +17,7 @@ binds.
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Mapping
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -25,7 +25,12 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from hermes_cli.dashboard_auth import list_session_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
-from hermes_cli.dashboard_auth.cookies import read_session_cookies
+from hermes_cli.dashboard_auth.cookies import (
+    clear_sso_attempt_cookie,
+    read_session_cookies,
+    read_sso_attempt_cookie,
+    set_sso_attempt_cookie,
+)
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
@@ -69,6 +74,24 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
+
+
+def _attach_session_state(request: Request, session) -> None:
+    """Attach the verified session and its governance identity facets.
+
+    ``dashboard_governance.enforcement.subject_from_request`` reads
+    ``request.state.groups`` / ``request.state.roles`` /
+    ``request.state.claims`` (via getattr with empty defaults), so this is
+    the single choke point where the Session's optional SSO facets become
+    visible to the governance resolver. Providers whose sessions predate the
+    optional fields (or that never populate them) degrade to empty values.
+    Never attach tokens here: only identity facets leave the Session.
+    """
+    request.state.session = session
+    request.state.groups = tuple(getattr(session, "groups", ()) or ())
+    request.state.roles = tuple(getattr(session, "roles", ()) or ())
+    claims = getattr(session, "claims", None)
+    request.state.claims = dict(claims) if isinstance(claims, Mapping) else {}
 
 
 def _client_ip(request: Request) -> str:
@@ -130,6 +153,79 @@ def _unauth_response(request: Request, *, reason: str) -> Response:
             status_code=401,
         )
     return RedirectResponse(url=login_url, status_code=302)
+
+
+def _auto_sso_response(request: Request) -> Response | None:
+    """Maybe auto-initiate the portal OAuth redirect on an unauth HTML load.
+
+    Returns a 302 → ``/auth/login`` (the existing OAuth-initiation route)
+    when ALL of the following hold, else ``None`` (caller falls back to the
+    ordinary ``/login`` interstitial):
+
+      * the request is an HTML document navigation, not an ``/api/*`` fetch
+        (a fetch() would follow the 302 into the cross-origin OAuth dance
+        opaquely — same reason ``_unauth_response`` never redirects APIs);
+      * exactly ONE interactive provider is registered — with two or more we
+        can't pick for the user, so the ``/login`` chooser must render; with
+        zero there's nothing to redirect to;
+      * the one-shot loop-guard marker is ABSENT. Its presence means we
+        already bounced to the portal once and came back still
+        unauthenticated (no portal session) — auto-redirecting again would
+        ping-pong, so we fall through to ``/login`` and clear the marker.
+
+    The portal ``/oauth/authorize`` auto-approves any current member of the
+    dashboard's org and is a silent 302 when the user already holds a portal
+    session, so for the common case (clicked a dashboard link while signed
+    in to the portal) this removes the interstitial CLICK entirely. It
+    removes a click, not a security check: the redirect lands on
+    ``/auth/login`` which runs the unchanged PKCE auth-code flow.
+    """
+    path = request.url.path
+    # APIs never auto-redirect (see _unauth_response). Only document loads.
+    if path.startswith("/api/"):
+        return None
+
+    # Already bounced once and still no session → portal has no session for
+    # this user. Stop here, clear the marker, let /login render.
+    if read_sso_attempt_cookie(request):
+        from hermes_cli.dashboard_auth.prefix import prefix_from_request
+        resp = _unauth_response(request, reason="no_cookie")
+        clear_sso_attempt_cookie(resp, prefix=prefix_from_request(request))
+        return resp
+
+    # list_session_providers() already filters on supports_session=True, so
+    # token-only credentials (drain/service providers) are never candidates.
+    providers = list_session_providers()
+    if len(providers) != 1:
+        # Zero → nothing to redirect to. Two+ → user must choose at /login.
+        return None
+
+    from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+    provider = providers[0]
+    prefix = prefix_from_request(request)
+    next_param = _safe_next_target(request)
+    from urllib.parse import quote
+    auth_login = f"{prefix}/auth/login?provider={quote(provider.name, safe='')}"
+    if next_param:
+        auth_login = f"{auth_login}&next={next_param}"
+
+    resp = RedirectResponse(url=auth_login, status_code=302)
+    # Drop the one-shot marker so a return trip that's STILL unauthenticated
+    # (portal had no session) trips the guard above next time instead of
+    # looping. Detect HTTPS for the Secure flag the same way the auth routes
+    # do; bind Path via the active prefix.
+    from hermes_cli.dashboard_auth.cookies import detect_https
+    set_sso_attempt_cookie(
+        resp, use_https=detect_https(request), prefix=prefix,
+    )
+    audit_log(
+        AuditEvent.LOGIN_START,
+        provider=provider.name,
+        reason="auto_sso",
+        ip=_client_ip(request),
+    )
+    return resp
 
 
 def _safe_next_target(request: Request) -> str:
@@ -195,7 +291,15 @@ async def gated_auth_middleware(
     at, _rt = read_session_cookies(request)
     if not at and not _rt:
         # Neither token present — no session at all. Nothing to verify or
-        # refresh; force login.
+        # refresh. Before falling back to the /login interstitial, try to
+        # silently bounce the user through the portal OAuth flow: the portal
+        # auto-approves org members and 302s straight back when they already
+        # hold a portal session, so the interstitial click is pure friction
+        # for the common case. The one-shot loop-guard inside _auto_sso_response
+        # prevents a ping-pong when the portal genuinely has no session.
+        auto = _auto_sso_response(request)
+        if auto is not None:
+            return auto
         return _unauth_response(request, reason="no_cookie")
 
     # Try every registered provider's verify_session in turn. Providers
@@ -267,7 +371,7 @@ async def gated_auth_middleware(
         refreshed = _attempt_refresh(request, refresh_token=_rt)
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
-            request.state.session = new_session
+            _attach_session_state(request, new_session)
             response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
@@ -313,7 +417,7 @@ async def gated_auth_middleware(
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
-    request.state.session = session
+    _attach_session_state(request, session)
     return await call_next(request)
 
 

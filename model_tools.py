@@ -144,7 +144,11 @@ def _run_async(coro):
                 worker_loop.close()
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(_run_in_worker)
+        # Carry the active profile + approval/sudo callbacks into the worker so
+        # async tools resolve get_hermes_home() under the active profile.
+        from tools.thread_context import propagate_context_to_thread
+
+        future = pool.submit(propagate_context_to_thread(_run_in_worker))
         try:
             return future.result(timeout=300)
         except concurrent.futures.TimeoutError:
@@ -265,6 +269,100 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _current_dashboard_governance_context():
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        return current_governance_context()
+    except Exception:
+        return None
+
+
+def _governance_cache_fingerprint():
+    ctx = _current_dashboard_governance_context()
+    if ctx is None:
+        return None
+    try:
+        if getattr(ctx.access, "mode", "off") != "enforce":
+            return None
+        return ctx.cache_fingerprint()
+    except Exception:
+        return None
+
+
+def _governance_tool_decision(tool_name: str):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import tool_allowed_for_context
+        return tool_allowed_for_context(ctx, tool_name, registry)
+    except Exception as exc:
+        logger.debug("dashboard governance tool policy failed for %s: %s", tool_name, exc)
+        # Fail closed only when an enforce context is active; otherwise preserve
+        # legacy CLI/gateway behavior if the governance package cannot import.
+        try:
+            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any]):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        return tool_arguments_allowed_for_context(ctx, tool_name, function_args)
+    except Exception as exc:
+        logger.debug("dashboard governance argument policy failed for %s: %s", tool_name, exc)
+        try:
+            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_argument_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+def _governance_usage_decision(tool_name: str, args: Optional[Dict[str, Any]] = None):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.usage import check_usage_caps
+        return check_usage_caps(ctx, tool_name, args or {})
+    except Exception as exc:
+        logger.debug("dashboard governance usage cap check failed for %s: %s", tool_name, exc)
+        try:
+            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_usage_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+def _governance_record_tool_usage(tool_name: str, args: Optional[Dict[str, Any]] = None) -> None:
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.usage import record_tool_usage
+        record_tool_usage(ctx, tool_name, args or {})
+    except Exception as exc:
+        logger.debug("dashboard governance usage recording failed for %s: %s", tool_name, exc)
+
+
+def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ctx = _current_dashboard_governance_context()
+    if ctx is None or getattr(ctx.access, "mode", "off") != "enforce":
+        return tool_defs
+    filtered: List[Dict[str, Any]] = []
+    for td in tool_defs:
+        name = td.get("function", {}).get("name", "")
+        if not name:
+            continue
+        decision = _governance_tool_decision(name)
+        if decision is None or decision.allowed:
+            filtered.append(td)
+    return filtered
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
@@ -319,6 +417,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            _governance_cache_fingerprint(),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -436,8 +535,9 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    filtered_tools = _filter_tools_by_governance(filtered_tools)
 
-    # The set of tool names that actually passed check_fn filtering.
+    # The set of tool names that actually passed check_fn and governance filtering.
     # Use this (not tools_to_include) for any downstream schema that references
     # other tools by name — otherwise the model sees tools mentioned in
     # descriptions that don't actually exist, and hallucinates calls to them.
@@ -1018,6 +1118,45 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
             )
 
+    _dispatch_decision = _governance_tool_decision(function_name)
+    if _dispatch_decision is not None and not _dispatch_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        return json.dumps({
+            "error": f"Tool denied by dashboard governance: {_dispatch_decision.reason}",
+            "governance": {
+                "mode": _governance_mode,
+                "tool": function_name,
+                "reason": _dispatch_decision.reason,
+            },
+        }, ensure_ascii=False)
+
+    _argument_decision = _governance_argument_decision(function_name, function_args)
+    if _argument_decision is not None and not _argument_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        return json.dumps({
+            "error": f"Tool denied by dashboard governance: {_argument_decision.reason}",
+            "governance": {
+                "mode": _governance_mode,
+                "tool": function_name,
+                "reason": _argument_decision.reason,
+            },
+        }, ensure_ascii=False)
+
+    _usage_decision = _governance_usage_decision(function_name, function_args)
+    if _usage_decision is not None and not _usage_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        return json.dumps({
+            "error": f"Tool denied by dashboard governance: {_usage_decision.reason}",
+            "governance": {
+                "mode": _governance_mode,
+                "tool": function_name,
+                "reason": _usage_decision.reason,
+            },
+        }, ensure_ascii=False)
+
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
         try:
@@ -1170,6 +1309,7 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        _governance_record_tool_usage(function_name, function_args)
 
         _emit_post_tool_call_hook(
             function_name=function_name,
