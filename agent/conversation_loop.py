@@ -3220,6 +3220,13 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
+                # Dynamic router context window: OmniRoute and similar routers
+                # return the actual routed model in response.model. Update the
+                # compressor after every successful response, even when the
+                # provider omitted usage accounting for this completion.
+                from agent.chat_completion_helpers import capture_omniroute_route
+                capture_omniroute_route(agent, response)
+
                 # Track actual token usage from response for context management
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
@@ -6102,12 +6109,34 @@ def run_conversation(
                         if tc.function.name in {n for n, _ in invalid_json_args}
                     )
                     if _truncated:
+                        agent._invalid_json_retries = 0
+                        if truncated_tool_call_retries < 4:
+                            truncated_tool_call_retries += 1
+                            agent._buffer_vprint(
+                                f"⚠️  Truncated tool call arguments detected "
+                                f"(finish_reason={finish_reason!r}) — retrying API call "
+                                f"({truncated_tool_call_retries}/4)..."
+                            )
+                            # Some routers report finish_reason='tool_calls'
+                            # even when the tool-argument JSON was cut off by
+                            # the output cap.  Treat this like the normal
+                            # finish_reason='length' tool-call branch: do not
+                            # execute partial arguments, re-issue the same API
+                            # call, and temporarily raise the output budget.
+                            _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
+                            _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
+                            _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+                            if _tc_requested_cap is not None:
+                                _tc_boost = max(_tc_boost, _tc_requested_cap)
+                            _tc_boost_cap = max(32768, _tc_requested_cap or 0)
+                            agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                            continue
+
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
-                            f"(finish_reason={finish_reason!r}) — refusing to execute.",
+                            f"again (finish_reason={finish_reason!r}) — refusing to execute.",
                             force=True,
                         )
-                        agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
                         _final_response = "Response truncated due to output length limit"
                         # Same tool-tail close as interrupt / invalid-tool
