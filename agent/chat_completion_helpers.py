@@ -51,6 +51,105 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+def _extract_omniroute_route(http_response) -> tuple[str, str] | None:
+    """Extract ``(provider, model)`` from an OmniRoute HTTP response.
+
+    OmniRoute returns ``x-omniroute-provider`` and ``x-omniroute-model``
+    as response headers on every routed request.  Together they form a
+    provider-qualified model slug (e.g. ``cc/claude-fable-5``) that
+    resolves to the correct context window via the model catalog.
+    """
+    if http_response is None:
+        return None
+    headers = getattr(http_response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        model = headers.get("x-omniroute-model")
+        provider = headers.get("x-omniroute-provider")
+    except Exception:
+        return None
+    if model and provider:
+        return (provider, model)
+    return None
+
+
+def capture_omniroute_route(agent, response) -> None:
+    """Detect the actual routed model from the API response and update the
+    context compressor so compression thresholds match the real model's
+    context window.
+
+    Two detection sources, in priority order:
+
+    1. ``agent._omniroute_route_info`` — set by the streaming/non-streaming
+       call sites from raw HTTP response headers (``x-omniroute-provider`` +
+       ``x-omniroute-model``).  This is provider-qualified (e.g.
+       ``cc/claude-fable-5``) and unambiguous.
+    2. ``response.model`` — the bare model name in the response body.
+       Used as fallback when headers are unavailable (non-streaming path
+       without ``with_raw_response``).
+
+    Best-effort — failures are logged but never raised, so the conversation
+    loop is never disrupted by a metadata lookup error.
+    """
+    # ── Source 1: provider-qualified route from HTTP headers ──
+    route_info = getattr(agent, "_omniroute_route_info", None)
+    # Consume immediately so stale info from a previous turn doesn't
+    # contaminate the next turn's detection.
+    agent._omniroute_route_info = None
+    if route_info:
+        provider, model = route_info
+        resolved_model = f"{provider}/{model}"
+    else:
+        # ── Source 2: bare model name from response body ──
+        resolved_model = getattr(response, "model", None) if response else None
+
+    if not resolved_model or resolved_model == agent.model:
+        return
+
+    # Deduplicate: same route already resolved this session
+    if getattr(agent, "_effective_routed_model", None) == resolved_model:
+        return
+
+    from agent.model_metadata import get_model_context_length
+
+    try:
+        context_length = get_model_context_length(
+            resolved_model,
+            base_url=agent.base_url,
+            api_key=agent.api_key,
+            provider=agent.provider,
+        )
+    except Exception:
+        logger.debug(
+            "Failed to resolve context length for routed model %r",
+            resolved_model,
+            exc_info=True,
+        )
+        return
+
+    if context_length is None:
+        logger.debug(
+            "No context length resolved for routed model %r — skipping update",
+            resolved_model,
+        )
+        return
+
+    # Persist on the agent so subsequent calls are deduplicated
+    agent._effective_routed_model = resolved_model
+    agent._effective_context_length = context_length
+
+    agent.context_compressor.update_model(
+        model=resolved_model,
+        context_length=context_length,
+        base_url=agent.base_url or "",
+        api_key=agent.api_key or "",
+        provider=agent.provider or "",
+        api_mode=agent.api_mode or "",
+        max_tokens=getattr(agent, "max_tokens", None),
+    )
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -270,7 +369,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         api_kwargs=api_kwargs,
                     )
                 )
-                result["response"] = request_client.chat.completions.create(**api_kwargs)
+                _raw = request_client.chat.completions.with_raw_response.create(**api_kwargs)
+                result["response"] = _raw.parse()
+                _omni_route = _extract_omniroute_route(_raw)
+                if _omni_route:
+                    agent._omniroute_route_info = _omni_route
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
@@ -1943,6 +2046,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Log OpenRouter response cache status when present.
         agent._check_openrouter_cache_status(getattr(stream, "response", None))
+
+        # OmniRoute: capture provider+model from response headers for
+        # dynamic context-window resolution.  The headers are available
+        # on stream.response before any chunks are consumed.
+        _omni_route = _extract_omniroute_route(getattr(stream, "response", None))
+        if _omni_route:
+            agent._omniroute_route_info = _omni_route
 
         content_parts: list = []
         tool_calls_acc: dict = {}
