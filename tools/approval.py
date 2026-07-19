@@ -3558,6 +3558,67 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+_PROFILE_SCOPE_MOD = "__unloaded__"
+
+
+def _load_profile_scope():
+    """Lazy-load ~/.hermes/profile_scope.py by absolute path (mirrors how
+    identity_tiers is kept outside the vendored tree). Cached. Returns the
+    module or None if it cannot be loaded."""
+    global _PROFILE_SCOPE_MOD
+    if _PROFILE_SCOPE_MOD == "__unloaded__":
+        try:
+            import importlib.util
+            path = os.path.expanduser("~/.hermes/profile_scope.py")
+            spec = importlib.util.spec_from_file_location("profile_scope", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _PROFILE_SCOPE_MOD = mod
+        except Exception as e:  # pragma: no cover
+            logger.error("profile_scope load failed: %s", e)
+            _PROFILE_SCOPE_MOD = None
+    return _PROFILE_SCOPE_MOD
+
+
+def _check_profile_scope_guard(command: str):
+    """Return a block-result dict if the active (SCOPED) profile's command is
+    outside its allowed project folders, else None.
+
+    Fail-open for non-scoped profiles (the existing workstation is untouched).
+    Fail-closed ONLY for a scoped profile if the check itself errors.
+    """
+    try:
+        mod = _load_profile_scope()
+        if mod is None:
+            raise RuntimeError("profile_scope unavailable")
+        profile = mod.resolve_profile()
+        if not mod.is_scoped(profile):
+            return None
+        allowed, reason = mod.check_command(profile, command)
+        if allowed:
+            return None
+        logger.warning("Profile-scope block [%s]: %s (command: %s)",
+                       profile, reason, command[:200])
+        return {"approved": False,
+                "message": (f"Blocked by profile scope ({profile}): {reason}. "
+                            f"This profile may only operate within its assigned "
+                            f"project folders.")}
+    except Exception as e:
+        # Only fail-closed when we can independently tell this is a scoped
+        # profile from HERMES_HOME; otherwise fail-open so non-scoped profiles
+        # are never impacted by a guard error.
+        try:
+            home = os.environ.get("HERMES_HOME", "")
+            scoped = "/profiles/steve" in home
+        except Exception:
+            scoped = False
+        if scoped:
+            logger.error("Profile-scope guard error (fail-closed): %s", e)
+            return {"approved": False,
+                    "message": "Blocked: profile-scope guard error (fail-closed)."}
+        return None
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -3605,6 +3666,15 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # == Profile scope guard ==
+    # Confines a SCOPED profile (e.g. a freelancer) to its allowed project
+    # folders and hard-denies secrets / other profiles. Fires BEFORE the yolo
+    # bypass so a scoped profile can never yolo out of scope. No-op (None) for
+    # non-scoped profiles, so the default gateway + ops profiles are untouched.
+    _scope_block = _check_profile_scope_guard(command)
+    if _scope_block is not None:
+        return _scope_block
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
