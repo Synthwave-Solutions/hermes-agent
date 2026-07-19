@@ -1053,6 +1053,61 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     return None
 
 
+_PROFILE_SCOPE_MOD = "__unloaded__"
+
+
+def _profile_scope_mod():
+    """Lazy-load ~/.hermes/profile_scope.py by absolute path. Cached. None on
+    failure."""
+    global _PROFILE_SCOPE_MOD
+    if _PROFILE_SCOPE_MOD == "__unloaded__":
+        try:
+            import importlib.util
+            path = os.path.expanduser("~/.hermes/profile_scope.py")
+            spec = importlib.util.spec_from_file_location("profile_scope", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _PROFILE_SCOPE_MOD = mod
+        except Exception:
+            _PROFILE_SCOPE_MOD = None
+    return _PROFILE_SCOPE_MOD
+
+
+def _check_profile_scope_path(filepath: str, mode: str = "read",
+                              task_id: str = "default") -> str | None:
+    """Hard-deny a filesystem path that is outside a SCOPED profile's allowed
+    project folders, or that hits secrets / another profile.
+
+    Returns an error string to block, or None to allow. No-op for non-scoped
+    profiles (existing workstation untouched). Unlike _check_cross_profile_path
+    this IS a boundary for the scoped profile: it complements the terminal
+    profile-scope guard for the agent's direct file tools.
+    """
+    mod = _profile_scope_mod()
+    if mod is None:
+        # Fail-closed only for the scoped freelancer; fail-open otherwise.
+        if "/profiles/steve" in os.environ.get("HERMES_HOME", ""):
+            return "Blocked: profile-scope guard unavailable (fail-closed)."
+        return None
+    try:
+        profile = mod.resolve_profile()
+        if not mod.is_scoped(profile):
+            return None
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
+        allowed, reason = mod.check_path(profile, resolved, mode)
+        if allowed:
+            return None
+        return (f"Blocked by profile scope ({profile}): {reason}. This profile "
+                f"may only access its assigned project folders.")
+    except Exception:
+        if "/profiles/steve" in os.environ.get("HERMES_HOME", ""):
+            return "Blocked: profile-scope guard error (fail-closed)."
+        return None
+
+
 def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
     """Return a soft-guard warning when ``filepath`` lands in another Hermes
     profile's scoped area, a host-side sandbox-mirror of authoritative profile
@@ -1625,6 +1680,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+
+        # Profile-scope guard (scoped freelancer profiles only; no-op otherwise)
+        _scope_err = _check_profile_scope_path(path, "read", task_id)
+        if _scope_err:
+            return json.dumps({"error": _scope_err})
 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
@@ -2230,6 +2290,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    scope_err = _check_profile_scope_path(path, "write", task_id)
+    if scope_err:
+        return tool_error(scope_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2374,6 +2437,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        scope_err = _check_profile_scope_path(_p, "write", task_id)
+        if scope_err:
+            return tool_error(scope_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
