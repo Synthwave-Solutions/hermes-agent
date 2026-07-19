@@ -3250,8 +3250,10 @@ def check_dangerous_command(command: str, env_type: str,
                             has_host_access: bool = False) -> dict:
     """Check if a command is dangerous and handle approval.
 
-    This is the main entry point called by terminal_tool before executing
-    any command. It orchestrates detection, session checks, and prompting.
+    Legacy entry point: terminal_tool now calls ``check_all_command_guards``
+    (which combines this detection with tirith and the other guards); this
+    function remains for tests and backwards compatibility. It orchestrates
+    detection, session checks, and prompting.
 
     Args:
         command: The shell command to check.
@@ -3558,32 +3560,20 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
-_PROFILE_SCOPE_MOD = "__unloaded__"
-
-
 def _load_profile_scope():
-    """Lazy-load ~/.hermes/profile_scope.py by absolute path (mirrors how
-    identity_tiers is kept outside the vendored tree). Cached. Returns the
-    module or None if it cannot be loaded."""
-    global _PROFILE_SCOPE_MOD
-    if _PROFILE_SCOPE_MOD == "__unloaded__":
-        try:
-            import importlib.util
-            path = os.path.expanduser("~/.hermes/profile_scope.py")
-            spec = importlib.util.spec_from_file_location("profile_scope", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _PROFILE_SCOPE_MOD = mod
-        except Exception as e:  # pragma: no cover
-            logger.error("profile_scope load failed: %s", e)
-            _PROFILE_SCOPE_MOD = None
-    return _PROFILE_SCOPE_MOD
+    """Lazy-load ~/.hermes/profile_scope.py via the shared bridge
+    (``tools/profile_scope_bridge.py``, cached there). Returns the module
+    or None if it cannot be loaded."""
+    from tools import profile_scope_bridge
+    return profile_scope_bridge.load_profile_scope()
 
 
-def _check_profile_scope_guard(command: str):
+def _check_profile_scope_guard(command: str, cwd: str | None = None):
     """Return a block-result dict if the active (SCOPED) profile's command is
     outside its allowed project folders, else None.
 
+    ``cwd`` is the task's tracked terminal cwd, used to resolve relative
+    path tokens against the directory the command actually runs in.
     Fail-open for non-scoped profiles (the existing workstation is untouched).
     Fail-closed ONLY for a scoped profile if the check itself errors.
     """
@@ -3594,7 +3584,7 @@ def _check_profile_scope_guard(command: str):
         profile = mod.resolve_profile()
         if not mod.is_scoped(profile):
             return None
-        allowed, reason = mod.check_command(profile, command)
+        allowed, reason = mod.check_command(profile, command, cwd=cwd)
         if allowed:
             return None
         logger.warning("Profile-scope block [%s]: %s (command: %s)",
@@ -3605,11 +3595,12 @@ def _check_profile_scope_guard(command: str):
                             f"project folders.")}
     except Exception as e:
         # Only fail-closed when we can independently tell this is a scoped
-        # profile from HERMES_HOME; otherwise fail-open so non-scoped profiles
-        # are never impacted by a guard error.
+        # profile from HERMES_HOME (segment-equality parse + marker-file
+        # fallback in the bridge); otherwise fail-open so non-scoped
+        # profiles are never impacted by a guard error.
         try:
-            home = os.environ.get("HERMES_HOME", "")
-            scoped = "/profiles/steve" in home
+            from tools import profile_scope_bridge
+            scoped = profile_scope_bridge.is_scoped_home()
         except Exception:
             scoped = False
         if scoped:
@@ -3621,7 +3612,8 @@ def _check_profile_scope_guard(command: str):
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             cwd: str | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -3632,7 +3624,22 @@ def check_all_command_guards(command: str, env_type: str,
     ``has_host_access`` is True when a Docker sandbox bind-mounts host paths;
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
+
+    ``cwd`` is the task's tracked terminal cwd, threaded into the profile
+    scope guard so relative path tokens resolve against the directory the
+    command actually runs in (not the gateway process cwd).
     """
+    # == Profile scope guard ==
+    # Confines a SCOPED profile (e.g. a freelancer) to its allowed project
+    # folders and hard-denies secrets / other profiles. Profile-keyed, not
+    # environment-keyed, so it fires BEFORE the container skip AND before the
+    # yolo bypass: a scoped profile can neither sandbox nor yolo its way out
+    # of scope. No-op (None) for non-scoped profiles, so the default gateway
+    # + ops profiles are untouched.
+    _scope_block = _check_profile_scope_guard(command, cwd=cwd)
+    if _scope_block is not None:
+        return _scope_block
+
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
@@ -3666,16 +3673,6 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
-
-    # == Profile scope guard ==
-    # Confines a SCOPED profile (e.g. a freelancer) to its allowed project
-    # folders and hard-denies secrets / other profiles. Fires BEFORE the yolo
-    # bypass so a scoped profile can never yolo out of scope. No-op (None) for
-    # non-scoped profiles, so the default gateway + ops profiles are untouched.
-    _scope_block = _check_profile_scope_guard(command)
-    if _scope_block is not None:
-        return _scope_block
-
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
@@ -4144,6 +4141,52 @@ def check_execute_code_guard(code: str, env_type: str,
         "mutate files without passing through terminal command approval; "
         "approval is one-shot for this run."
     )
+
+    # == Profile scope guard ==
+    # A SCOPED profile (e.g. a freelancer) is denied execute_code entirely:
+    # script content cannot be reliably path-scanned, so arbitrary Python is
+    # an open door out of the profile's project folders. Profile-keyed, so it
+    # fires BEFORE the container/yolo skips. Fail-closed on guard error for
+    # scoped homes only; None of this affects non-scoped profiles (fail-open).
+    try:
+        _scope_mod = _load_profile_scope()
+        if _scope_mod is None:
+            raise RuntimeError("profile_scope unavailable")
+        _scope_profile = _scope_mod.resolve_profile()
+        if _scope_mod.is_scoped(_scope_profile):
+            logger.warning("Profile-scope block [%s]: execute_code denied "
+                           "for scoped profile", _scope_profile)
+            return {
+                "approved": False,
+                "message": (
+                    f"Blocked by profile scope ({_scope_profile}): "
+                    "execute_code is not available to this profile because "
+                    "arbitrary scripts cannot be path-scoped. Use the file "
+                    "and terminal tools inside the assigned project folders "
+                    "instead."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
+    except Exception as _scope_err:
+        try:
+            from tools import profile_scope_bridge
+            _scope_home = profile_scope_bridge.is_scoped_home()
+        except Exception:
+            _scope_home = False
+        if _scope_home:
+            logger.error("Profile-scope guard error in execute_code "
+                         "(fail-closed): %s", _scope_err)
+            return {
+                "approved": False,
+                "message": "Blocked: profile-scope guard error (fail-closed).",
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
 
     # Isolated backends already sandbox the child — matches the container skip
     # in check_all_command_guards / check_dangerous_command. Docker stops

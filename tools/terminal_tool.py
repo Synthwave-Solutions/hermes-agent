@@ -340,6 +340,7 @@ def _reset_cached_sudo_passwords() -> None:
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
+    _check_profile_scope_guard,
     check_all_command_guards as _check_all_guards_impl,
 )
 
@@ -366,11 +367,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      cwd: str | None = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  cwd=cwd)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2575,6 +2578,31 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # The task's tracked terminal cwd, so the profile-scope guard resolves
+        # relative path tokens against the directory the command actually runs
+        # in (not the gateway process cwd).
+        try:
+            from tools.file_tools import _get_live_tracking_cwd
+            _guard_cwd = (_get_live_tracking_cwd(effective_task_id)
+                          or getattr(env, "cwd", None))
+        except Exception:
+            _guard_cwd = getattr(env, "cwd", None)
+
+        # Profile scope guard runs UNCONDITIONALLY, before the force
+        # short-circuit below: force=True replays a user-approved dangerous
+        # command, but a scoped profile must not be able to force its way out
+        # of its assigned project folders. No-op (None) for non-scoped
+        # profiles.
+        _scope_block = _check_profile_scope_guard(command, cwd=_guard_cwd)
+        if _scope_block is not None:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _scope_block.get("message",
+                                          "Blocked by profile scope."),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
@@ -2587,6 +2615,7 @@ def terminal_tool(
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                cwd=_guard_cwd,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
