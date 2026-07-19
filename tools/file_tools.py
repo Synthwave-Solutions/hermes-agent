@@ -1053,24 +1053,22 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     return None
 
 
-_PROFILE_SCOPE_MOD = "__unloaded__"
-
-
 def _profile_scope_mod():
-    """Lazy-load ~/.hermes/profile_scope.py by absolute path. Cached. None on
-    failure."""
-    global _PROFILE_SCOPE_MOD
-    if _PROFILE_SCOPE_MOD == "__unloaded__":
-        try:
-            import importlib.util
-            path = os.path.expanduser("~/.hermes/profile_scope.py")
-            spec = importlib.util.spec_from_file_location("profile_scope", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _PROFILE_SCOPE_MOD = mod
-        except Exception:
-            _PROFILE_SCOPE_MOD = None
-    return _PROFILE_SCOPE_MOD
+    """Lazy-load ~/.hermes/profile_scope.py via the shared bridge
+    (``tools/profile_scope_bridge.py``, cached there). None on failure."""
+    from tools import profile_scope_bridge
+    return profile_scope_bridge.load_profile_scope()
+
+
+def _is_scoped_profile_home() -> bool:
+    """True when HERMES_HOME points inside a SCOPED profile's home (via the
+    bridge: segment-equality parse plus marker-file fallback). Decides
+    fail-closed vs fail-open on guard errors."""
+    try:
+        from tools import profile_scope_bridge
+        return profile_scope_bridge.is_scoped_home()
+    except Exception:
+        return False
 
 
 def _check_profile_scope_path(filepath: str, mode: str = "read",
@@ -1085,8 +1083,8 @@ def _check_profile_scope_path(filepath: str, mode: str = "read",
     """
     mod = _profile_scope_mod()
     if mod is None:
-        # Fail-closed only for the scoped freelancer; fail-open otherwise.
-        if "/profiles/steve" in os.environ.get("HERMES_HOME", ""):
+        # Fail-closed only for a scoped profile's home; fail-open otherwise.
+        if _is_scoped_profile_home():
             return "Blocked: profile-scope guard unavailable (fail-closed)."
         return None
     try:
@@ -1103,9 +1101,63 @@ def _check_profile_scope_path(filepath: str, mode: str = "read",
         return (f"Blocked by profile scope ({profile}): {reason}. This profile "
                 f"may only access its assigned project folders.")
     except Exception:
-        if "/profiles/steve" in os.environ.get("HERMES_HOME", ""):
+        if _is_scoped_profile_home():
             return "Blocked: profile-scope guard error (fail-closed)."
         return None
+
+
+def _filter_profile_scope_search_results(result, task_id: str = "default") -> int:
+    """Drop search results that resolve outside a SCOPED profile's allowed
+    folders (matches, files, and counts, in-place). Returns the number
+    omitted; 0 (no-op) for non-scoped profiles.
+
+    Complements the search-root check in ``search_tool``: a search rooted
+    inside scope can still surface out-of-scope paths via symlinks, so each
+    result path is re-checked individually.
+    """
+    # Fast path: nothing to do unless the active profile is scoped, or the
+    # guard is unavailable under a scoped home (then the per-path check
+    # below fails closed and drops everything).
+    try:
+        mod = _profile_scope_mod()
+        if mod is not None and not mod.is_scoped(mod.resolve_profile()):
+            return 0
+        if mod is None and not _is_scoped_profile_home():
+            return 0
+    except Exception:
+        if not _is_scoped_profile_home():
+            return 0
+
+    omitted = 0
+
+    if hasattr(result, "matches") and result.matches:
+        allowed_matches = []
+        for match in result.matches:
+            if _check_profile_scope_path(match.path, "read", task_id):
+                omitted += 1
+                continue
+            allowed_matches.append(match)
+        result.matches = allowed_matches
+
+    if hasattr(result, "files") and result.files:
+        allowed_files = []
+        for file_path in result.files:
+            if _check_profile_scope_path(file_path, "read", task_id):
+                omitted += 1
+                continue
+            allowed_files.append(file_path)
+        result.files = allowed_files
+
+    if hasattr(result, "counts") and result.counts:
+        allowed_counts = {}
+        for file_path, count in result.counts.items():
+            if _check_profile_scope_path(file_path, "read", task_id):
+                omitted += 1
+                continue
+            allowed_counts[file_path] = count
+        result.counts = allowed_counts
+
+    return omitted
 
 
 def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
@@ -2606,6 +2658,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
+        # Profile-scope guard (scoped freelancer profiles only; no-op otherwise)
+        _scope_err = _check_profile_scope_path(path, "read", task_id)
+        if _scope_err:
+            return json.dumps({"error": _scope_err}, ensure_ascii=False)
+
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
         # results without tripping the repeated-search guard.
@@ -2665,6 +2722,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
+        # Per-result profile-scope filter: drop matches that resolve outside
+        # a SCOPED profile's allowed folders (no-op for everyone else).
+        omitted += _filter_profile_scope_search_results(result, task_id)
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
