@@ -2,13 +2,18 @@
 
 Scope: the policy file at `/home/synthwavehq/.hermes/dashboard-governance.yaml` (authored 2026-07-12, mode `report_only`), Google SSO wiring for the Hermes dashboard, and the exact flip to `enforce`. No secrets appear in this document or in the policy file.
 
-## 0. Current state
+## 0. Current state and the two-track architecture
 
-- Policy file exists, validates, mode `report_only`, default deny, bootstrap admin `michael@synthwave.solutions`.
-- Roles: `owner` (wildcard), `admin`, `operator`, `viewer`.
-- Groups: `sw-admins`, `sw-engineering`, `sw-freelancers`, `sw-viewers`. All `sso_groups` values are PLACEHOLDERS (see step 3).
-- Dashboard: `hermes-webui` on `127.0.0.1:8787`, exposed tailnet only at the root of `https://synthwavehq.tailbdab77.ts.net/` via `tailscale serve`. A helper proxy (`hermes-webui-tailnet-proxy.py`) also binds `100.84.151.33:8787` directly.
-- `config.yaml` `dashboard:` block currently has empty `oauth.client_id`, empty `oauth.portal_url`, and empty `basic_auth`: the dashboard has no authentication of its own today.
+There are TWO separate web surfaces; do not confuse them:
+
+- **Track A (LIVE today)**: `/home/synthwavehq/hermes-webui/server.py` (the standalone hermes-webui project), running as user systemd unit `hermes-webui.service` on `127.0.0.1:8787`, exposed at the root of `https://synthwavehq.tailbdab77.ts.net/` via `tailscale serve`. A helper proxy (`hermes-webui-tailnet-proxy.service`) also binds `100.84.151.33:8787` directly. This app has its OWN auth stack (`api/auth.py` + `api/auth_oidc.py`): password auth (already enabled via `HERMES_WEBUI_PASSWORD` in `hermes-webui/.env`) plus native Google OIDC login. Its sessions are anonymous tokens: once logged in, every user has FULL access. There is no per-user RBAC here.
+- **Track B (governance RBAC, built, not yet live)**: the hermes-agent dashboard (`hermes_cli/web_server.py` + `hermes_cli/dashboard_governance/`) on branch `feat/dashboard-governance-rbac` in the worktree `~/work/hermes-agent-governance-build`. This carries the full whitelist-first per-user/per-group governance (skills, MCP, CLI, models, files, usage caps), the admin UI, audit trail, and the policy file below. It enforces via middleware on `request.state` populated by the `dashboard_auth` provider layer.
+
+Status 2026-07-12:
+
+- Track A: Google OIDC is CONFIGURED and ACTIVE (staged in `hermes-webui/.env`, backup `.env.bak-governance-20260712`): issuer accounts.google.com, Helix client id, redirect `https://synthwavehq.tailbdab77.ts.net/api/auth/oidc/callback`, allowlist `email = michael@synthwave.solutions`. `/api/auth/status` reports `oidc_enabled: true`. Password login stays as fallback, so there is no lockout risk. The ONLY missing piece is the Google console redirect URI (step 2.2).
+- Track B: policy file exists, validates, mode `report_only`, default deny, bootstrap admin `michael@synthwave.solutions`. Roles: `owner` (wildcard), `admin`, `operator`, `viewer`. Groups: `sw-admins`, `sw-engineering`, `sw-freelancers`, `sw-viewers`. All `sso_groups` values are PLACEHOLDERS (see step 3). `config.yaml` `dashboard:` block now carries `public_url`, `oauth.client_id` (id only), `oauth.portal_url`, and `governance.policy_file` (backup `~/.hermes/config.yaml.bak-governance-20260712`).
+- Because hermes-webui has no per-user RBAC, the per-user governance only takes effect once Track B is deployed (either serve the hermes-agent dashboard, or port the governance middleware into hermes-webui). Until then the live UI is protected by SSO/password as a single shared gate, with the OIDC email allowlist as the only per-person control.
 
 ## 1. Validate and preview (repeat after every policy edit)
 
@@ -36,9 +41,11 @@ Reuse the proven Helix Google OAuth web client. Its identifiers live in `/home/s
 
 `gcloud` on the Pi is RAPT broken, so this must be done in the browser by Michael:
 
-1. Open Google Cloud console, select the project named in `GOOGLE_OAUTH_PROJECT` in the env file above.
+1. Open Google Cloud console, select the project named in `GOOGLE_OAUTH_PROJECT` in the env file above (`synthwave-website-dev`).
 2. Go to APIs and Services > Credentials, open the existing OAuth 2.0 Web application client (the one whose client id matches `GOOGLE_OAUTH_CLIENT_ID`).
-3. Under Authorized redirect URIs, add: `https://synthwavehq.tailbdab77.ts.net/auth/google/callback`
+3. Under Authorized redirect URIs, add BOTH (Track A live now, Track B for the governance dashboard later):
+   - `https://synthwavehq.tailbdab77.ts.net/api/auth/oidc/callback`
+   - `https://synthwavehq.tailbdab77.ts.net/auth/google/callback`
 4. Under Authorized JavaScript origins, add: `https://synthwavehq.tailbdab77.ts.net`
 5. Save. The redirect host is tailnet only; that is fine because Google OAuth only requires the browser (not Google) to reach the redirect URI.
 6. Optional hardening: on the OAuth consent screen keep or set User type Internal so only `synthwave.solutions` accounts can complete the flow. The policy's `identity.allowed_domains` also pins the domain server side.
@@ -59,9 +66,25 @@ dashboard:
 
 The client secret stays in the env file and is provided to the dashboard process environment (for example via the systemd unit `EnvironmentFile=`). The governance middleware (`hermes_cli/dashboard_governance/enforcement.py`) builds its subject from the authenticated session that the dashboard auth provider attaches to `request.state`; a Google OIDC provider registered through `hermes_cli/dashboard_auth/registry.register_provider` is the integration point.
 
-### 2.4 Close the side door
+### 2.4 Side door status
 
-Before enforcing, the raw tailnet proxy `hermes-webui-tailnet-proxy.py` on `100.84.151.33:8787` must either be stopped or routed through the same auth middleware. If it stays up unauthenticated, governance is bypassable from any tailnet device. Recommended: stop and disable it, keep only the `tailscale serve` :443 path.
+The raw tailnet proxy `hermes-webui-tailnet-proxy.py` on `100.84.151.33:8787` forwards to the same hermes-webui process, and that process now enforces auth (password + OIDC) on every non-public path regardless of transport. So the side door is no longer an unauthenticated bypass. It does run plain HTTP on the tailnet (WireGuard-encrypted between devices, but no TLS at the app layer). Recommended before `enforce`: stop and disable `hermes-webui-tailnet-proxy.service` anyway and keep only the `tailscale serve` :443 path, so cookies always travel over HTTPS.
+
+### 2.5 hermes-webui native OIDC config reference (Track A, applied)
+
+The live hermes-webui reads `webui_oidc` from config.yaml or these env vars (env wins). They are staged in `hermes-webui/.env` (0600, gitignored), which the systemd unit loads via `EnvironmentFile=`:
+
+```
+HERMES_WEBUI_OIDC_ISSUER=https://accounts.google.com
+HERMES_WEBUI_OIDC_CLIENT_ID=<GOOGLE_OAUTH_CLIENT_ID>
+HERMES_WEBUI_OIDC_CLIENT_SECRET=<from helix google-oauth.env, never in config.yaml or repos>
+HERMES_WEBUI_OIDC_REDIRECT_URI=https://synthwavehq.tailbdab77.ts.net/api/auth/oidc/callback
+HERMES_WEBUI_OIDC_ALLOW_CLAIM=email
+HERMES_WEBUI_OIDC_ALLOW_VALUES=michael@synthwave.solutions
+HERMES_WEBUI_TRUST_FORWARDED_PROTO=1
+```
+
+`ALLOW_VALUES` is comma-separated; add teammates there to admit them through Google login (they then have full UI access until Track B lands, so add people deliberately). Do NOT switch `ALLOW_CLAIM` to `hd` with value `synthwave.solutions` before Track B: that would admit every Workspace user with full access, which contradicts whitelist-first. After editing: `systemctl --user restart hermes-webui.service`.
 
 ## 3. Replace the placeholder SSO groups
 
@@ -101,3 +124,13 @@ Any of these restores access instantly, no code change needed:
 - Set `mode: report_only` (keeps auditing) or `mode: off` in the policy file and restart the dashboard.
 - Or move the file away: `mv ~/.hermes/dashboard-governance.yaml ~/.hermes/dashboard-governance.yaml.disabled` (loader then returns an `off` policy).
 - Bootstrap safety net: `michael@synthwave.solutions` is in `bootstrap_admins` and always resolves to wildcard grants, so the owner can never be locked out by a bad policy edit.
+
+## 7. Track B deployment decision (open)
+
+The governance branch lives in the worktree; the live repo `~/.hermes/hermes-agent` is on `main` with UNCOMMITTED changes (conversation_loop.py, api_server.py, tui_gateway/server.py, web assets) that overlap files the branch touches. Do NOT check out `feat/dashboard-governance-rbac` on the live repo before those are committed or stashed deliberately. Options, pick one with Michael:
+
+1. Commit the live dirty changes on `main` first, then merge `feat/dashboard-governance-rbac` and serve the hermes-agent dashboard (Track B replaces or runs beside hermes-webui on another port).
+2. Keep hermes-webui as the live UI and port the governance middleware + admin pages into hermes-webui (extra work, one UI).
+3. Run both: hermes-webui stays on :8787 root, the governance dashboard gets its own tailscale serve path/port for admin + freelancer use.
+
+Until decided, per-user RBAC is not active on the live UI; the OIDC email allowlist (2.5) is the access control.
