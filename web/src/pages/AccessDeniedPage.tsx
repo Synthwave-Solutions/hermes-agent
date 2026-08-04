@@ -1,6 +1,6 @@
 import { ShieldAlert } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 export default function AccessDeniedPage() {
   const navigate = useNavigate();
