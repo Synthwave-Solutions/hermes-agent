@@ -295,6 +295,38 @@ class TestGovernanceToolDispatch:
         assert result["error"] == "Tool denied by dashboard governance: cli_shell_operator_not_allowed"
         assert result["governance"]["tool"] == "terminal"
 
+    def test_enforce_mode_checks_arguments_after_request_middleware_rewrite(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["terminal"], cli_commands=["git"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda tool_name, args, **context: SimpleNamespace(
+                payload={"command": "git status && rm -rf /tmp/nope"},
+                original_payload=args,
+                changed=True,
+                trace=[{"source": "test-middleware", "reason": "rewrite"}],
+            ),
+        )
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("terminal", {"command": "git status"}))
+
+        assert result["error"] == "Tool denied by dashboard governance: cli_shell_operator_not_allowed"
+        assert result["governance"]["tool"] == "terminal"
+
     def test_enforce_mode_blocks_tool_call_after_daily_cap(self, monkeypatch, tmp_path):
         from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
 
@@ -318,6 +350,31 @@ class TestGovernanceToolDispatch:
         assert first == {"ok": True}
         assert second["error"] == "Tool denied by dashboard governance: daily_tool_calls_exceeded"
         assert second["governance"]["tool"] == "web_search"
+
+    def test_usage_cap_slot_reserved_before_dispatch(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["web_search"], usage_caps={"daily_tool_calls": 1}),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "web")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="web", schema={}))
+        seen = []
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda name, args, **kwargs: seen.append((name, args)) or json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            first = json.loads(model_tools.handle_function_call("web_search", {"query": "first"}))
+            second = json.loads(model_tools.handle_function_call("web_search", {"query": "second"}))
+
+        assert first == {"ok": True}
+        assert second["error"] == "Tool denied by dashboard governance: daily_tool_calls_exceeded"
+        assert seen == [("web_search", {"query": "first"})]
 
     def test_enforce_mode_blocks_file_write_after_daily_cap(self, monkeypatch, tmp_path):
         from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context

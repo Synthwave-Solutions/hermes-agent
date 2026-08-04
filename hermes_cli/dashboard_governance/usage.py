@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,39 @@ _FILE_WRITE_TOOLS = {"write_file", "patch"}
 
 def _usage_file() -> Path:
     return get_hermes_home() / "dashboard-governance-usage.json"
+
+
+def _usage_lock_file() -> Path:
+    return get_hermes_home() / "dashboard-governance-usage.lock"
+
+
+class _UsageFileLock:
+    def __init__(self, path: Path):
+        self._path = path
+        self._fh = None
+
+    def __enter__(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self._path.open("a+")
+        try:
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        return self._fh
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is None:
+            return False
+        try:
+            try:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                pass
+        finally:
+            self._fh.close()
+        return False
 
 
 def _now() -> datetime:
@@ -103,7 +137,8 @@ def _usage_counters_for_tool(tool_name: str, args: dict[str, Any] | None = None)
 
 
 def read_usage_state() -> dict[str, Any]:
-    return _load_state(_usage_file())
+    with _UsageFileLock(_usage_lock_file()):
+        return _load_state(_usage_file())
 
 
 def _check_counter_cap(caps: dict[str, Any], counters: dict[str, int], counter: str, prefix: str) -> AccessDecision | None:
@@ -125,14 +160,20 @@ def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str, arg
     if not caps:
         return AccessDecision(True, "usage_caps_inactive")
 
-    state = _load_state(_usage_file())
-    counter_names = _usage_counters_for_tool(tool_name, args)
-    for period, prefix in (("days", "daily"), ("months", "monthly")):
-        counters = _counter_bucket(state, ctx, period)
-        for counter in counter_names:
-            decision = _check_counter_cap(caps, counters, counter, prefix)
-            if decision is not None:
-                return decision
+    with _UsageFileLock(_usage_lock_file()):
+        state = _load_state(_usage_file())
+        counter_names = _usage_counters_for_tool(tool_name, args)
+        for period, prefix in (("days", "daily"), ("months", "monthly")):
+            counters = _counter_bucket(state, ctx, period)
+            for counter in counter_names:
+                decision = _check_counter_cap(caps, counters, counter, prefix)
+                if decision is not None:
+                    return decision
+        for period in ("days", "months"):
+            counters = _counter_bucket(state, ctx, period)
+            for counter in counter_names:
+                counters[counter] = int(counters.get(counter, 0)) + 1
+        atomic_json_write(_usage_file(), state)
     return AccessDecision(True, "usage_allowed")
 
 
@@ -141,11 +182,12 @@ def record_tool_usage(ctx: DashboardGovernanceContext | None, tool_name: str, ar
         return
     if not dict(ctx.access.grants.usage_caps or {}):
         return
-    path = _usage_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state = _load_state(path)
-    for period in ("days", "months"):
-        counters = _counter_bucket(state, ctx, period)
-        for counter in _usage_counters_for_tool(tool_name, args):
-            counters[counter] = int(counters.get(counter, 0)) + 1
-    atomic_json_write(path, state)
+    with _UsageFileLock(_usage_lock_file()):
+        state = _load_state(_usage_file())
+        if state:
+            return
+        for period in ("days", "months"):
+            counters = _counter_bucket(state, ctx, period)
+            for counter in _usage_counters_for_tool(tool_name, args):
+                counters[counter] = int(counters.get(counter, 0)) + 1
+        atomic_json_write(_usage_file(), state)
