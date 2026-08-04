@@ -20,7 +20,7 @@ import time  # noqa: F401
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
-from fastapi import APIRouter, HTTPException, Query  # noqa: F401
+from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -341,7 +341,7 @@ def get_profiles_sessions_sidebar(
 
 
 @router.get("/api/profiles")
-async def list_profiles_endpoint(request):
+async def list_profiles_endpoint(request: Request):
     from hermes_cli import profiles as profiles_mod
     from hermes_cli.dashboard_governance.enforcement import (
         effective_access_for_request,
