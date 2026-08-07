@@ -28,6 +28,28 @@ _PROFILE_SCOPE_PATH = "~/.hermes/profile_scope.py"
 _PROFILE_SCOPE_MOD = "__unloaded__"
 
 
+def _real_home() -> str:
+    """The account's passwd home, independent of the HOME env var.
+
+    The profile multiplexer runs with HOME pointed at its own root
+    (``~/.hermes-mux/home``), so plain ``expanduser`` would look for the
+    scoping layer in a directory that does not exist and silently
+    fail open for every multiplexed profile.
+    """
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return os.path.expanduser("~")
+
+
+def _expand(path: str) -> str:
+    """``expanduser`` where ``~`` is the passwd home, never ``$HOME``."""
+    if path == "~" or path.startswith("~/"):
+        return _real_home() + path[1:]
+    return os.path.expanduser(path)
+
+
 def load_profile_scope():
     """Lazy-load ~/.hermes/profile_scope.py by absolute path. Cached.
 
@@ -38,7 +60,7 @@ def load_profile_scope():
     """
     global _PROFILE_SCOPE_MOD
     if _PROFILE_SCOPE_MOD == "__unloaded__":
-        path = os.path.expanduser(_PROFILE_SCOPE_PATH)
+        path = _expand(_PROFILE_SCOPE_PATH)
         try:
             import importlib.util
             spec = importlib.util.spec_from_file_location("profile_scope", path)
@@ -67,15 +89,26 @@ def _profile_name_from_home(home: str) -> tuple[str | None, str]:
     ``<profiles_root>/<name>`` (never substring matching), so a sibling
     profile named e.g. "steven" is never conflated with "steve".
     """
-    profiles_root = os.path.normpath(os.path.expanduser("~/.hermes/profiles"))
+    profiles_root = os.path.normpath(_expand("~/.hermes/profiles"))
     if not home:
         return None, profiles_root
-    home_n = os.path.normpath(os.path.expanduser(home))
-    if not home_n.startswith(profiles_root + os.sep):
-        return None, profiles_root
-    rest = home_n[len(profiles_root) + 1:].split(os.sep)
-    name = rest[0] if rest and rest[0] else None
-    return name, profiles_root
+    home_n = os.path.normpath(_expand(home))
+    # The multiplexer serves profiles through a symlinked tree
+    # (``~/.hermes-mux/profiles/<name>`` -> ``~/.hermes/profiles/<name>``),
+    # so match the resolved path as well as the textual one.
+    candidates = [home_n]
+    try:
+        real = os.path.realpath(home_n)
+        if real != home_n:
+            candidates.append(real)
+    except OSError:
+        pass
+    for cand in candidates:
+        if cand.startswith(profiles_root + os.sep):
+            rest = cand[len(profiles_root) + 1:].split(os.sep)
+            if rest and rest[0]:
+                return rest[0], profiles_root
+    return None, profiles_root
 
 
 def is_scoped_home() -> bool:
@@ -88,8 +121,14 @@ def is_scoped_home() -> bool:
     env override so a scoped profile still fails closed.
     """
     try:
+        home = ""
+        try:
+            from hermes_constants import get_hermes_home_override
+            home = get_hermes_home_override() or ""
+        except Exception:
+            home = ""
         name, profiles_root = _profile_name_from_home(
-            os.environ.get("HERMES_HOME", ""))
+            home or os.environ.get("HERMES_HOME", ""))
         if not name:
             return False
         mod = load_profile_scope()

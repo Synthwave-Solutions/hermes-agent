@@ -314,3 +314,94 @@ class TestSelfTest:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "ALL PASS" in proc.stdout
+
+
+# ── The multiplexer: overridden HOME and a per-turn contextvar home ─────────
+#
+# The profile multiplexer serves every profile from ONE process whose HOME is
+# its own root (~/.hermes-mux/home) and whose HERMES_HOME env var never names
+# the caller's profile. The per-turn profile arrives as a contextvar override
+# instead, and the profile homes are reached through a symlinked tree. Both
+# facts silently disabled the guard for every multiplexed request until
+# 2026-08-07: the module was looked up under the wrong HOME and the profile
+# name was read from an env var that always said "the multiplexer".
+
+MUX_ROOT = os.path.join(HOME, ".hermes-mux")
+MUX_HOME = os.path.join(MUX_ROOT, "home")
+MUX_STEVE_HOME = os.path.join(MUX_ROOT, "profiles", "steve")
+
+
+class TestMultiplexerHome:
+    def test_module_loads_when_home_is_overridden(self, monkeypatch):
+        """expanduser must not decide where the scoping layer lives."""
+        monkeypatch.setenv("HOME", MUX_HOME)
+        bridge._reset_for_tests()
+        assert bridge.load_profile_scope() is not None
+
+    def test_profile_resolves_from_contextvar_override(self, monkeypatch):
+        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", MUX_ROOT)
+        bridge._reset_for_tests()
+        mod = bridge.load_profile_scope()
+        assert mod is not None
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        token = set_hermes_home_override(STEVE_HOME)
+        try:
+            assert mod.resolve_profile() == "steve"
+            assert mod.is_scoped("steve") is True
+            assert bridge.is_scoped_home() is True
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_guard_blocks_through_the_multiplexer(self, monkeypatch):
+        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", MUX_ROOT)
+        bridge._reset_for_tests()
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        token = set_hermes_home_override(STEVE_HOME)
+        try:
+            blocked = _check_profile_scope_guard(f"cat {SECRET_PATH}")
+            assert blocked is not None and blocked["approved"] is False
+            assert _check_profile_scope_guard(f"ls {IN_SCOPE_DIR}") is None
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_symlinked_profile_tree_resolves(self, monkeypatch):
+        """The mux reaches profiles through ~/.hermes-mux/profiles/<name>."""
+        if not os.path.islink(MUX_STEVE_HOME):
+            pytest.skip("no symlinked mux profile tree on this machine")
+        monkeypatch.setenv("HOME", MUX_HOME)
+        bridge._reset_for_tests()
+        mod = bridge.load_profile_scope()
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        token = set_hermes_home_override(MUX_STEVE_HOME)
+        try:
+            assert mod.resolve_profile() == "steve"
+            assert bridge.is_scoped_home() is True
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_multiplexer_does_not_scope_a_parked_profile(self, monkeypatch):
+        """Fail-open must survive the fix: parked profiles stay unbounded."""
+        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", MUX_ROOT)
+        bridge._reset_for_tests()
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        token = set_hermes_home_override(NON_SCOPED_HOME)
+        try:
+            assert bridge.is_scoped_home() is False
+            assert _check_profile_scope_guard(f"cat {OUT_OF_SCOPE}") is None
+        finally:
+            reset_hermes_home_override(token)
