@@ -64,6 +64,7 @@ def _wildcard_grants() -> GrantSet:
         file_write_roots=star,
         cli_commands=star,
         cli_workdir_roots=star,
+        workspaces=star,
     )
 
 
