@@ -405,3 +405,32 @@ class TestMultiplexerHome:
             assert _check_profile_scope_guard(f"cat {OUT_OF_SCOPE}") is None
         finally:
             reset_hermes_home_override(token)
+
+
+class TestGovernancePolicyPathUnderMux:
+    """Het beleid moet vindbaar blijven als HOME naar de multiplexer wijst.
+
+    Dit is dezelfde val als bij de folderguard: onder de mux staat HOME op
+    ~/.hermes-mux/home en HERMES_HOME op de profielmap van de beller. Daar
+    staat geen dashboard-governance.yaml, en de loader valt dan stil terug op
+    mode "off". Alles gaat dan door zonder foutmelding.
+    """
+
+    def test_beleidspad_volgt_de_echte_gebruiker_niet_de_omgeving(self, monkeypatch):
+        from gateway.platforms.api_server import _beleidspad
+
+        monkeypatch.setenv("HOME", "/home/synthwavehq/.hermes-mux/home")
+        monkeypatch.setenv("HERMES_HOME", "/home/synthwavehq/.hermes/profiles/steve")
+        pad = _beleidspad()
+        assert pad.endswith("/.hermes/dashboard-governance.yaml")
+        assert ".hermes-mux" not in pad
+        assert "/profiles/" not in pad
+
+    def test_beleid_blijft_afdwingend_onder_de_mux(self, monkeypatch):
+        from gateway.platforms.api_server import _beleidspad
+        from hermes_cli.dashboard_governance import load_governance_policy
+
+        monkeypatch.setenv("HOME", "/home/synthwavehq/.hermes-mux/home")
+        beleid = load_governance_policy(path=_beleidspad())
+        # Stil terugvallen op "off" is precies wat we niet willen zien.
+        assert beleid.mode != "off"
