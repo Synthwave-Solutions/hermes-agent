@@ -44,6 +44,7 @@ def _deep_merge_grants(base: "GrantSet", other: "GrantSet") -> "GrantSet":
         file_denied_globs=base.file_denied_globs | other.file_denied_globs,
         cli_commands=base.cli_commands | other.cli_commands,
         cli_workdir_roots=base.cli_workdir_roots | other.cli_workdir_roots,
+        workspaces=base.workspaces | other.workspaces,
         usage_caps={**base.usage_caps, **other.usage_caps},
     )
 
@@ -77,6 +78,10 @@ class GrantSet:
     file_denied_globs: frozenset[str] = field(default_factory=frozenset)
     cli_commands: frozenset[str] = field(default_factory=frozenset)
     cli_workdir_roots: frozenset[str] = field(default_factory=frozenset)
+    # Workspaces zijn de mappen die de WebUI in zijn kiezer toont. Ze horen
+    # hier thuis en niet in een los bestand: anders bepaalt de ene plek wat je
+    # ziet en de andere wat je mag openen, en dan lopen die uit elkaar.
+    workspaces: frozenset[str] = field(default_factory=frozenset)
     usage_caps: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -123,6 +128,7 @@ class GrantSet:
             file_denied_globs=_string_set(files.get("denied_globs") if isinstance(files, Mapping) else None),
             cli_commands=frozenset(command_ids),
             cli_workdir_roots=_string_set(cli.get("workdir_roots") if isinstance(cli, Mapping) else None),
+            workspaces=_string_set(data.get("workspaces")),
             usage_caps=dict(data.get("usage_caps") or {}),
         )
 

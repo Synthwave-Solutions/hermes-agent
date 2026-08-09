@@ -1081,6 +1081,9 @@ def _check_profile_scope_path(filepath: str, mode: str = "read",
     this IS a boundary for the scoped profile: it complements the terminal
     profile-scope guard for the agent's direct file tools.
     """
+    gov = _check_governance_path(filepath, mode, task_id)
+    if gov is not None:
+        return gov
     mod = _profile_scope_mod()
     if mod is None:
         # Fail-closed only for a scoped profile's home; fail-open otherwise.
@@ -1103,6 +1106,42 @@ def _check_profile_scope_path(filepath: str, mode: str = "read",
     except Exception:
         if _is_scoped_profile_home():
             return "Blocked: profile-scope guard error (fail-closed)."
+        return None
+
+
+def _check_governance_path(filepath: str, mode: str = "read",
+                           task_id: str = "default") -> str | None:
+    """Tweede slot: de bestandsregels uit de dashboard-governance.
+
+    De folderguard hierboven kent alleen mappen. De governance kent daarnaast
+    verboden patronen (.env, sleutels, alles met 'secret' in de naam), en die
+    gelden ook binnen een map die iemand verder wel mag openen. Zonder deze
+    controle kon een profiel de .env uit zijn eigen projectmap lezen.
+
+    Geen governance-context (een gewone werkplek, of het beleid is even niet te
+    lezen) betekent geen oordeel: dan blijft alles bij het oude.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import (
+            decide_tool_argument_access,
+        )
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return None
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
+        naam = "read_file" if mode == "read" else "write_file"
+        besluit = decide_tool_argument_access(ctx.access, naam, {"path": resolved})
+        if besluit.allowed:
+            return None
+        return (f"Blocked by governance: {besluit.reason}. Ask Michael if you "
+                f"need this path.")
+    except Exception:
+        logger.debug("governance path check failed", exc_info=True)
         return None
 
 
