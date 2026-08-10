@@ -1,10 +1,23 @@
-<!-- ───────────────────────────────────────────────────────────────────────────
-  Synthwave Solutions fork — the engine behind the SynthPulse Agentic Workstation.
-  Clean fork (no upstream source edits); see SYNTHPULSE.md. Deploy template:
-  https://github.com/Synthwave-Solutions/synthpulse-agentic-workstation
-─────────────────────────────────────────────────────────────────────────── -->
-> **⚡ Synthwave Solutions fork** — engine for the **[SynthPulse Agentic Workstation](SYNTHPULSE.md)**.
-> Kept upstream-mergeable; branding lives in `SYNTHPULSE.md` + `branding/`. Original Hermes Agent docs follow.
+<!--
+  Synthwave Solutions fork of NousResearch/hermes-agent: the engine behind the
+  SynthPulse Agentic Workstation. Fork-specific docs are SYNTHPULSE.md,
+  docs/FORK.md and docs/REFRESH.md. Everything after this block is upstream
+  Hermes Agent documentation and should stay that way.
+-->
+> **Synthwave Solutions fork.** This repository is the agent **engine** of the
+> [SynthPulse Agentic Workstation](SYNTHPULSE.md). It is a patched fork, not a
+> clean one: besides SynthPulse branding it carries a dashboard governance (RBAC)
+> layer, profile scope enforcement, and OmniRoute context-window resolution.
+>
+> | Question | Read |
+> |---|---|
+> | What is this fork, where does it sit in the product, how do I build and run it? | [SYNTHPULSE.md](SYNTHPULSE.md) |
+> | What is ours versus upstream, and what must not be renamed? | [docs/FORK.md](docs/FORK.md) |
+> | How do I rebase onto upstream and get it into a published image? | [docs/REFRESH.md](docs/REFRESH.md) |
+>
+> Upstream is [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent),
+> MIT, Copyright (c) 2025 Nous Research. The original Hermes Agent documentation
+> follows unchanged.
 
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
