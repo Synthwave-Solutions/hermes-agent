@@ -170,6 +170,7 @@ def _install_fake_tools_package():
         detect_dangerous_command=lambda *args, **kwargs: None,
         check_dangerous_command=lambda *args, **kwargs: {"approved": True},
         check_all_command_guards=lambda *args, **kwargs: {"approved": True},
+        _check_profile_scope_guard=lambda *args, **kwargs: None,
         load_permanent_allowlist=lambda *args, **kwargs: [],
         DANGEROUS_PATTERNS=[],
     )
