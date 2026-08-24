@@ -13,6 +13,57 @@ from .models import AccessDecision, EffectiveAccess
 
 _SHELL_OPERATOR_RE = re.compile(r"(;|&&|\|\||\||`|\$\(|<\(|>\(|\s[<>]{1,2}\s|\d[<>])")
 
+# Command/process substitution hides a nested command from segment parsing, so
+# it stays blocked outright for governed users. Plain operators (;, &&, ||, |)
+# are fine: every segment's argv0 is checked against the CLI allowlist below.
+_SHELL_SUBSTITUTION_RE = re.compile(r"(`|\$\(|<\(|>\()")
+
+# Shell builtins that carry no execution surface of their own; they may appear
+# as a segment head without an allowlist entry (export CLOUDSDK_CONFIG=...; ...).
+_SHELL_BUILTINS = frozenset({
+    "export", "cd", "set", "unset", "true", "false", "test", "[", "pwd",
+    "wait", "exit", "read", "umask", "ulimit", "echo", "printf",
+})
+
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_REDIRECT_TOKEN_RE = re.compile(r"^\d*(>>|>|<|>&|<&|&>>|&>)\d*$")
+
+
+def _split_shell_segments(command: str) -> list[list[str]]:
+    """Split a shell command on ;, &&, ||, |, & and newlines into token lists,
+    respecting quoting. Raises ValueError on unparseable input."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";|&")
+    lex.whitespace_split = True
+    segments: list[list[str]] = [[]]
+    for token in lex:
+        if token in {";", "|", "||", "&&", "&", ";;", "|&"}:
+            if segments[-1]:
+                segments.append([])
+            continue
+        segments[-1].append(token)
+    return [seg for seg in segments if seg]
+
+
+def _segment_argv0(tokens: list[str]) -> str:
+    """First real command word of a segment: skips VAR=val prefixes,
+    redirection operators plus their targets, and an `env` prefix."""
+    skip_next = False
+    saw_env = False
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if _REDIRECT_TOKEN_RE.match(token):
+            skip_next = True
+            continue
+        if _ENV_ASSIGNMENT_RE.match(token):
+            continue
+        if token == "env" and not saw_env:
+            saw_env = True
+            continue
+        return token
+    return ""
+
 
 @dataclass(frozen=True)
 class ToolIdentity:
@@ -139,7 +190,14 @@ def _command_id(command: Any) -> tuple[str, str]:
 
 def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
     skill = str(name or "").strip()
-    return bool(skill) and ("*" in values or skill in values)
+    if not skill:
+        return False
+    if "*" in values or skill in values:
+        return True
+    # Skill trees expose category-prefixed names ("synthwave/opencode",
+    # "autonomous-ai-agents/opencode"); grants list bare names. Match on the
+    # final path segment so one grant covers every category alias.
+    return skill.rsplit("/", 1)[-1] in values
 
 
 def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
@@ -148,34 +206,47 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
     grants = access.grants
     if tool_name == "skill_view":
         if not _skill_name_allowed(grants.skills_view, args.get("name")):
-            return AccessDecision(False, "skill_not_allowed")
+            return AccessDecision(False, "skill_not_allowed", detail=str(args.get("name") or ""))
     elif tool_name == "skill_manage":
         if not _skill_name_allowed(grants.skills_manage, args.get("name")):
-            return AccessDecision(False, "skill_manage_not_allowed")
+            return AccessDecision(False, "skill_manage_not_allowed", detail=str(args.get("name") or ""))
     elif tool_name in {"read_file", "search_files"}:
         path = args.get("path") or "."
         if _matches_denied_glob(str(path), grants.file_denied_globs):
-            return AccessDecision(False, "file_denied_glob")
+            return AccessDecision(False, "file_denied_glob", detail=str(path))
         if grants.file_read_roots and not _path_within_roots(str(path), grants.file_read_roots):
-            return AccessDecision(False, "file_read_root_not_allowed")
+            return AccessDecision(False, "file_read_root_not_allowed", detail=str(path))
     elif tool_name in {"write_file", "patch"}:
         path = args.get("path")
         if path:
             if _matches_denied_glob(str(path), grants.file_denied_globs):
-                return AccessDecision(False, "file_denied_glob")
+                return AccessDecision(False, "file_denied_glob", detail=str(path))
             if grants.file_write_roots and not _path_within_roots(str(path), grants.file_write_roots):
-                return AccessDecision(False, "file_write_root_not_allowed")
+                return AccessDecision(False, "file_write_root_not_allowed", detail=str(path))
     elif tool_name == "terminal":
         command = args.get("command")
-        if _SHELL_OPERATOR_RE.search(str(command or "")):
+        command_s = str(command or "")
+        if _SHELL_SUBSTITUTION_RE.search(command_s):
             return AccessDecision(False, "cli_shell_operator_not_allowed")
-        argv0, basename = _command_id(command)
         if grants.cli_commands and "*" not in grants.cli_commands:
-            if argv0 not in grants.cli_commands and basename not in grants.cli_commands:
+            try:
+                segments = _split_shell_segments(command_s)
+            except ValueError:
+                return AccessDecision(False, "cli_shell_operator_not_allowed")
+            if not segments:
                 return AccessDecision(False, "cli_command_not_allowed")
+            for tokens in segments:
+                seg_argv0 = _segment_argv0(tokens)
+                seg_base = os.path.basename(seg_argv0) if seg_argv0 else ""
+                if not seg_argv0:
+                    continue
+                if seg_argv0 in _SHELL_BUILTINS or seg_base in _SHELL_BUILTINS:
+                    continue
+                if seg_argv0 not in grants.cli_commands and seg_base not in grants.cli_commands:
+                    return AccessDecision(False, "cli_command_not_allowed", detail=seg_argv0)
         workdir = args.get("workdir")
         if workdir and grants.cli_workdir_roots and not _path_within_roots(str(workdir), grants.cli_workdir_roots):
-            return AccessDecision(False, "cli_workdir_not_allowed")
+            return AccessDecision(False, "cli_workdir_not_allowed", detail=str(workdir))
     return AccessDecision(True, "arguments_allowed")
 
 
