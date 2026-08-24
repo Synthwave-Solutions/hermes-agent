@@ -728,8 +728,72 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         )
         raw = transcoded
         mime = "image/png"
+    raw, mime = _downscale_for_attachment(raw, mime, source=path.name)
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+
+def _attach_limit(env_name: str, default: int) -> int:
+    try:
+        val = int(os.getenv(env_name, "").strip() or default)
+        return val if val > 0 else default
+    except Exception:
+        return default
+
+
+def _downscale_for_attachment(raw: bytes, mime: str, *, source: str = "") -> Tuple[bytes, str]:
+    """Shrink oversized attachment images before they are base64-embedded.
+
+    Full-resolution phone photos and 4K screenshots (2-4 MB PNG each) become
+    ~5 MB base64 parts that live in the conversation history for every
+    subsequent turn and regularly trip provider payload ceilings. Cap the long
+    side (HERMES_IMAGE_ATTACH_MAX_DIM, default 2048 px — text in screenshots
+    stays readable) and only keep the re-encode when the source exceeded
+    HERMES_IMAGE_ATTACH_MAX_BYTES (default 2 MB) or the dimension cap.
+    Fails open: any decode problem returns the original bytes untouched.
+    Animated GIFs are passed through (resizing would drop frames).
+    """
+    max_bytes = _attach_limit("HERMES_IMAGE_ATTACH_MAX_BYTES", 2 * 1024 * 1024)
+    max_dim = _attach_limit("HERMES_IMAGE_ATTACH_MAX_DIM", 2048)
+    if mime == "image/gif":
+        return raw, mime
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        with Image.open(BytesIO(raw)) as im:
+            w, h = im.size
+            if len(raw) <= max_bytes and max(w, h) <= max_dim:
+                return raw, mime
+            if max(w, h) > max_dim:
+                scale = max_dim / float(max(w, h))
+                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            has_alpha = im.mode in {"RGBA", "LA", "PA"} or (
+                im.mode == "P" and "transparency" in im.info
+            )
+            buf = BytesIO()
+            if has_alpha:
+                if im.mode not in {"RGBA", "LA"}:
+                    im = im.convert("RGBA")
+                im.save(buf, format="PNG", optimize=True)
+                out_mime = "image/png"
+            else:
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                im.save(buf, format="JPEG", quality=88)
+                out_mime = "image/jpeg"
+            out = buf.getvalue()
+            if len(out) >= len(raw):
+                return raw, mime
+            logger.info(
+                "image_routing: downscaled attachment %s %dx%d %s (%d KB) -> %s (%d KB)",
+                source or "<bytes>", w, h, mime, len(raw) // 1024, out_mime, len(out) // 1024,
+            )
+            return out, out_mime
+    except Exception as exc:
+        logger.info("image_routing: attachment downscale skipped for %s: %s", source or "<bytes>", exc)
+        return raw, mime
 
 
 def build_native_content_parts(
