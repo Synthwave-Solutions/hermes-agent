@@ -1842,6 +1842,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+    """Build API kwargs, then apply per-turn model tiering (SYNTHWAVE fork).
+
+    See ``agent.model_tiering``: when the session model is the synthwave-auto
+    combo, each turn independently picks a model tier (luna/terra/sol) and a
+    reasoning effort based on the question. Fail-open by design.
+    """
+    kwargs = _build_api_kwargs_impl(agent, api_messages, tools_for_api)
+    try:
+        from agent.model_tiering import apply_model_tiering
+        apply_model_tiering(agent, kwargs, api_messages)
+    except Exception:
+        logger.debug("model tiering unavailable", exc_info=True)
+    return kwargs
+
+
+def _build_api_kwargs_impl(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
