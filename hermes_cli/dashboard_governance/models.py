@@ -55,6 +55,9 @@ class AccessDecision:
     reason: str
     sources: tuple[str, ...] = ()
     report_only: bool = False
+    # Human-readable specifier of WHAT was denied (skill name, command word,
+    # file path) so a deny is diagnosable without transcript archaeology.
+    detail: str = ""
 
 
 @dataclass(frozen=True)

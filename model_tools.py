@@ -1480,11 +1480,15 @@ def handle_function_call(
         _governance_ctx = _current_dashboard_governance_context()
         _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
         return json.dumps({
-            "error": f"Tool denied by dashboard governance: {_argument_decision.reason}",
+            "error": (
+                f"Tool denied by dashboard governance: {_argument_decision.reason}"
+                + (f" ({getattr(_argument_decision, 'detail', '')})" if getattr(_argument_decision, "detail", "") else "")
+            ),
             "governance": {
                 "mode": _governance_mode,
                 "tool": function_name,
                 "reason": _argument_decision.reason,
+                "detail": getattr(_argument_decision, "detail", ""),
             },
         }, ensure_ascii=False)
 
