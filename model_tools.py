@@ -1285,6 +1285,26 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+_GOVERNANCE_DENY_GUIDANCE = (
+    "Do NOT silently switch to a lesser workaround. Tell the user in your "
+    "reply exactly which step was blocked by governance and how that limits "
+    "the result. When access_request is 'filed', an access request has "
+    "already been sent to the admins' governance screen automatically; tell "
+    "the user an admin can approve it there. Only continue with a fallback "
+    "after naming this trade-off to the user."
+)
+
+
+def _record_grant_request(ctx, tool_name, reason, detail=""):
+    """Spool a grantable denial for the admin approvals queue. Never raises."""
+    try:
+        from hermes_cli.dashboard_governance.grant_requests import record_denial
+
+        return record_denial(ctx, tool_name, reason, detail)
+    except Exception:
+        return False
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1446,8 +1466,14 @@ def handle_function_call(
     if _dispatch_decision is not None and not _dispatch_decision.allowed:
         _governance_ctx = _current_dashboard_governance_context()
         _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        _req_filed = _record_grant_request(
+            _governance_ctx, function_name, _dispatch_decision.reason,
+            getattr(_dispatch_decision, "detail", ""),
+        )
         return json.dumps({
             "error": f"Tool denied by dashboard governance: {_dispatch_decision.reason}",
+            "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
+            "access_request": "filed" if _req_filed else "none",
             "governance": {
                 "mode": _governance_mode,
                 "tool": function_name,
@@ -1484,6 +1510,11 @@ def handle_function_call(
                 f"Tool denied by dashboard governance: {_argument_decision.reason}"
                 + (f" ({getattr(_argument_decision, 'detail', '')})" if getattr(_argument_decision, "detail", "") else "")
             ),
+            "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
+            "access_request": "filed" if _record_grant_request(
+                _governance_ctx, function_name, _argument_decision.reason,
+                getattr(_argument_decision, "detail", ""),
+            ) else "none",
             "governance": {
                 "mode": _governance_mode,
                 "tool": function_name,
@@ -1498,6 +1529,7 @@ def handle_function_call(
         _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
         return json.dumps({
             "error": f"Tool denied by dashboard governance: {_usage_decision.reason}",
+            "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
             "governance": {
                 "mode": _governance_mode,
                 "tool": function_name,
