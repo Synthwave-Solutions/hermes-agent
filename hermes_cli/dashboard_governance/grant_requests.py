@@ -22,7 +22,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_STORE = Path(os.path.expanduser("~/.hermes/webui/governance-grant-requests.json"))
+_STORE_NAME = "governance-grant-requests.json"
+
+
+def _store_path() -> Path:
+    """Resolve the spool lazily from the env so a test STATE_DIR override (or
+    a relocated HERMES_HOME) never writes into the live admin queue."""
+    state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR")
+    if state_dir:
+        return Path(state_dir).expanduser() / _STORE_NAME
+    home = os.environ.get("HERMES_HOME") or "~/.hermes"
+    return Path(home).expanduser() / "webui" / _STORE_NAME
 
 # Denial reasons that map to a grantable request. Everything else (shell
 # operators, denied globs, usage caps) is a deliberate rule, not a grant gap.
@@ -88,8 +98,9 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
             return False
         key = f"{email}|{gkind}|{value}"
         now = time.time()
-        _STORE.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = _STORE.with_suffix(".lock")
+        store_file = _store_path()
+        store_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = store_file.with_suffix(".lock")
         with open(lock_path, "w") as lock_fh:
             try:
                 import fcntl
@@ -98,7 +109,7 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
             except Exception:
                 pass  # windows / no fcntl: best-effort without the lock
             try:
-                store = json.loads(_STORE.read_text(encoding="utf-8"))
+                store = json.loads(store_file.read_text(encoding="utf-8"))
                 if not isinstance(store, dict):
                     store = {}
             except (FileNotFoundError, ValueError):
@@ -121,9 +132,9 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
                     "first_seen": now,
                     "last_seen": now,
                 }
-            tmp = _STORE.with_suffix(".tmp")
+            tmp = store_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(store, ensure_ascii=False, indent=1), encoding="utf-8")
-            os.replace(tmp, _STORE)
+            os.replace(tmp, store_file)
         return True
     except Exception as exc:  # pragma: no cover: must never break tool flow
         logger.debug("grant request record failed: %s", exc)
@@ -133,7 +144,7 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
 def load_store() -> dict:
     """Read the aggregated request store (empty dict when absent/corrupt)."""
     try:
-        data = json.loads(_STORE.read_text(encoding="utf-8"))
+        data = json.loads(_store_path().read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, ValueError):
         return {}
