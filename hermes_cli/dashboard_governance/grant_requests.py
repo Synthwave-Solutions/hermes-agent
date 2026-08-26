@@ -63,6 +63,16 @@ def _map_denial(tool_name: str, reason: str, detail: str) -> tuple[str, str] | N
         if server:
             return "mcp", server
         return "tool", tool_name
+    if reason == "file_denied_glob" and detail:
+        # A secret-bearing path a governed user was blocked from. Grantable per
+        # person: approving adds this exact path to their files.allow_globs, an
+        # exception that overrides denied_globs for that one path only.
+        return "secret_glob", detail
+    if reason == "route_not_allowed" and detail:
+        # An API route outside the caller's allowlist. Grantable: approving adds
+        # the path to their grants.routes. The permission layer still applies,
+        # so this alone never confers an admin capability.
+        return "route", detail
     return None
 
 
@@ -139,6 +149,31 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
     except Exception as exc:  # pragma: no cover: must never break tool flow
         logger.debug("grant request record failed: %s", exc)
         return False
+
+
+# Admin identification, so a denial can tell the user WHO can approve it.
+# Resolved from the live policy (roles owner/admin or group sw-admins) rather
+# than hardcoded, so a change in the policy moves the pointer with it.
+_ADMIN_ROLES = frozenset({"owner", "admin"})
+_ADMIN_GROUPS = frozenset({"sw-admins"})
+
+
+def approver_emails() -> list[str]:
+    """Emails that can approve an access request. Empty list when unknown."""
+    try:
+        from hermes_cli.dashboard_governance.loader import load_governance_policy
+
+        policy = load_governance_policy()
+        out = []
+        for email, user in (getattr(policy, "users", None) or {}).items():
+            roles = {str(r).lower() for r in (getattr(user, "roles", None) or ())}
+            groups = {str(g).lower() for g in (getattr(user, "groups", None) or ())}
+            if roles & _ADMIN_ROLES or groups & _ADMIN_GROUPS:
+                out.append(str(email))
+        return sorted(out)
+    except Exception as exc:  # pragma: no cover: never break the denial path
+        logger.debug("approver lookup failed: %s", exc)
+        return []
 
 
 def load_store() -> dict:

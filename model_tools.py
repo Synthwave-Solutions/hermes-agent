@@ -1288,21 +1288,38 @@ def _emit_post_tool_call_hook(
 _GOVERNANCE_DENY_GUIDANCE = (
     "Do NOT silently switch to a lesser workaround. Tell the user in your "
     "reply exactly which step was blocked by governance and how that limits "
-    "the result. When access_request is 'filed', an access request has "
-    "already been sent to the admins' governance screen automatically; tell "
-    "the user an admin can approve it there. Only continue with a fallback "
-    "after naming this trade-off to the user."
+    "the result. When access_request is 'filed', say explicitly that an "
+    "access request has ALREADY been placed in the admins' SynthPulse WebUI "
+    "(governance screen, Approvals tab) and name the admins listed in "
+    "'approvers' so the user knows who to ask for the one-click approval. "
+    "Only continue with a fallback after naming this trade-off to the user."
 )
 
 
-def _record_grant_request(ctx, tool_name, reason, detail=""):
-    """Spool a grantable denial for the admin approvals queue. Never raises."""
+def _governance_denial_payload(ctx, tool_name, reason, detail=""):
+    """Shared denial extras: file the request and say who can approve it."""
+    filed = False
     try:
-        from hermes_cli.dashboard_governance.grant_requests import record_denial
+        from hermes_cli.dashboard_governance.grant_requests import (
+            approver_emails,
+            record_denial,
+        )
 
-        return record_denial(ctx, tool_name, reason, detail)
+        filed = record_denial(ctx, tool_name, reason, detail)
+        approvers = approver_emails() if filed else []
     except Exception:
-        return False
+        approvers = []
+    payload = {
+        "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
+        "access_request": "filed" if filed else "none",
+    }
+    if filed:
+        payload["access_request_location"] = (
+            "SynthPulse WebUI > Governance > Approvals tab (kind: Access)"
+        )
+        if approvers:
+            payload["approvers"] = approvers
+    return payload
 
 
 def handle_function_call(
@@ -1466,14 +1483,13 @@ def handle_function_call(
     if _dispatch_decision is not None and not _dispatch_decision.allowed:
         _governance_ctx = _current_dashboard_governance_context()
         _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
-        _req_filed = _record_grant_request(
+        _deny_extra = _governance_denial_payload(
             _governance_ctx, function_name, _dispatch_decision.reason,
             getattr(_dispatch_decision, "detail", ""),
         )
         return json.dumps({
             "error": f"Tool denied by dashboard governance: {_dispatch_decision.reason}",
-            "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
-            "access_request": "filed" if _req_filed else "none",
+            **_deny_extra,
             "governance": {
                 "mode": _governance_mode,
                 "tool": function_name,
@@ -1510,11 +1526,10 @@ def handle_function_call(
                 f"Tool denied by dashboard governance: {_argument_decision.reason}"
                 + (f" ({getattr(_argument_decision, 'detail', '')})" if getattr(_argument_decision, "detail", "") else "")
             ),
-            "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
-            "access_request": "filed" if _record_grant_request(
+            **_governance_denial_payload(
                 _governance_ctx, function_name, _argument_decision.reason,
                 getattr(_argument_decision, "detail", ""),
-            ) else "none",
+            ),
             "governance": {
                 "mode": _governance_mode,
                 "tool": function_name,
