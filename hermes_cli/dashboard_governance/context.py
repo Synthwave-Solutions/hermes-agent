@@ -68,8 +68,12 @@ def _serialize_grants(grants: GrantSet) -> dict[str, Any]:
         "file_read_roots": _list(grants.file_read_roots),
         "file_write_roots": _list(grants.file_write_roots),
         "file_denied_globs": _list(grants.file_denied_globs),
+        "file_allow_globs": _list(grants.file_allow_globs),
         "cli_commands": _list(grants.cli_commands),
+        "cli_approval_commands": _list(grants.cli_approval_commands),
+        "cli_denied_commands": _list(grants.cli_denied_commands),
         "cli_workdir_roots": _list(grants.cli_workdir_roots),
+        "workspaces": _list(grants.workspaces),
         "usage_caps": dict(grants.usage_caps),
     }
 
@@ -98,8 +102,12 @@ def _deserialize_grants(data: dict[str, Any]) -> GrantSet:
         file_read_roots=_set(data.get("file_read_roots")),
         file_write_roots=_set(data.get("file_write_roots")),
         file_denied_globs=_set(data.get("file_denied_globs")),
+        file_allow_globs=_set(data.get("file_allow_globs")),
         cli_commands=_set(data.get("cli_commands")),
+        cli_approval_commands=_set(data.get("cli_approval_commands")),
+        cli_denied_commands=_set(data.get("cli_denied_commands")),
         cli_workdir_roots=_set(data.get("cli_workdir_roots")),
+        workspaces=_set(data.get("workspaces")),
         usage_caps=dict(data.get("usage_caps") or {}),
     )
 

@@ -284,14 +284,16 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
             return AccessDecision(False, "skill_manage_not_allowed", detail=str(args.get("name") or ""))
     elif tool_name in {"read_file", "search_files"}:
         path = args.get("path") or "."
-        if _matches_denied_glob(str(path), grants.file_denied_globs):
+        if _matches_denied_glob(str(path), grants.file_denied_globs) \
+                and not _matches_denied_glob(str(path), grants.file_allow_globs):
             return AccessDecision(False, "file_denied_glob", detail=str(path))
         if grants.file_read_roots and not _path_within_roots(str(path), grants.file_read_roots):
             return AccessDecision(False, "file_read_root_not_allowed", detail=str(path))
     elif tool_name in {"write_file", "patch"}:
         path = args.get("path")
         if path:
-            if _matches_denied_glob(str(path), grants.file_denied_globs):
+            if _matches_denied_glob(str(path), grants.file_denied_globs) \
+                    and not _matches_denied_glob(str(path), grants.file_allow_globs):
                 return AccessDecision(False, "file_denied_glob", detail=str(path))
             if grants.file_write_roots and not _path_within_roots(str(path), grants.file_write_roots):
                 return AccessDecision(False, "file_write_root_not_allowed", detail=str(path))

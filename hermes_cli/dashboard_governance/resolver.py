@@ -100,6 +100,25 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
     if user:
         grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
 
+    # Deny overrides grants, applied LAST so a per-user (or per-group) deny
+    # beats anything a role or group handed out. Bootstrap admins are
+    # never-deny: their wildcard access is not subtractable (a deny on an owner
+    # is refused at write time and ignored here as defence in depth).
+    # Mirrors the hermes-webui vendored resolver (api/governance/resolver.py):
+    # only the per-USER deny is subtracted, so a person is individually blocked
+    # from a capability a role or group otherwise grants. Kept identical across
+    # the two copies on purpose: a deny that applied in one layer but not the
+    # other would be a silent hole.
+    ud = getattr(user, "deny", None) if user else None
+    if user and ud is not None and not ud.is_empty() and email not in policy.bootstrap_admins:
+        grants = grants.subtract(ud)
+        sources.append(f"deny:user:{email}")
+        # A subtracted permission must also leave the source map, or a preview
+        # would still name a source for a permission the subject no longer holds.
+        for perm in list(permission_sources):
+            if perm not in grants.permissions:
+                permission_sources.pop(perm, None)
+
     return EffectiveAccess(
         subject=subject,
         mode=policy.mode,

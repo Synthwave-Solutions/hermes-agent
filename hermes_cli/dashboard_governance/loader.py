@@ -62,6 +62,7 @@ def _parse_group(name: str, raw: Any) -> GovernanceGroup:
         roles=tuple(str(v) for v in (data.get("roles") or []) if str(v).strip()),
         sso_groups=_string_set(data.get("sso_groups")),
         grants=GrantSet.from_mapping(data.get("grants")),
+        deny=GrantSet.from_mapping(data.get("deny")),
     )
 
 
@@ -72,6 +73,7 @@ def _parse_user(email: str, raw: Any) -> GovernanceUser:
         roles=tuple(str(v) for v in (data.get("roles") or []) if str(v).strip()),
         groups=tuple(str(v) for v in (data.get("groups") or []) if str(v).strip()),
         grants=GrantSet.from_mapping(data.get("grants")),
+        deny=GrantSet.from_mapping(data.get("deny")),
     )
 
 
