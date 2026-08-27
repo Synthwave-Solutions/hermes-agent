@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -92,6 +93,61 @@ def _containing_dir(path: str) -> str:
     return path
 
 
+# ── The request behind the request ──────────────────────────────────────────
+# Reported 27 Aug 2026: an admin reviewing an access request saw the derived
+# capability ("Skill: vanzelf-gmail") but not what the person had actually
+# asked for, which is the context that makes the decision informed. The
+# surface that owns the conversation (the WebUI) exports the triggering user
+# message in the agent env; this module stores a redacted, truncated copy on
+# the request. Absent env means no trigger is stored: never invent one.
+_TRIGGER_ENV = "HERMES_SESSION_LAST_USER_MESSAGE"
+_TRIGGER_MAX = 400
+
+_SECRET_PATTERNS = (
+    re.compile(r"\b(sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}", re.I),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+    re.compile(
+        r"((?:api[\s_-]?key|token|secret|password|wachtwoord|bearer)\s*[:=]\s*)\S+",
+        re.I,
+    ),
+)
+
+
+def redact_trigger(text: str) -> str:
+    """Collapse and truncate a user message, with credential-shaped runs masked.
+
+    Policy redaction happens before the trigger is ever stored, so a secret a
+    user pasted into a prompt cannot reach the approvals screen.
+    """
+    text = " ".join(str(text or "").split())
+    if not text:
+        return ""
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups:
+            text = pattern.sub(lambda m: m.group(1) + "[REDACTED]", text)
+        else:
+            text = pattern.sub("[REDACTED]", text)
+    if len(text) > _TRIGGER_MAX:
+        text = text[: _TRIGGER_MAX - 1].rstrip() + "…"
+    return text
+
+
+def _trigger_from_env() -> str:
+    try:
+        raw = os.environ.get(_TRIGGER_ENV) or ""
+        if not raw:
+            try:
+                from gateway.session_context import get_session_env
+
+                raw = get_session_env(_TRIGGER_ENV) or ""
+            except Exception:
+                raw = ""
+        return redact_trigger(raw)
+    except Exception:
+        return ""
+
+
 def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
     """Record one governance denial as an access request. Never raises."""
     try:
@@ -124,12 +180,18 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
                     store = {}
             except (FileNotFoundError, ValueError):
                 store = {}
+            trigger = _trigger_from_env()
             entry = store.get(key)
             if isinstance(entry, dict):
                 entry["count"] = int(entry.get("count") or 0) + 1
                 entry["last_seen"] = now
                 entry["tool"] = str(tool_name or "")
                 entry["detail"] = str(detail or "")
+                # Keep the FIRST trigger: it is the ask that opened the
+                # request, and an admin deciding on it should see that one
+                # rather than whichever retry happened to be last.
+                if trigger and not entry.get("trigger"):
+                    entry["trigger"] = trigger
             else:
                 store[key] = {
                     "email": email,
@@ -138,6 +200,7 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
                     "tool": str(tool_name or ""),
                     "reason": str(reason or ""),
                     "detail": str(detail or ""),
+                    "trigger": trigger,
                     "count": 1,
                     "first_seen": now,
                     "last_seen": now,
