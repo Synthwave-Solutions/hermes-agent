@@ -135,3 +135,68 @@ def test_resolver_empty_deny_leaves_sources_untouched():
     )
     access = resolve_effective_access(policy, GovernanceSubject(email="user@example.com"))
     assert not any(source.startswith("deny:") for source in access.grant_sources)
+
+
+# ── The ask behind an access request (27 Aug 2026 ticket) ───────────────────
+# An admin deciding on a request needs the user's own words, redacted and
+# truncated before they are ever stored.
+
+class TestTriggerRedaction:
+    def test_credential_shaped_runs_are_masked(self):
+        from hermes_cli.dashboard_governance.grant_requests import redact_trigger
+        for secret, probe in [
+            ("sk-abcdef1234567890abcdef", "sk-abcdef"),
+            ("ghp_ABCDEFGHIJKLMNOPQRSTUV", "ghp_ABCD"),
+            ("api_key: hunter2superlong", "hunter2superlong"),
+            ("password=Zomer2026!", "Zomer2026!"),
+            ("deadbeefdeadbeefdeadbeefdeadbeef", "deadbeef"),
+        ]:
+            out = redact_trigger(f"please use {secret} for me")
+            assert probe not in out, out
+            assert "[REDACTED]" in out
+
+    def test_ordinary_text_survives_intact(self):
+        from hermes_cli.dashboard_governance.grant_requests import redact_trigger
+        text = "pull my open github issues and put them on my todo list"
+        assert redact_trigger(f"  {text}  ") == text
+
+    def test_long_input_is_truncated_with_an_ellipsis(self):
+        from hermes_cli.dashboard_governance.grant_requests import redact_trigger
+        out = redact_trigger("x" * 900)
+        assert len(out) <= 400 and out.endswith("…")
+
+    def test_empty_input_stays_empty_never_a_placeholder(self):
+        from hermes_cli.dashboard_governance.grant_requests import redact_trigger
+        assert redact_trigger("") == "" and redact_trigger(None) == ""
+
+    def test_denial_stores_the_first_trigger_not_the_latest(self, tmp_path, monkeypatch):
+        from hermes_cli.dashboard_governance import grant_requests as gr
+        monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(tmp_path))
+
+        class _Subject:
+            email = "steve@example.test"
+
+        class _Ctx:
+            access = type("A", (), {"subject": _Subject()})()
+
+        monkeypatch.setenv("HERMES_SESSION_LAST_USER_MESSAGE", "get my github issues")
+        assert gr.record_denial(_Ctx(), "load_skill", "skill_not_allowed", "my-day")
+        monkeypatch.setenv("HERMES_SESSION_LAST_USER_MESSAGE", "retrying the same thing")
+        assert gr.record_denial(_Ctx(), "load_skill", "skill_not_allowed", "my-day")
+        entry = next(iter(gr.load_store().values()))
+        assert entry["trigger"] == "get my github issues"
+        assert entry["count"] == 2
+
+    def test_missing_env_stores_no_trigger(self, tmp_path, monkeypatch):
+        from hermes_cli.dashboard_governance import grant_requests as gr
+        monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(tmp_path))
+        monkeypatch.delenv("HERMES_SESSION_LAST_USER_MESSAGE", raising=False)
+
+        class _Subject:
+            email = "steve@example.test"
+
+        class _Ctx:
+            access = type("A", (), {"subject": _Subject()})()
+
+        assert gr.record_denial(_Ctx(), "load_skill", "skill_not_allowed", "other")
+        assert next(iter(gr.load_store().values()))["trigger"] == ""
