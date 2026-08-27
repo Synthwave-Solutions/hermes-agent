@@ -1292,6 +1292,8 @@ _GOVERNANCE_DENY_GUIDANCE = (
     "access request has ALREADY been placed in the admins' SynthPulse WebUI "
     "(governance screen, Approvals tab) and name the admins listed in "
     "'approvers' so the user knows who to ask for the one-click approval. "
+    "Also tell the user they can follow their own requests under Settings > "
+    "Access requests in the SynthPulse WebUI. "
     "Only continue with a fallback after naming this trade-off to the user."
 )
 
@@ -1316,6 +1318,10 @@ def _governance_denial_payload(ctx, tool_name, reason, detail=""):
     if filed:
         payload["access_request_location"] = (
             "SynthPulse WebUI > Governance > Approvals tab (kind: Access)"
+        )
+        # Where the requester can watch their own request's status.
+        payload["access_request_self_view"] = (
+            "SynthPulse WebUI > Settings > Access requests"
         )
         if approvers:
             payload["approvers"] = approvers

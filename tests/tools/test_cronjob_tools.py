@@ -615,3 +615,47 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+
+
+# ── Time context (27 Aug 2026 report: a one-shot was scheduled one hour late
+# because the current time was never checked). Every scheduling reply now
+# carries now_local / timezone, action='now' exposes them directly, and a
+# one-shot in the past is rejected instead of silently stored.
+
+class TestTimeContext:
+    def test_now_action_reports_local_time_and_zone(self):
+        from tools.cronjob_tools import cronjob
+        out = json.loads(cronjob(action="now"))
+        assert out["success"] is True
+        for key in ("now_local", "now_iso", "timezone", "utc_offset"):
+            assert out.get(key), key
+
+    def test_time_context_renders_next_run_in_local_zone(self):
+        from tools.cronjob_tools import _time_context
+        from hermes_time import now as _now
+        from datetime import timedelta
+        target = _now() + timedelta(hours=2)
+        ctx = _time_context(target.isoformat())
+        assert ctx["next_run_local"] == target.strftime("%a %Y-%m-%d %H:%M %Z")
+
+    def test_one_shot_in_past_is_rejected_with_now(self):
+        from tools.cronjob_tools import _one_shot_in_past_error
+        from hermes_time import now as _now
+        from datetime import timedelta
+        past = (_now() - timedelta(hours=1)).replace(microsecond=0)
+        err = _one_shot_in_past_error(past.isoformat())
+        assert err and "already passed" in err and "it is now" in err
+
+    def test_future_one_shot_and_recurring_pass(self):
+        from tools.cronjob_tools import _one_shot_in_past_error
+        from hermes_time import now as _now
+        from datetime import timedelta
+        future = (_now() + timedelta(hours=1)).replace(microsecond=0)
+        assert _one_shot_in_past_error(future.isoformat()) is None
+        assert _one_shot_in_past_error("0 9 * * *") is None
+        assert _one_shot_in_past_error("every 2h") is None
+
+    def test_tool_description_states_the_time_rule(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+        text = json.dumps(CRONJOB_SCHEMA)
+        assert "TIME RULE" in text and "action='now'" in text
