@@ -42,7 +42,10 @@ def _deep_merge_grants(base: "GrantSet", other: "GrantSet") -> "GrantSet":
         file_read_roots=base.file_read_roots | other.file_read_roots,
         file_write_roots=base.file_write_roots | other.file_write_roots,
         file_denied_globs=base.file_denied_globs | other.file_denied_globs,
+        file_allow_globs=base.file_allow_globs | other.file_allow_globs,
         cli_commands=base.cli_commands | other.cli_commands,
+        cli_approval_commands=base.cli_approval_commands | other.cli_approval_commands,
+        cli_denied_commands=base.cli_denied_commands | other.cli_denied_commands,
         cli_workdir_roots=base.cli_workdir_roots | other.cli_workdir_roots,
         workspaces=base.workspaces | other.workspaces,
         usage_caps={**base.usage_caps, **other.usage_caps},
@@ -79,7 +82,19 @@ class GrantSet:
     file_read_roots: frozenset[str] = field(default_factory=frozenset)
     file_write_roots: frozenset[str] = field(default_factory=frozenset)
     file_denied_globs: frozenset[str] = field(default_factory=frozenset)
+    # Per-user allow exceptions that override a denied glob. A path matching an
+    # allow_glob is readable/writable even when it also matches a denied glob,
+    # so an admin can grant one person access to a specific secret-bearing path
+    # (e.g. via the approvals queue) without loosening denied_globs for anyone
+    # else. Allow beats deny only for the exact paths/globs listed here.
+    file_allow_globs: frozenset[str] = field(default_factory=frozenset)
     cli_commands: frozenset[str] = field(default_factory=frozenset)
+    # Mirrors the hermes-webui vendored GrantSet: commands that require an
+    # approval before running, and commands explicitly denied for a user
+    # (populated in subtract from a per-user cli deny). Kept in parity so a
+    # dimension is never silently dropped on the agent side.
+    cli_approval_commands: frozenset[str] = field(default_factory=frozenset)
+    cli_denied_commands: frozenset[str] = field(default_factory=frozenset)
     cli_workdir_roots: frozenset[str] = field(default_factory=frozenset)
     # Workspaces zijn de mappen die de WebUI in zijn kiezer toont. Ze horen
     # hier thuis en niet in een los bestand: anders bepaalt de ene plek wat je
@@ -129,7 +144,9 @@ class GrantSet:
             file_read_roots=_string_set(files.get("read_roots") if isinstance(files, Mapping) else None),
             file_write_roots=_string_set(files.get("write_roots") if isinstance(files, Mapping) else None),
             file_denied_globs=_string_set(files.get("denied_globs") if isinstance(files, Mapping) else None),
+            file_allow_globs=_string_set(files.get("allow_globs") if isinstance(files, Mapping) else None),
             cli_commands=frozenset(command_ids),
+            cli_approval_commands=_string_set(cli.get("approval_commands") if isinstance(cli, Mapping) else None),
             cli_workdir_roots=_string_set(cli.get("workdir_roots") if isinstance(cli, Mapping) else None),
             workspaces=_string_set(data.get("workspaces")),
             usage_caps=dict(data.get("usage_caps") or {}),
@@ -137,6 +154,63 @@ class GrantSet:
 
     def merge(self, other: "GrantSet") -> "GrantSet":
         return _deep_merge_grants(self, other)
+
+    def is_empty(self) -> bool:
+        """True when this grant set carries nothing (an absent deny block)."""
+        return self == GrantSet()
+
+    def subtract(self, deny: "GrantSet") -> "GrantSet":
+        """Return this grant set with everything in ``deny`` removed.
+
+        A per-user (or per-group) deny block overrides the grants inherited
+        from roles and groups: a member of a group that grants a skill can be
+        individually blocked from that one skill. ``"*"`` in a deny field wipes
+        the whole category. A specific deny cannot narrow a wildcard grant
+        (``"*"`` stays ``"*"``): a bootstrap admin is never run through this
+        path anyway. denied_globs and usage_caps are left untouched: they are
+        deny-by-nature (adding to them is a grant merge, not a subtraction),
+        and caps are numeric limits, not grants to remove.
+        """
+        def sub(base: frozenset[str], remove: frozenset[str]) -> frozenset[str]:
+            if "*" in remove:
+                return frozenset()
+            return base - remove
+
+        mcp_tools: dict[str, frozenset[str]] = {}
+        if "*" not in deny.mcp_servers:
+            for server, tools in self.mcp_tools.items():
+                if server in deny.mcp_servers:
+                    continue  # whole server denied
+                dtools = deny.mcp_tools.get(server)
+                mcp_tools[server] = frozenset() if (dtools and "*" in dtools) else (
+                    tools - dtools if dtools else tools)
+
+        return GrantSet(
+            permissions=sub(self.permissions, deny.permissions),
+            profiles=sub(self.profiles, deny.profiles),
+            routes=sub(self.routes, deny.routes),
+            settings_read=sub(self.settings_read, deny.settings_read),
+            settings_write=sub(self.settings_write, deny.settings_write),
+            toolsets=sub(self.toolsets, deny.toolsets),
+            tools=sub(self.tools, deny.tools),
+            skills_view=sub(self.skills_view, deny.skills_view),
+            skills_load=sub(self.skills_load, deny.skills_load),
+            skills_manage=sub(self.skills_manage, deny.skills_manage),
+            mcp_servers=sub(self.mcp_servers, deny.mcp_servers),
+            mcp_tools=mcp_tools,
+            model_providers=sub(self.model_providers, deny.model_providers),
+            models=sub(self.models, deny.models),
+            file_read_roots=sub(self.file_read_roots, deny.file_read_roots),
+            file_write_roots=sub(self.file_write_roots, deny.file_write_roots),
+            file_denied_globs=self.file_denied_globs,
+            file_allow_globs=sub(self.file_allow_globs, deny.file_allow_globs),
+            cli_commands=sub(self.cli_commands, deny.cli_commands),
+            cli_approval_commands=self.cli_approval_commands,
+            cli_denied_commands=self.cli_denied_commands | deny.cli_commands,
+            cli_workdir_roots=sub(self.cli_workdir_roots, deny.cli_workdir_roots),
+            workspaces=sub(self.workspaces, deny.workspaces),
+            usage_caps=dict(self.usage_caps),
+        )
 
 
 @dataclass(frozen=True)
@@ -151,6 +225,9 @@ class GovernanceGroup:
     name: str
     roles: tuple[str, ...] = ()
     grants: GrantSet = field(default_factory=GrantSet)
+    # Removed from the effective grants after all merges (see resolver). Lets a
+    # group carve an exception out of what its roles grant.
+    deny: GrantSet = field(default_factory=GrantSet)
     sso_groups: frozenset[str] = field(default_factory=frozenset)
     description: str = ""
 
@@ -161,6 +238,10 @@ class GovernanceUser:
     roles: tuple[str, ...] = ()
     groups: tuple[str, ...] = ()
     grants: GrantSet = field(default_factory=GrantSet)
+    # The per-person override: subtracted from the effective grants LAST, so it
+    # beats any role or group grant. This is how one member of a group is
+    # individually blocked from a capability the group otherwise hands out.
+    deny: GrantSet = field(default_factory=GrantSet)
 
 
 @dataclass(frozen=True)
