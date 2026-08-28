@@ -542,3 +542,101 @@ class TestHeredocBodiesAreData:
     def test_an_ordinary_compound_command_is_unchanged(self):
         assert self._decide("git status && rm -rf /x").allowed is False
         assert self._decide("cat a.txt | grep b").allowed is True
+
+
+class TestDwdIdentityBinding:
+    """Hard requirement 29-08-2026: a governed non-admin may only drive their
+    OWN Google Workspace account. Every gchat/gmail/gws-hermes/gdrive-dwd call
+    must carry `--as <own email>`; without it the CLI would run on the owner's
+    token (as Michael), with another address it would impersonate someone."""
+
+    ME = "stephen@synthwave.solutions"
+
+    def _access(self, *, roles=("tech_lead",), sources=(), email=ME, cli=("gchat", "gmail", "gws-hermes", "git", "echo", "head")):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode="enforce",
+            roles=frozenset(roles),
+            grants=GrantSet(cli_commands=frozenset(cli)),
+            grant_sources=tuple(sources),
+        )
+
+    def _decide(self, access, command):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "terminal", {"command": command})
+
+    def test_send_without_as_is_refused(self):
+        d = self._decide(self._access(), "gchat send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_required" and d.detail == "gchat"
+
+    def test_read_without_as_is_refused_too(self):
+        d = self._decide(self._access(), "gchat messages --space spaces/x --limit 5")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+
+    def test_as_self_is_allowed(self):
+        assert self._decide(self._access(), f"gchat --as {self.ME} send --space spaces/x --text hi").allowed
+        assert self._decide(self._access(), f"gmail --as={self.ME} list --limit 3").allowed
+        assert self._decide(self._access(), f"gws-hermes --as {self.ME} gmail messages list").allowed
+
+    def test_as_self_is_case_insensitive(self):
+        assert self._decide(self._access(), "gchat --as Stephen@Synthwave.Solutions spaces").allowed
+
+    def test_as_someone_else_is_refused(self):
+        d = self._decide(self._access(), "gchat --as michael@synthwave.solutions send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_mismatch"
+        assert d.detail == "gchat --as michael@synthwave.solutions"
+
+    def test_dangling_as_is_refused(self):
+        assert not self._decide(self._access(), "gmail --as").allowed
+
+    def test_env_prefix_cannot_substitute_for_as(self):
+        # gchat honours GCHAT_WRITE_AS only when --as is absent; the gate still
+        # demands an explicit --as self, so the env prefix buys nothing.
+        d = self._decide(self._access(), "GCHAT_WRITE_AS=michael@synthwave.solutions gchat send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+        assert self._decide(self._access(), f"GCHAT_WRITE_AS=x gchat --as {self.ME} send --space spaces/x --text hi").allowed
+
+    def test_every_segment_is_checked(self):
+        assert self._decide(self._access(), f"git status && gchat --as {self.ME} spaces").allowed
+        d = self._decide(self._access(), f"gchat --as {self.ME} spaces; gmail list")
+        assert not d.allowed and d.detail == "gmail"
+
+    def test_command_substitution_and_heredoc_are_checked(self):
+        assert not self._decide(self._access(), "echo $(gchat spaces)").allowed
+        assert not self._decide(self._access(), "cat <<EOF\n$(gmail list)\nEOF").allowed
+        assert self._decide(self._access(), f"echo $(gchat --as {self.ME} spaces)").allowed
+
+    def test_full_path_invocation_is_checked(self):
+        d = self._decide(self._access(cli=("*",)), "/home/synthwavehq/.local/bin/gchat send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+
+    def test_wildcard_cli_grant_does_not_lift_the_binding(self):
+        d = self._decide(self._access(cli=("*",)), "gmail send --to a@b.nl --subject s --text t")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+
+    def test_unknown_identity_fails_closed(self):
+        d = self._decide(self._access(email=""), "gchat --as stephen@synthwave.solutions spaces")
+        assert not d.allowed and d.reason == "dwd_identity_mismatch"
+
+    def test_bootstrap_admin_is_unrestricted(self):
+        a = self._access(email="michael@synthwave.solutions", roles=(), sources=("bootstrap_admin",), cli=("*",))
+        assert self._decide(a, "gchat send --space spaces/x --text hi").allowed
+        assert self._decide(a, "gmail --as info@synthwave.solutions list").allowed
+
+    def test_owner_and_admin_roles_are_unrestricted(self):
+        for role in ("owner", "admin"):
+            a = self._access(email="yaser@synthwave.solutions", roles=(role,), cli=("*",))
+            assert self._decide(a, "gchat --as odis@synthwave.solutions spaces").allowed
+
+    def test_non_dwd_commands_are_untouched(self):
+        assert self._decide(self._access(), "git log --oneline -3 | head").allowed
+        assert self._decide(self._access(), "echo --as nobody@x.nl").allowed
+
+    def test_governance_off_is_untouched(self):
+        a = EffectiveAccess(subject=GovernanceSubject(email=self.ME), mode="report_only", grants=GrantSet())
+        assert self._decide(a, "gchat send --space spaces/x --text hi").allowed
+
+    def test_model_tools_denial_gives_the_fix_and_files_nothing(self):
+        payload = model_tools._governance_denial_payload(None, "terminal", "dwd_identity_required", "gchat")
+        assert payload["access_request"] == "not_applicable"
+        assert "--as" in payload["required_behavior"]

@@ -23,6 +23,55 @@ _SHELL_SUBSTITUTION_RE = re.compile(r"(`|<\(|>\()")
 
 _CMD_SUBSTITUTION_MARK = "__HERMES_SUBST__"
 
+# Domain-wide-delegation CLIs. With `--as <email>` they act as ANY
+# @synthwave.solutions mailbox; without it they run on the owner's own OAuth
+# token (reads AND sends land as Michael). Hard requirement 29-08-2026: a
+# governed non-admin may only drive their OWN account, so every call to one
+# of these must carry `--as <their identity email>`; a missing or different
+# subject is refused. Enforced here (not via grants) so a grant rewrite can
+# never widen it. Admins (bootstrap admins, owner/admin role) are exempt.
+_DWD_CLIS = frozenset({"gchat", "gmail", "gws-hermes", "gdrive-dwd", "gdrive_dwd.py"})
+_DWD_ADMIN_ROLES = frozenset({"owner", "admin"})
+# Sentinel: no identity binding for this caller (admin or governance off).
+_DWD_UNRESTRICTED = None
+
+
+def dwd_identity_for(access: EffectiveAccess | None):
+    """The identity a caller's DWD CLI calls must be bound to, or
+    _DWD_UNRESTRICTED for admins. An unknown email binds to '' (fail closed)."""
+    if access is None:
+        return _DWD_UNRESTRICTED
+    if "bootstrap_admin" in tuple(access.grant_sources or ()):
+        return _DWD_UNRESTRICTED
+    if frozenset(access.roles or ()) & _DWD_ADMIN_ROLES:
+        return _DWD_UNRESTRICTED
+    email = getattr(access.subject, "email", "") or ""
+    return str(email).strip().lower()
+
+
+def _dwd_subject(tokens: list[str]) -> str:
+    """The `--as` subject in one segment ('' when absent)."""
+    for i, tok in enumerate(tokens):
+        if tok == "--as":
+            return tokens[i + 1].strip().lower() if i + 1 < len(tokens) else ""
+        if tok.startswith("--as="):
+            return tok[len("--as="):].strip().lower()
+    return ""
+
+
+def _check_dwd_identity(segments: list[list[str]], identity: str) -> AccessDecision:
+    for tokens in segments:
+        argv0 = _segment_argv0(tokens)
+        base = os.path.basename(argv0) if argv0 else ""
+        if base not in _DWD_CLIS:
+            continue
+        subject = _dwd_subject(tokens)
+        if not subject:
+            return AccessDecision(False, "dwd_identity_required", detail=base)
+        if not identity or subject != identity:
+            return AccessDecision(False, "dwd_identity_mismatch", detail=f"{base} --as {subject}")
+    return AccessDecision(True, "arguments_allowed")
+
 
 def _extract_cmd_substitutions(command: str) -> tuple[str, list[str]]:
     """Replace every balanced $(...) span with a placeholder and return the
@@ -293,7 +342,7 @@ def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
     return skill.rsplit("/", 1)[-1] in values
 
 
-def _check_expanded_heredoc_body(body: str, grants) -> AccessDecision:
+def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICTED) -> AccessDecision:
     """A bare-delimiter heredoc is still expanded by the shell, so anything the
     shell would RUN inside it stays gated: backticks and process substitution
     are refused, and each $(...) is checked as a command. The literal text
@@ -305,19 +354,19 @@ def _check_expanded_heredoc_body(body: str, grants) -> AccessDecision:
     except ValueError:
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     for inner in inners:
-        inner_decision = _check_cli_command(inner, grants)
+        inner_decision = _check_cli_command(inner, grants, dwd_identity)
         if not inner_decision.allowed:
             return inner_decision
     return AccessDecision(True, "arguments_allowed")
 
 
-def _check_cli_command(command_s: str, grants) -> AccessDecision:
+def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -> AccessDecision:
     """Validate one shell command string against the CLI grants: hard-block
     backticks/process substitution, recursively validate $(...) contents, and
     check every segment's argv0 against the allowlist."""
     command_s, heredoc_bodies = _strip_heredocs(command_s)
     for body in heredoc_bodies:
-        body_decision = _check_expanded_heredoc_body(body, grants)
+        body_decision = _check_expanded_heredoc_body(body, grants, dwd_identity)
         if not body_decision.allowed:
             return body_decision
     if _SHELL_SUBSTITUTION_RE.search(command_s):
@@ -327,9 +376,19 @@ def _check_cli_command(command_s: str, grants) -> AccessDecision:
     except ValueError:
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     for inner in inners:
-        inner_decision = _check_cli_command(inner, grants)
+        inner_decision = _check_cli_command(inner, grants, dwd_identity)
         if not inner_decision.allowed:
             return inner_decision
+    if dwd_identity is not _DWD_UNRESTRICTED:
+        # Identity binding runs regardless of the allowlist: even a wildcard
+        # CLI grant must not let a non-admin act as someone else.
+        try:
+            dwd_segments = _split_shell_segments(command_s)
+        except ValueError:
+            return AccessDecision(False, "cli_shell_operator_not_allowed")
+        dwd_decision = _check_dwd_identity(dwd_segments, dwd_identity)
+        if not dwd_decision.allowed:
+            return dwd_decision
     if grants.cli_commands and "*" not in grants.cli_commands:
         try:
             segments = _split_shell_segments(command_s)
@@ -377,7 +436,7 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
     elif tool_name == "terminal":
         command = args.get("command")
         command_s = str(command or "")
-        decision = _check_cli_command(command_s, grants)
+        decision = _check_cli_command(command_s, grants, dwd_identity_for(access))
         if not decision.allowed:
             return decision
         workdir = args.get("workdir")
