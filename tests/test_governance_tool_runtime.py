@@ -488,3 +488,57 @@ class TestGovernanceToolDispatch:
             result = json.loads(model_tools.handle_function_call("skill_manage", {"name": "blocked-skill", "action": "patch"}))
 
         assert result["error"].startswith("Tool denied by dashboard governance: skill_manage_not_allowed")
+
+
+class TestHeredocBodiesAreData:
+    """A heredoc body is stdin for one command, not a list of commands.
+
+    Reported by Hrishikesh Oemraw on 28 Aug 2026: every request came back as a
+    governance denial. His agent ran an ordinary python heredoc whose body held
+    `d=json.load(r); print('URL',u)`; the gate split on that semicolon and
+    refused the fragment as cli_command_not_allowed (print(URL,u)). The same
+    shape blocked every governed user, since agents write python this way.
+    """
+
+    def _decide(self, command: str):
+        from hermes_cli.dashboard_governance.tool_policy import _check_cli_command
+
+        return _check_cli_command(command, _access(cli_commands=("python3", "cat", "grep", "git")).grants)
+
+    def test_the_exact_command_that_was_refused_is_allowed(self):
+        command = (
+            "python3 - <<'PY'\n"
+            "import json,urllib.request\n"
+            "for u in ['a','b']:\n"
+            " with urllib.request.urlopen(u) as r:\n"
+            "  d=json.load(r); print('URL',u)\n"
+            "PY"
+        )
+        assert self._decide(command).allowed is True
+
+    @pytest.mark.parametrize("body", ["x = a | b", "a and b; c", "d && e", "s = 'x' # ;|&"])
+    def test_shell_operators_inside_a_body_are_text(self, body):
+        assert self._decide(f"python3 - <<'PY'\n{body}\nPY").allowed is True
+
+    def test_a_bare_delimiter_still_gates_what_the_shell_would_run(self):
+        """<<PY expands, so a substitution in the body is a real command."""
+        decision = self._decide("cat <<PY\n$(rm -rf /x)\nPY")
+        assert decision.allowed is False
+        assert decision.detail == "rm"
+
+    def test_a_quoted_delimiter_makes_the_same_text_literal(self):
+        assert self._decide("python3 - <<'PY'\ns = '$(rm -rf /x)'\nPY").allowed is True
+
+    def test_a_command_word_before_the_heredoc_is_still_checked(self):
+        assert self._decide("nmap - <<'PY'\nprint(1)\nPY").allowed is False
+
+    def test_a_herestring_is_not_a_heredoc(self):
+        assert self._decide("grep foo <<< 'bar'").allowed is True
+
+    def test_backticks_and_process_substitution_stay_refused(self):
+        assert self._decide("echo `rm -rf /x`").allowed is False
+        assert self._decide("cat <(rm -rf /x)").allowed is False
+
+    def test_an_ordinary_compound_command_is_unchanged(self):
+        assert self._decide("git status && rm -rf /x").allowed is False
+        assert self._decide("cat a.txt | grep b").allowed is True

@@ -52,6 +52,60 @@ def _extract_cmd_substitutions(command: str) -> tuple[str, list[str]]:
             i += 1
     return "".join(out), inners
 
+# Heredoc opener: << or <<- plus a delimiter word, quoted or bare. The
+# lookarounds keep <<< (herestring) out, and the trailing check keeps a stray
+# "a << b" inside a quoted string from being read as one.
+_HEREDOC_OPEN_RE = re.compile(
+    r"(?<!<)<<(-?)(?!<)\s*(?:([\'\"])([A-Za-z_][A-Za-z0-9_]*)\2|([A-Za-z_][A-Za-z0-9_]*))(?=\s|$)"
+)
+
+
+def _strip_heredocs(command: str) -> tuple[str, list[str]]:
+    """Remove heredoc bodies before segmentation, returning the remaining
+    command plus the bodies the shell would still expand.
+
+    A heredoc body is stdin DATA for a command word that is itself checked, not
+    a list of commands: `python3 - <<'PY' ... PY` is one python3 call. Without
+    this, any ; | && inside the script split the body into fake segments whose
+    first word was matched against cli.commands and denied, so an ordinary
+    python heredoc failed for every governed user. Reported by Hrishikesh
+    Oemraw on 28 Aug 2026 ("everything I ask gives governance"), on
+    `python3 - <<'PY' ... d=json.load(r); print('URL',u) ... PY`, denied as
+    cli_command_not_allowed (print(URL,u)).
+
+    This grants nothing new: `python3 -c '<anything>'` was already opaque to
+    the gate. A BARE delimiter (<<PY) is still expanded by the shell, so those
+    bodies are handed back for the caller's substitution checks; a quoted
+    delimiter (<<'PY') is literal and is dropped.
+    """
+    if "<<" not in command:
+        return command, []
+    lines = command.split("\n")
+    kept: list[str] = []
+    expanded: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        openers = [
+            (match.group(3) or match.group(4), match.group(2) is None, match.group(1) == "-")
+            for match in _HEREDOC_OPEN_RE.finditer(line)
+        ]
+        kept.append(_HEREDOC_OPEN_RE.sub(" ", line) if openers else line)
+        for delimiter, expands, strip_tabs in openers:
+            body: list[str] = []
+            while index < len(lines):
+                current = lines[index]
+                if current.strip() == delimiter or (strip_tabs and current.lstrip("\t") == delimiter):
+                    index += 1
+                    break
+                body.append(current)
+                index += 1
+            if expands:
+                expanded.append("\n".join(body))
+    return "\n".join(kept), expanded
+
+
 # Shell builtins that carry no execution surface of their own; they may appear
 # as a segment head without an allowlist entry (export CLOUDSDK_CONFIG=...; ...).
 _SHELL_BUILTINS = frozenset({
@@ -239,10 +293,33 @@ def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
     return skill.rsplit("/", 1)[-1] in values
 
 
+def _check_expanded_heredoc_body(body: str, grants) -> AccessDecision:
+    """A bare-delimiter heredoc is still expanded by the shell, so anything the
+    shell would RUN inside it stays gated: backticks and process substitution
+    are refused, and each $(...) is checked as a command. The literal text
+    itself is data and is not segmented."""
+    if _SHELL_SUBSTITUTION_RE.search(body):
+        return AccessDecision(False, "cli_shell_operator_not_allowed")
+    try:
+        _, inners = _extract_cmd_substitutions(body)
+    except ValueError:
+        return AccessDecision(False, "cli_shell_operator_not_allowed")
+    for inner in inners:
+        inner_decision = _check_cli_command(inner, grants)
+        if not inner_decision.allowed:
+            return inner_decision
+    return AccessDecision(True, "arguments_allowed")
+
+
 def _check_cli_command(command_s: str, grants) -> AccessDecision:
     """Validate one shell command string against the CLI grants: hard-block
     backticks/process substitution, recursively validate $(...) contents, and
     check every segment's argv0 against the allowlist."""
+    command_s, heredoc_bodies = _strip_heredocs(command_s)
+    for body in heredoc_bodies:
+        body_decision = _check_expanded_heredoc_body(body, grants)
+        if not body_decision.allowed:
+            return body_decision
     if _SHELL_SUBSTITUTION_RE.search(command_s):
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     try:
