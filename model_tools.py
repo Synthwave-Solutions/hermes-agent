@@ -1285,6 +1285,16 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+_DWD_IDENTITY_GUIDANCE = (
+    "This Google Workspace CLI (gchat, gmail, gws-hermes, gdrive-dwd) may only "
+    "act as the signed-in user. Re-run the exact same command with "
+    "`--as <the user's own e-mail address>` placed right after the CLI name "
+    "(reads included). Never run it without --as and never use another "
+    "person's address: that is refused and cannot be approved by an admin. "
+    "If the task needs to read or send as someone else, tell the user plainly "
+    "that this is not possible from their account."
+)
+
 _GOVERNANCE_DENY_GUIDANCE = (
     "Do NOT silently switch to a lesser workaround. Tell the user in your "
     "reply exactly which step was blocked by governance and how that limits "
@@ -1301,6 +1311,13 @@ _GOVERNANCE_DENY_GUIDANCE = (
 def _governance_denial_payload(ctx, tool_name, reason, detail=""):
     """Shared denial extras: file the request and say who can approve it."""
     filed = False
+    if str(reason or "").startswith("dwd_identity"):
+        # Identity binding is not a grant an admin can hand out: the fix is
+        # to call the CLI as yourself. Nothing to file, say how to proceed.
+        return {
+            "required_behavior": _DWD_IDENTITY_GUIDANCE,
+            "access_request": "not_applicable",
+        }
     try:
         from hermes_cli.dashboard_governance.grant_requests import (
             approver_emails,
