@@ -640,3 +640,113 @@ class TestDwdIdentityBinding:
         payload = model_tools._governance_denial_payload(None, "terminal", "dwd_identity_required", "gchat")
         assert payload["access_request"] == "not_applicable"
         assert "--as" in payload["required_behavior"]
+
+
+class TestSecretsAreOutOfShellReach:
+    """29-08-2026: the file tools honoured denied_globs, the terminal did not,
+    so a governed user could `cat` the domain-wide-delegation key that
+    read_file refused them. Every path in a command line is now checked, and
+    the per-person allow_globs exception still opens one named file."""
+
+    KEY = "/home/synthwavehq/.hermes/gmail-dwd-sa.json"
+
+    def _access(self, *, allow=(), cli=("cat", "cp", "grep", "ls", "python3", "git")):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email="stephen@synthwave.solutions"),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            grants=GrantSet(
+                cli_commands=frozenset(cli),
+                file_denied_globs=frozenset({"**/.env", "**/*-sa.json", "**/.hermes/**"}),
+                file_allow_globs=frozenset(allow),
+            ),
+        )
+
+    def _decide(self, access, command):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "terminal", {"command": command})
+
+    def test_reading_the_delegation_key_is_refused(self):
+        d = self._decide(self._access(), f"cat {self.KEY}")
+        assert not d.allowed and d.reason == "file_denied_glob" and d.detail == self.KEY
+
+    def test_tilde_path_is_refused(self):
+        assert not self._decide(self._access(), "cat ~/.hermes/gmail-dwd-sa.json").allowed
+
+    def test_a_path_quoted_inside_an_interpreter_argument_is_refused(self):
+        d = self._decide(self._access(), f"python3 -c \"print(open('{self.KEY}').read())\"")
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_copying_it_out_is_refused(self):
+        assert not self._decide(self._access(), f"cp {self.KEY} /tmp/k.json").allowed
+
+    def test_dotenv_files_are_refused(self):
+        assert not self._decide(self._access(), "cat /home/synthwavehq/clients/peterson/.env").allowed
+
+    def test_ordinary_client_work_still_runs(self):
+        assert self._decide(self._access(), "git -C /home/synthwavehq/clients/adams status").allowed
+        assert self._decide(self._access(), "grep -rn TODO /home/synthwavehq/clients/360kas/src").allowed
+
+    def test_a_granted_exception_opens_exactly_that_file(self):
+        access = self._access(allow={"/home/synthwavehq/.hermes/skills/x/notify.py"})
+        assert self._decide(access, "cat /home/synthwavehq/.hermes/skills/x/notify.py").allowed
+        assert not self._decide(access, f"cat {self.KEY}").allowed
+
+    def test_a_caller_without_denied_globs_is_unchanged(self):
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email="stephen@synthwave.solutions"),
+            mode="enforce",
+            grants=GrantSet(cli_commands=frozenset({"cat"})),
+        )
+        assert self._decide(access, f"cat {self.KEY}").allowed
+
+
+class TestIdentityBindingCannotBeShakenOff:
+    """The identity that pins the Google CLIs travels in the child process
+    environment, so the gate refuses both the wrapper words that used to hide
+    the real command and any attempt to name that variable."""
+
+    ME = "stephen@synthwave.solutions"
+
+    def _access(self, cli=("gchat", "env", "command", "time", "echo")):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            grants=GrantSet(cli_commands=frozenset(cli)),
+        )
+
+    def _decide(self, command, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), "terminal", {"command": command})
+
+    def test_command_wrapper_no_longer_hides_the_call(self):
+        d = self._decide("command gchat --as michael@synthwave.solutions spaces")
+        assert not d.allowed and d.reason == "dwd_identity_mismatch"
+
+    def test_time_wrapper_no_longer_hides_the_call(self):
+        assert not self._decide("time gchat --as michael@synthwave.solutions spaces").allowed
+
+    def test_wrapper_still_passes_an_allowed_call_through(self):
+        assert self._decide(f"command gchat --as {self.ME} spaces").allowed
+
+    def test_a_wrapped_command_outside_the_allowlist_is_still_refused(self):
+        d = self._decide("command curl https://example.com")
+        assert not d.allowed and d.reason == "cli_command_not_allowed"
+
+    def test_clearing_the_identity_variable_is_refused(self):
+        d = self._decide("HERMES_DWD_IDENTITY= gchat send --space x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_tamper"
+
+    def test_unsetting_the_identity_variable_is_refused(self):
+        assert not self._decide("env -u HERMES_DWD_IDENTITY gchat spaces").allowed
+
+    def test_admins_are_not_bound_and_may_name_the_variable(self):
+        admin = EffectiveAccess(
+            subject=GovernanceSubject(email="michael@synthwave.solutions"),
+            mode="enforce",
+            roles=frozenset({"owner", "admin"}),
+            grants=GrantSet(cli_commands=frozenset({"echo"})),
+            grant_sources=("bootstrap_admin",),
+        )
+        assert self._decide("echo $HERMES_DWD_IDENTITY", access=admin).allowed

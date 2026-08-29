@@ -186,9 +186,16 @@ def _split_shell_segments(command: str) -> list[list[str]]:
     return [seg for seg in segments if seg]
 
 
+# Words that introduce another command without consuming arguments of their
+# own. Without this, `command gchat --as someone-else` read as a call to
+# `command` and slipped past both the allowlist and the identity binding.
+_COMMAND_WRAPPERS = frozenset({"command", "builtin", "exec", "nohup", "time"})
+
+
 def _segment_argv0(tokens: list[str]) -> str:
     """First real command word of a segment: skips VAR=val prefixes,
-    redirection operators plus their targets, and an `env` prefix."""
+    redirection operators plus their targets, an `env` prefix, and wrapper
+    words such as `command` that just introduce the real command."""
     skip_next = False
     saw_env = False
     for token in tokens:
@@ -202,6 +209,8 @@ def _segment_argv0(tokens: list[str]) -> str:
             continue
         if token == "env" and not saw_env:
             saw_env = True
+            continue
+        if token in _COMMAND_WRAPPERS:
             continue
         return token
     return ""
@@ -342,6 +351,43 @@ def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
     return skill.rsplit("/", 1)[-1] in values
 
 
+# A path anywhere in a command line, quoted or not: `cat ~/.hermes/x.json`,
+# `python3 -c "open('/home/.../key.json')"`, `cp a b` all expose one.
+_PATHLIKE_RE = re.compile(r"(?:~|\.{0,2}/)[A-Za-z0-9._~/@+-]*")
+
+
+def _check_denied_paths(command_s: str, grants) -> AccessDecision:
+    """Apply the file denied-globs to shell commands too.
+
+    The read_file/write_file tools honoured denied_globs, the terminal did
+    not, so `cat ~/.hermes/gmail-dwd-sa.json` handed a governed user the
+    domain-wide-delegation key that the file tools refused them (found
+    29-08-2026). One path per denial keeps the message actionable, and the
+    per-person allow_globs exception still opens a single file.
+    """
+    if not grants.file_denied_globs:
+        return AccessDecision(True, "arguments_allowed")
+    for candidate in _PATHLIKE_RE.findall(command_s):
+        if len(candidate) < 2:
+            continue
+        if _matches_denied_glob(candidate, grants.file_denied_globs) \
+                and not _matches_denied_glob(candidate, grants.file_allow_globs):
+            return AccessDecision(False, "file_denied_glob", detail=candidate)
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _check_identity_env_tamper(command_s: str) -> AccessDecision:
+    """Refuse any attempt to touch the identity the child processes carry.
+
+    HERMES_DWD_IDENTITY is what pins the Google CLIs to the caller's own
+    account. Unsetting or rewriting it is never a legitimate need, and naming
+    it at all is the only way to try.
+    """
+    if "HERMES_DWD_IDENTITY" in command_s:
+        return AccessDecision(False, "dwd_identity_tamper", detail="HERMES_DWD_IDENTITY")
+    return AccessDecision(True, "arguments_allowed")
+
+
 def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICTED) -> AccessDecision:
     """A bare-delimiter heredoc is still expanded by the shell, so anything the
     shell would RUN inside it stays gated: backticks and process substitution
@@ -379,7 +425,13 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
         inner_decision = _check_cli_command(inner, grants, dwd_identity)
         if not inner_decision.allowed:
             return inner_decision
+    denied_path = _check_denied_paths(command_s, grants)
+    if not denied_path.allowed:
+        return denied_path
     if dwd_identity is not _DWD_UNRESTRICTED:
+        tamper = _check_identity_env_tamper(command_s)
+        if not tamper.allowed:
+            return tamper
         # Identity binding runs regardless of the allowlist: even a wildcard
         # CLI grant must not let a non-admin act as someone else.
         try:
