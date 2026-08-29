@@ -520,11 +520,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        # Usage-aware demotion (29 Aug 2026), unioned with the coding posture's
+        # set. A large category in which almost nothing has ever been opened
+        # renders names-only, so the index stays proportional to the catalogue
+        # people actually use. Same hard rule as the posture path: names are
+        # never hidden, only descriptions dropped. Off unless
+        # skills.index_mode is "usage".
+        _skills_dir = _agent_skills_dir(agent)
+        try:
+            from agent.skill_index_focus import compact_categories as _usage_compact
+
+            _compact_cats = frozenset(_compact_cats) | _usage_compact(_skills_dir)
+        except Exception:
+            pass
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
-            skills_dir_override=_agent_skills_dir(agent),
+            skills_dir_override=_skills_dir,
         )
     else:
         skills_prompt = ""
