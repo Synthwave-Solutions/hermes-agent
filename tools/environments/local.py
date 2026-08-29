@@ -503,6 +503,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
 
+    _inject_dwd_identity_env(sanitized)
+
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
 
@@ -511,6 +513,37 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
 
     return sanitized
+
+
+def _inject_dwd_identity_env(env: dict[str, str]) -> None:
+    """Pin domain-wide delegation to the governed caller for this child.
+
+    The Google CLIs (gchat, gmail, gws-hermes, gdrive-dwd) can act as any
+    mailbox in the domain, and with no ``--as`` they fall back to the owner's
+    own token. The command gate refuses a foreign ``--as``, but an interpreter
+    the user is allowed to run can invoke those CLIs out of its sight, so the
+    identity travels with the process instead: ``hermes_dwd`` turns this value
+    into the address the CLI acts as, and refuses every other one.
+
+    Only set for a governed non-admin under enforce. Admins, report_only and
+    ungoverned runs keep today's behaviour, so the owner's own shell and the
+    crons are untouched. A governed caller whose address cannot be resolved
+    gets a value that can never match an account: fail closed, not fall back.
+    """
+    env.pop("HERMES_DWD_IDENTITY", None)
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        ctx = current_governance_context()
+        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+            return
+        identity = dwd_identity_for(ctx.access)
+        if identity is None:  # admin: unrestricted, same as before
+            return
+        env["HERMES_DWD_IDENTITY"] = identity or "unresolved-identity"
+    except Exception:
+        logger.debug("could not bind DWD identity for subprocess", exc_info=True)
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
