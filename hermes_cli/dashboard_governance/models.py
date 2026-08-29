@@ -48,6 +48,7 @@ def _deep_merge_grants(base: "GrantSet", other: "GrantSet") -> "GrantSet":
         cli_denied_commands=base.cli_denied_commands | other.cli_denied_commands,
         cli_workdir_roots=base.cli_workdir_roots | other.cli_workdir_roots,
         workspaces=base.workspaces | other.workspaces,
+        env_vars=base.env_vars | other.env_vars,
         usage_caps={**base.usage_caps, **other.usage_caps},
     )
 
@@ -100,6 +101,13 @@ class GrantSet:
     # hier thuis en niet in een los bestand: anders bepaalt de ene plek wat je
     # ziet en de andere wat je mag openen, en dan lopen die uit elkaar.
     workspaces: frozenset[str] = field(default_factory=frozenset)
+    # Environment variables a caller's shell may receive. The terminal cannot
+    # read the Hermes .env any more (it holds every platform key), so a person
+    # who legitimately needs one key gets exactly that name granted and the
+    # value is filled in for their child processes. Naming the variable is the
+    # authorisation, so it is revocable and visible in the policy instead of
+    # being a file everyone could open.
+    env_vars: frozenset[str] = field(default_factory=frozenset)
     usage_caps: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -113,6 +121,7 @@ class GrantSet:
         models = data.get("models") if isinstance(data.get("models"), Mapping) else {}
         files = data.get("files") if isinstance(data.get("files"), Mapping) else {}
         cli = data.get("cli") if isinstance(data.get("cli"), Mapping) else {}
+        env = data.get("env") if isinstance(data.get("env"), Mapping) else {}
         mcp_tools: dict[str, frozenset[str]] = {}
         raw_mcp_tools = mcp.get("tools") if isinstance(mcp, Mapping) else None
         if isinstance(raw_mcp_tools, Mapping):
@@ -149,6 +158,7 @@ class GrantSet:
             cli_approval_commands=_string_set(cli.get("approval_commands") if isinstance(cli, Mapping) else None),
             cli_workdir_roots=_string_set(cli.get("workdir_roots") if isinstance(cli, Mapping) else None),
             workspaces=_string_set(data.get("workspaces")),
+            env_vars=_string_set(env.get("vars") if isinstance(env, Mapping) else None),
             usage_caps=dict(data.get("usage_caps") or {}),
         )
 
@@ -209,6 +219,7 @@ class GrantSet:
             cli_denied_commands=self.cli_denied_commands | deny.cli_commands,
             cli_workdir_roots=sub(self.cli_workdir_roots, deny.cli_workdir_roots),
             workspaces=sub(self.workspaces, deny.workspaces),
+            env_vars=sub(self.env_vars, deny.env_vars),
             usage_caps=dict(self.usage_caps),
         )
 

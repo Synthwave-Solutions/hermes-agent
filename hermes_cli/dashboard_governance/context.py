@@ -73,6 +73,7 @@ def _serialize_grants(grants: GrantSet) -> dict[str, Any]:
         "cli_approval_commands": _list(grants.cli_approval_commands),
         "cli_denied_commands": _list(grants.cli_denied_commands),
         "cli_workdir_roots": _list(grants.cli_workdir_roots),
+        "env_vars": _list(grants.env_vars),
         "workspaces": _list(grants.workspaces),
         "usage_caps": dict(grants.usage_caps),
     }
@@ -107,6 +108,7 @@ def _deserialize_grants(data: dict[str, Any]) -> GrantSet:
         cli_approval_commands=_set(data.get("cli_approval_commands")),
         cli_denied_commands=_set(data.get("cli_denied_commands")),
         cli_workdir_roots=_set(data.get("cli_workdir_roots")),
+        env_vars=_set(data.get("env_vars")),
         workspaces=_set(data.get("workspaces")),
         usage_caps=dict(data.get("usage_caps") or {}),
     )
