@@ -1648,6 +1648,41 @@ def _validate_job_mode_invariants(
         )
 
 
+def _creating_owner_email() -> str:
+    """The person whose session is creating this job.
+
+    A cron job outlives the conversation that made it, so without this the
+    run has no identity and acts with the owner's full rights: exactly the
+    hole a governed user would otherwise walk through (29-08-2026). Empty for
+    admins, for the CLI and for ungoverned runs, which keeps every existing
+    job and every job Michael makes behaving as before.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+
+        ctx = current_governance_context()
+        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+            return ""
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        identity = dwd_identity_for(ctx.access)
+        if identity is None:  # admin
+            return ""
+        owner = str(identity or "").strip().lower()
+    except ImportError:
+        logger.debug("cron: governance unavailable, job stays ownerless", exc_info=True)
+        return ""
+    if not owner:
+        # A governed session whose address we cannot read would otherwise
+        # produce an ownerless job, which is the very thing this prevents:
+        # such a job runs unbound. Refuse the create instead.
+        raise ValueError(
+            "Cannot schedule a job for this session: no verified account to run it as. "
+            "Ask your admin."
+        )
+    return owner
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1668,6 +1703,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    owner_email: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1859,6 +1895,9 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        # The person this job runs as. Every fire binds their governance
+        # context, so a job can never do more than the person who made it.
+        "owner_email": (str(owner_email).strip().lower() if owner_email else _creating_owner_email()),
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the

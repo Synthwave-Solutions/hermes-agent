@@ -5721,6 +5721,49 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+
+@contextlib.contextmanager
+def _governed_as_job_owner(job: dict):
+    """Run a fire under the governance of the person who created the job.
+
+    A cron job outlives the conversation that made it. Without this the run
+    has no identity at all, so a job a governed user created would act with
+    the owner's full rights, including every Google account in the domain
+    (29-08-2026). Jobs without an owner (everything made before this, and
+    everything an admin or the CLI makes) run exactly as before.
+
+    An owner whose grants cannot be resolved stops the run rather than
+    falling back to unrestricted: the failure is recorded on the job, which
+    is visible, where a silent fallback would not be.
+    """
+    owner = str(job.get("owner_email") or "").strip().lower()
+    if not owner:
+        yield
+        return
+    from hermes_cli.dashboard_governance.context import (
+        DashboardGovernanceContext,
+        bind_governance_context,
+        reset_governance_context,
+    )
+    from hermes_cli.dashboard_governance.loader import load_governance_policy
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+
+    policy = load_governance_policy()
+    access = resolve_effective_access(policy, GovernanceSubject(email=owner))
+    token = bind_governance_context(
+        DashboardGovernanceContext(
+            subject=access.subject,
+            access=access,
+            session_id=str(job.get("id") or ""),
+        )
+    )
+    try:
+        yield
+    finally:
+        reset_governance_context(token)
+
+
 def run_one_job(
     job: dict,
     *,
@@ -5759,22 +5802,23 @@ def run_one_job(
             profile_home,
         )
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
+        with _governed_as_job_owner(job):
+            return _run_with_fire_claim_heartbeat(
                 job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token,
                 ),
-                execution_token=execution_token,
-            ),
-        )
+            )
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])

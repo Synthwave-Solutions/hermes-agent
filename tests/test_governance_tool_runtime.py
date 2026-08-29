@@ -750,3 +750,159 @@ class TestIdentityBindingCannotBeShakenOff:
             grant_sources=("bootstrap_admin",),
         )
         assert self._decide("echo $HERMES_DWD_IDENTITY", access=admin).allowed
+
+
+class TestGrantedEnvVarsReachTheShell:
+    """The terminal can no longer read the Hermes .env, so a person who needs
+    one platform key gets that variable name granted and the value is filled
+    in for their child processes only. Naming the variable is the
+    authorisation: revocable, per person, and visible in the policy."""
+
+    def _bind(self, grants, mode="enforce", email="stephen@synthwave.solutions", roles=("tech_lead",), sources=()):
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext, bind_governance_context, reset_governance_context)
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode=mode,
+            roles=frozenset(roles),
+            grants=grants,
+            grant_sources=tuple(sources),
+        )
+        ctx = DashboardGovernanceContext(subject=access.subject, access=access)
+        return bind_governance_context(ctx), reset_governance_context
+
+    def _child_env(self, dotenv, grants, **kw):
+        from unittest.mock import patch
+        from tools.environments import local
+        token, reset = self._bind(grants, **kw)
+        try:
+            with patch.object(local, "_hermes_dotenv_values",
+                              lambda names: {k: v for k, v in dotenv.items() if k in names}):
+                return local._sanitize_subprocess_env({"PATH": "/usr/bin"})
+        finally:
+            reset(token)
+
+    DOTENV = {"OMNIROUTE_API_KEY": "sk-omni", "NOTION_API_KEY": "ntn-x", "STRIPE_SECRET": "sk-live"}
+
+    def test_a_granted_variable_arrives_with_its_value(self):
+        env = self._child_env(self.DOTENV, GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
+        assert env["OMNIROUTE_API_KEY"] == "sk-omni"
+
+    def test_only_the_granted_names_arrive(self):
+        env = self._child_env(self.DOTENV, GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
+        assert "NOTION_API_KEY" not in env and "STRIPE_SECRET" not in env
+
+    def test_without_the_grant_nothing_arrives(self):
+        env = self._child_env(self.DOTENV, GrantSet())
+        assert not ({"OMNIROUTE_API_KEY", "NOTION_API_KEY", "STRIPE_SECRET"} & set(env))
+
+    def test_report_only_does_not_hand_out_secrets(self):
+        env = self._child_env(self.DOTENV, GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})), mode="report_only")
+        assert "OMNIROUTE_API_KEY" not in env
+
+    def test_an_inherited_value_is_not_overwritten(self):
+        from unittest.mock import patch
+        from tools.environments import local
+        token, reset = self._bind(GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
+        try:
+            with patch.object(local, "_hermes_dotenv_values", lambda names: {"OMNIROUTE_API_KEY": "from-dotenv"}):
+                env = local._sanitize_subprocess_env({"PATH": "/usr/bin", "OMNIROUTE_API_KEY": "already-set"})
+        finally:
+            reset(token)
+        assert env["OMNIROUTE_API_KEY"] == "already-set"
+
+    def test_the_grant_round_trips_through_the_policy_and_the_bridge(self):
+        from hermes_cli.dashboard_governance.context import (
+            serialize_context_for_env, context_from_env_payload, DashboardGovernanceContext)
+        grants = GrantSet.from_mapping({"env": {"vars": ["OMNIROUTE_API_KEY"]}})
+        assert grants.env_vars == frozenset({"OMNIROUTE_API_KEY"})
+        access = EffectiveAccess(subject=GovernanceSubject(email="x@y.z"), mode="enforce", grants=grants)
+        payload = serialize_context_for_env(DashboardGovernanceContext(subject=access.subject, access=access))
+        assert context_from_env_payload(payload).access.grants.env_vars == frozenset({"OMNIROUTE_API_KEY"})
+
+
+class TestCronJobsCarryTheirOwner:
+    """A cron job outlives the conversation that made it. Without an owner the
+    fire has no identity and acts with the platform owner's full rights, so a
+    governed user could reach every Google account in the domain through a job
+    they scheduled."""
+
+    def _ctx(self, email, roles=("tech_lead",), sources=(), mode="enforce"):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode=mode,
+            roles=frozenset(roles),
+            grants=GrantSet(),
+            grant_sources=tuple(sources),
+        )
+        return DashboardGovernanceContext(subject=access.subject, access=access)
+
+    def _creating_owner(self, ctx):
+        from unittest.mock import patch
+        from hermes_cli.dashboard_governance import context as gov_context
+        from cron.jobs import _creating_owner_email
+        with patch.object(gov_context, "current_governance_context", lambda: ctx):
+            return _creating_owner_email()
+
+    def test_a_governed_user_stamps_their_address_on_the_job(self):
+        assert self._creating_owner(self._ctx("stephen@synthwave.solutions")) == "stephen@synthwave.solutions"
+
+    def test_an_admin_leaves_the_job_ownerless_as_before(self):
+        ctx = self._ctx("michael@synthwave.solutions", roles=("owner", "admin"), sources=("bootstrap_admin",))
+        assert self._creating_owner(ctx) == ""
+
+    def test_an_ungoverned_create_leaves_the_job_ownerless(self):
+        assert self._creating_owner(None) == ""
+
+    def test_report_only_does_not_stamp_an_owner(self):
+        assert self._creating_owner(self._ctx("stephen@synthwave.solutions", mode="report_only")) == ""
+
+    def test_a_governed_session_without_an_address_cannot_schedule_at_all(self):
+        """An ownerless job from a governed session would run unbound, which is
+        the hole itself. Refuse the create rather than write one."""
+        import pytest as _pytest
+        with _pytest.raises(ValueError):
+            self._creating_owner(self._ctx(""))
+
+    def test_a_fire_runs_under_the_owner_and_unbinds_afterwards(self):
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        with _governed_as_job_owner({"id": "j1", "owner_email": "stephen@synthwave.solutions"}):
+            bound = current_governance_context()
+            assert bound is not None and bound.access.subject.email == "stephen@synthwave.solutions"
+        assert current_governance_context() is None
+
+    def test_an_ownerless_job_still_runs_unbound(self):
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        with _governed_as_job_owner({"id": "j2"}):
+            assert current_governance_context() is None
+
+    def test_the_fire_cannot_act_as_someone_else(self):
+        """The whole point of the owner: the job may only drive the account of
+        the person who scheduled it, exactly like their own session."""
+        from unittest.mock import patch
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance import loader, resolver
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+
+        granted = EffectiveAccess(
+            subject=GovernanceSubject(email="stephen@synthwave.solutions"),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            grants=GrantSet(cli_commands=frozenset({"gchat"})),
+        )
+        with patch.object(loader, "load_governance_policy", lambda *a, **k: object()), \
+                patch.object(resolver, "resolve_effective_access", lambda *a, **k: granted):
+            with _governed_as_job_owner({"id": "j3", "owner_email": "stephen@synthwave.solutions"}):
+                access = current_governance_context().access
+                refused = decide_tool_argument_access(
+                    access, "terminal",
+                    {"command": "gchat --as michael@synthwave.solutions send --space x --text hi"})
+                allowed = decide_tool_argument_access(
+                    access, "terminal",
+                    {"command": "gchat --as stephen@synthwave.solutions send --space x --text hi"})
+        assert not refused.allowed and refused.reason == "dwd_identity_mismatch"
+        assert allowed.allowed

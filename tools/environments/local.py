@@ -504,6 +504,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _inject_session_context_env(sanitized)
 
     _inject_dwd_identity_env(sanitized)
+    _inject_granted_env_vars(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -544,6 +545,68 @@ def _inject_dwd_identity_env(env: dict[str, str]) -> None:
         env["HERMES_DWD_IDENTITY"] = identity or "unresolved-identity"
     except Exception:
         logger.debug("could not bind DWD identity for subprocess", exc_info=True)
+
+
+def _hermes_dotenv_values(names: set[str]) -> dict[str, str]:
+    """Read exactly the named keys out of the Hermes .env.
+
+    Nothing else is read and nothing is put into this process's own
+    environment, so one person's grant cannot widen what another session
+    sees.
+    """
+    found: dict[str, str] = {}
+    if not names:
+        return found
+    try:
+        from hermes_constants import get_hermes_home
+        path = Path(get_hermes_home()) / ".env"
+    except Exception:
+        path = Path(os.path.expanduser("~/.hermes/.env"))
+    try:
+        raw = path.read_text(errors="replace")
+    except OSError:
+        return found
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.removeprefix("export ").strip()
+        if key not in names:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        found[key] = value
+    return found
+
+
+def _inject_granted_env_vars(env: dict[str, str]) -> None:
+    """Hand a governed caller the environment variables they were granted.
+
+    The terminal can no longer read the Hermes .env, which is right: it holds
+    every platform key. But some work legitimately needs one of them, so the
+    policy names the variables per person and the value is filled in here for
+    their child processes only. Naming the variable is the authorisation:
+    revocable, visible in the policy, and audited, instead of a file that
+    everyone with a shell could open.
+
+    Admins and ungoverned runs are untouched: they already inherit whatever
+    the parent process carries.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+
+        ctx = current_governance_context()
+        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+            return
+        names = {str(n).strip() for n in getattr(ctx.access.grants, "env_vars", ()) if str(n).strip()}
+        if not names:
+            return
+        for key, value in _hermes_dotenv_values(names).items():
+            env.setdefault(key, value)
+    except Exception:
+        logger.debug("could not apply granted env vars for subprocess", exc_info=True)
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
