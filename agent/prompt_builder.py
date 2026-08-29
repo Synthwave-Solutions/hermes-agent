@@ -430,6 +430,40 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+# Where work goes when it is delegated.  Without this the model reaches for a
+# separate CLI worker (OpenCode, dsh) for anything that smells like a task,
+# because the shared OmniRoute prefix names those tools by command.  A separate
+# CLI worker boots a whole second agent with its own context and its own model
+# calls: it is the slowest option available and it drops this session's tools,
+# governance binding and conversation context on the floor.  A subagent keeps
+# all three and returns straight into this conversation, and a background task
+# costs nothing at all while it runs.  Only injected when the tools it names
+# are actually loaded, so it can never point at something this agent lacks.
+DELEGATION_POLICY_GUIDANCE = (
+    "# Where to send work\n"
+    "Delegate self-contained work rather than doing every step inline, and "
+    "delegate inside this harness first.\n"
+    "- Several independent pieces of work, or one chunk that would flood this "
+    "conversation with output you do not need to read: spawn subagents with "
+    "delegate_task. They keep your tools and your access, run with their own "
+    "context, and return only their conclusion. Batch independent subagents "
+    "into one call so they run at the same time.\n"
+    "- Anything that takes a while and does not block your next step (a build, "
+    "a test run, a deploy, a long script): start it with "
+    "terminal(background=true, notify_on_complete=true) and carry on. Poll or "
+    "wait with the process tool when you actually need the result. Never sit "
+    "blocked on a command that could have run in the background.\n"
+    "- A separate coding CLI (OpenCode, DeepSeek Harness) is the last resort, "
+    "not the default. It boots a second agent with its own context, so it is "
+    "the slowest route by a wide margin and it loses this session's context. "
+    "Reach for it only for a large self-contained job in a repository you are "
+    "not otherwise working in, or when the user asks for it by name.\n"
+    "Doing the work yourself is still right for anything small, anything that "
+    "needs this conversation's context, and anything where you must see each "
+    "result before choosing the next step."
+)
+
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

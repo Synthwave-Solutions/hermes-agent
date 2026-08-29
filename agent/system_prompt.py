@@ -38,6 +38,7 @@ from agent.prompt_builder import (
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    DELEGATION_POLICY_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
@@ -411,6 +412,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    # Where delegated work goes (29 Aug 2026). The shared OmniRoute prefix names
+    # OpenCode and dsh by command, which steered this agent into booting a
+    # second CLI agent for work its own subagents and background tasks handle
+    # far faster and without losing session context. Injected only when the
+    # tools it names are loaded, so it never points at something this agent
+    # does not have; a run without delegation still gets the background-task
+    # half, which is the bigger latency win of the two.
+    if agent.valid_tool_names and (
+        "delegate_task" in agent.valid_tool_names or "terminal" in agent.valid_tool_names
+    ):
+        stable_parts.append(DELEGATION_POLICY_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
