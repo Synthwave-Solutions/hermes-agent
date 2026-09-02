@@ -441,6 +441,23 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
         dwd_decision = _check_dwd_identity(dwd_segments, dwd_identity)
         if not dwd_decision.allowed:
             return dwd_decision
+    # A per-person CLI deny is subtracted into cli_denied_commands and has to
+    # bite even when the role hands out a wildcard, otherwise the only way to
+    # keep one command away from an administrator is to take the wildcard back
+    # and enumerate every other command. Checked before the allowlist so deny
+    # wins, and independently of it so "*" does not skip past it.
+    if grants.cli_denied_commands:
+        try:
+            denied_segments = _split_shell_segments(command_s)
+        except ValueError:
+            return AccessDecision(False, "cli_shell_operator_not_allowed")
+        for tokens in denied_segments:
+            seg_argv0 = _segment_argv0(tokens)
+            seg_base = os.path.basename(seg_argv0) if seg_argv0 else ""
+            if not seg_argv0 or seg_argv0 == _CMD_SUBSTITUTION_MARK:
+                continue
+            if seg_argv0 in grants.cli_denied_commands or seg_base in grants.cli_denied_commands:
+                return AccessDecision(False, "cli_command_denied", detail=seg_argv0)
     if grants.cli_commands and "*" not in grants.cli_commands:
         try:
             segments = _split_shell_segments(command_s)

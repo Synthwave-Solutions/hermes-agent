@@ -906,3 +906,51 @@ class TestCronJobsCarryTheirOwner:
                     {"command": "gchat --as stephen@synthwave.solutions send --space x --text hi"})
         assert not refused.allowed and refused.reason == "dwd_identity_mismatch"
         assert allowed.allowed
+
+
+class TestPerPersonCliDeny:
+    """A per-person CLI deny has to bite through a wildcard grant.
+
+    Requested 02-09-2026: one colleague gets full administrator capability
+    except the bank CLI. Without this the only way to keep one command away
+    from a wildcard grant was to withdraw the wildcard and enumerate every
+    other command, so the deny was written into the policy and silently did
+    nothing.
+    """
+
+    @staticmethod
+    def _access(*, cli=("*",), denied=("bunq",)):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email="delivery@example.test"),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset(cli),
+                cli_denied_commands=frozenset(denied),
+            ),
+        )
+
+    def _check(self, command, **kwargs):
+        from hermes_cli.dashboard_governance.tool_policy import _check_cli_command
+        return _check_cli_command(command, self._access(**kwargs).grants)
+
+    def test_denied_command_refused_despite_wildcard(self):
+        decision = self._check("bunq balance")
+        assert not decision.allowed
+        assert decision.reason == "cli_command_denied"
+        assert decision.detail == "bunq"
+
+    def test_denied_command_refused_behind_an_absolute_path(self):
+        assert not self._check("/home/someone/.local/bin/bunq payments").allowed
+
+    def test_denied_command_refused_in_a_later_segment(self):
+        assert not self._check("git status; bunq accounts list").allowed
+
+    def test_denied_command_refused_inside_command_substitution(self):
+        assert not self._check("echo $(bunq balance)").allowed
+
+    def test_other_commands_still_run_on_the_wildcard(self):
+        assert self._check("git status").allowed
+
+    def test_allowlist_still_applies_when_nothing_is_denied(self):
+        assert self._check("git status", cli=("git",), denied=()).allowed
+        assert not self._check("bunq balance", cli=("git",), denied=()).allowed
