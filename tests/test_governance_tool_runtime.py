@@ -954,3 +954,61 @@ class TestPerPersonCliDeny:
     def test_allowlist_still_applies_when_nothing_is_denied(self):
         assert self._check("git status", cli=("git",), denied=()).allowed
         assert not self._check("bunq balance", cli=("git",), denied=()).allowed
+
+
+class TestDeliveryLeadActsForColleagues:
+    """admin_delivery drives every colleague's Workspace account.
+
+    Michael, 02-09-2026: Hrishi reads everyone's mail, Chat and calendar
+    "net zoals wij als admins". The identity binding built on 29-08 stays in
+    force for every other governed role, so this is a deliberate exemption for
+    one named role and not a hole in the gate.
+    """
+
+    ME = "hrishikesh@synthwave.solutions"
+    OTHER = "michael@synthwave.solutions"
+
+    def _access(self, *, roles):
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset(roles),
+            grants=GrantSet(cli_commands=frozenset({"gchat", "gmail", "gws-hermes"})),
+        )
+
+    def _decide(self, command, *, roles=("admin_delivery",)):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(self._access(roles=roles), "terminal",
+                                           {"command": command})
+
+    def test_reads_another_mailbox(self):
+        assert self._decide(f"gmail --as {self.OTHER} list").allowed
+
+    def test_reads_another_chat_account(self):
+        assert self._decide(f"gchat --as {self.OTHER} raw GET /v1/spaces").allowed
+
+    def test_reads_another_calendar(self):
+        assert self._decide(
+            f"gws-hermes --as {self.OTHER} calendar events list").allowed
+
+    def test_sends_as_a_colleague(self):
+        assert self._decide(f"gmail --as {self.OTHER} send --to x@y.z").allowed
+
+    def test_own_account_still_works(self):
+        assert self._decide(f"gchat --as {self.ME} send --space s --text hi").allowed
+
+    def test_every_other_governed_role_stays_bound(self):
+        refused = self._decide(f"gmail --as {self.OTHER} list", roles=("tech_lead",))
+        assert not refused.allowed
+        assert refused.reason == "dwd_identity_mismatch"
+
+    def test_a_role_less_governed_user_stays_bound(self):
+        refused = self._decide(f"gchat --as {self.OTHER} raw GET /v1/spaces", roles=())
+        assert not refused.allowed
+        assert refused.reason == "dwd_identity_mismatch"
+
+    def test_the_exemption_is_the_role_not_the_person(self):
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+        assert dwd_identity_for(self._access(roles=("admin_delivery",))) is None
+        assert dwd_identity_for(self._access(roles=("operator",))) == self.ME
