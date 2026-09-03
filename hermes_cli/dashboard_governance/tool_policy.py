@@ -29,9 +29,13 @@ _CMD_SUBSTITUTION_MARK = "__HERMES_SUBST__"
 # governed non-admin may only drive their OWN account, so every call to one
 # of these must carry `--as <their identity email>`; a missing or different
 # subject is refused. Enforced here (not via grants) so a grant rewrite can
-# never widen it. Admins (bootstrap admins, owner/admin role) are exempt.
+# never widen it: adding a role to the exempt set below takes a commit and a
+# review, which is the point. Admins (bootstrap admins, owner/admin role) are
+# exempt. admin_delivery joined them on 02-09-2026 on Michael's explicit
+# decision, asked as "net zoals wij als admins": a delivery lead reads every
+# colleague's mail, Chat and calendar, and sends as them too.
 _DWD_CLIS = frozenset({"gchat", "gmail", "gws-hermes", "gdrive-dwd", "gdrive_dwd.py"})
-_DWD_ADMIN_ROLES = frozenset({"owner", "admin"})
+_DWD_ADMIN_ROLES = frozenset({"owner", "admin", "admin_delivery"})
 # Sentinel: no identity binding for this caller (admin or governance off).
 _DWD_UNRESTRICTED = None
 
