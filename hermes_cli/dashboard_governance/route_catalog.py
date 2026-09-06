@@ -102,6 +102,7 @@ ROUTE_CATALOG: tuple[RouteRule, ...] = (
     RouteRule("/api/ssh/ownership", "system:read", match="exact"),
     RouteRule("/api/egress/status", "system:read", match="exact"),
     RouteRule("/api/hermes/update/check", "system:read", match="exact"),
+    RouteRule("/api/hermes/update/receipt", "system:read", match="exact"),
     RouteRule("/api/hermes/update", "system:ops", "system:ops", match="exact"),
     RouteRule("/api/ops", "system:ops", "system:ops"),
     RouteRule("/api/actions", "system:read"),

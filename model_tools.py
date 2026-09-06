@@ -688,6 +688,54 @@ def _compute_tool_definitions(
         ]
         available_tool_names.discard("browser_exec")
 
+    # delegate_task's child-restrictions rule names sibling tools (clarify,
+    # memory, cronjob). Warning about tools this session doesn't even have
+    # teaches ghost vocabulary — filter the list to tools actually present
+    # and drop the line entirely when none apply. Two source variants exist
+    # (depth-derived): the depth-off line also names delegate_task itself;
+    # the depth-on line lists only the siblings. Pattern order matters —
+    # the sibling list is a substring of the full list.
+    # Same session-level seam as the browser_exec gate above.
+    if "delegate_task" in available_tool_names:
+        blocked_present = [
+            t for t in ("clarify", "memory", "cronjob") if t in available_tool_names
+        ]
+        if len(blocked_present) < 3:
+            full_offvariant = "delegate_task, clarify, memory, or cronjob"
+            full_onvariant = "clarify, memory, or cronjob"
+            for i, td in enumerate(filtered_tools):
+                fn = td.get("function", {})
+                desc = fn.get("description", "")
+                if fn.get("name") != "delegate_task":
+                    continue
+                if full_offvariant in desc:
+                    full, keep_self = full_offvariant, True
+                elif full_onvariant in desc:
+                    full, keep_self = full_onvariant, False
+                else:
+                    break
+                names = (["delegate_task"] if keep_self else []) + blocked_present
+                if blocked_present:
+                    if len(names) == 1:
+                        replacement = names[0]
+                    elif len(names) == 2:
+                        replacement = f"{names[0]} or {names[1]}"
+                    else:
+                        replacement = ", ".join(names[:-1]) + ", or " + names[-1]
+                    desc = desc.replace(full, replacement)
+                else:
+                    # No sibling tools here — drop the restriction line
+                    # (both variants end at the following "\n").
+                    start = desc.find("- Children cannot call " + full)
+                    if start != -1:
+                        end = desc.index("\n", start) + 1
+                        desc = desc[:start] + desc[end:]
+                filtered_tools[i] = {
+                    **td,
+                    "function": {**fn, "description": desc},
+                }
+                break
+
     if not quiet_mode:
         if filtered_tools:
             tool_names = [t["function"]["name"] for t in filtered_tools]
@@ -1308,7 +1356,70 @@ _GOVERNANCE_DENY_GUIDANCE = (
 )
 
 
-def _governance_denial_payload(ctx, tool_name, reason, detail=""):
+def _wait_for_governance_grant(ctx, tool_name, function_args, reason, detail, tool_call_id, session_id):
+    """Park this exact call frame only through a trusted, bounded run waiter.
+
+    No serialized callback, old journal, tool arguments or synthetic prompt is
+    used to restart work. The callback must honor run cancellation and return
+    within 300 seconds. Policy is loaded again before this invocation proceeds.
+    """
+    approved = False
+    released = False
+    operation = {}
+    waiter = None
+    try:
+        from dataclasses import replace
+        from hermes_cli.dashboard_governance.grant_requests import _map_denial, _operation, load_store
+        from hermes_cli.dashboard_governance.context import bind_governance_context
+        from hermes_cli.dashboard_governance.loader import load_governance_policy
+        from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+        from hermes_cli.dashboard_governance.tool_policy import tool_allowed_for_context, tool_arguments_allowed_for_context
+        waiter = getattr(ctx, "approval_waiter", None)
+        policy_path = getattr(ctx, "approval_policy_path", "")
+        mapped = _map_denial(tool_name, reason, detail)
+        if not callable(waiter) or not policy_path or mapped is None:
+            return False
+        email = ctx.access.subject.email.strip().lower()
+        _, operation = _operation(ctx, email, *mapped, tool_name, reason, tool_call_id, session_id, "", time.time())
+        if operation["binding_status"] != "bound" or operation["freshness_status"] != "bound":
+            return False
+        aggregate = load_store().get(f"{email}|{mapped[0]}|{mapped[1]}", {})
+        stored = (aggregate.get("operations") or {}).get(operation["operation_id"])
+        if not isinstance(stored, dict) or any(stored.get(key) != operation.get(key) for key in
+                ("actor_email", "session_id", "request_id", "tool_call_id", "prompt_sha256", "binding_status", "freshness_status")):
+            return False
+        operation = dict(stored)
+        if waiter(operation) is not True:
+            return False
+        approved = True
+        policy = load_governance_policy(path=policy_path)
+        if policy.mode != "enforce":
+            return False
+        fresh = replace(ctx, access=resolve_effective_access(policy, ctx.subject))
+        if not fresh.access.is_profile_allowed(ctx.active_profile):
+            return False
+        tool_decision = tool_allowed_for_context(fresh, tool_name, registry)
+        args_decision = tool_arguments_allowed_for_context(fresh, tool_name, function_args)
+        if not tool_decision.allowed or not args_decision.allowed:
+            return False
+        bind_governance_context(fresh)
+        released = True
+        return True
+    except Exception:
+        logger.debug("approval wait or policy revalidation failed", exc_info=True)
+        return False
+    finally:
+        if approved and not released:
+            finish = getattr(waiter, "finish", None)
+            if callable(finish):
+                try:
+                    finish(operation.get("operation_id"), False)
+                except Exception:
+                    pass
+
+
+
+def _governance_denial_payload(ctx, tool_name, reason, detail="", *, tool_call_id="", dispatch_session_id=""):
     """Shared denial extras: file the request and say who can approve it."""
     filed = False
     if str(reason or "").startswith("dwd_identity"):
@@ -1324,7 +1435,7 @@ def _governance_denial_payload(ctx, tool_name, reason, detail=""):
             record_denial,
         )
 
-        filed = record_denial(ctx, tool_name, reason, detail)
+        filed = record_denial(ctx, tool_name, reason, detail, tool_call_id=tool_call_id, dispatch_session_id=dispatch_session_id)
         approvers = approver_emails() if filed else []
     except Exception:
         approvers = []
@@ -1509,16 +1620,20 @@ def handle_function_call(
         _deny_extra = _governance_denial_payload(
             _governance_ctx, function_name, _dispatch_decision.reason,
             getattr(_dispatch_decision, "detail", ""),
+            tool_call_id=tool_call_id, dispatch_session_id=session_id,
         )
-        return json.dumps({
-            "error": f"Tool denied by dashboard governance: {_dispatch_decision.reason}",
-            **_deny_extra,
-            "governance": {
-                "mode": _governance_mode,
-                "tool": function_name,
-                "reason": _dispatch_decision.reason,
-            },
-        }, ensure_ascii=False)
+        if _deny_extra.get("access_request") != "filed" or not _wait_for_governance_grant(_governance_ctx, function_name, function_args,
+                                          _dispatch_decision.reason, getattr(_dispatch_decision, "detail", ""),
+                                          tool_call_id, session_id):
+            return json.dumps({
+                "error": f"Tool denied by dashboard governance: {_dispatch_decision.reason}",
+                **_deny_extra,
+                "governance": {
+                    "mode": _governance_mode,
+                    "tool": function_name,
+                    "reason": _dispatch_decision.reason,
+                },
+            }, ensure_ascii=False)
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
@@ -1544,22 +1659,27 @@ def handle_function_call(
     if _argument_decision is not None and not _argument_decision.allowed:
         _governance_ctx = _current_dashboard_governance_context()
         _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
-        return json.dumps({
-            "error": (
-                f"Tool denied by dashboard governance: {_argument_decision.reason}"
-                + (f" ({getattr(_argument_decision, 'detail', '')})" if getattr(_argument_decision, "detail", "") else "")
-            ),
-            **_governance_denial_payload(
-                _governance_ctx, function_name, _argument_decision.reason,
-                getattr(_argument_decision, "detail", ""),
-            ),
-            "governance": {
-                "mode": _governance_mode,
-                "tool": function_name,
-                "reason": _argument_decision.reason,
-                "detail": getattr(_argument_decision, "detail", ""),
-            },
-        }, ensure_ascii=False)
+        _deny_extra = _governance_denial_payload(
+            _governance_ctx, function_name, _argument_decision.reason,
+            getattr(_argument_decision, "detail", ""),
+            tool_call_id=tool_call_id, dispatch_session_id=session_id,
+        )
+        if _deny_extra.get("access_request") != "filed" or not _wait_for_governance_grant(_governance_ctx, function_name, function_args,
+                                          _argument_decision.reason, getattr(_argument_decision, "detail", ""),
+                                          tool_call_id, session_id):
+            return json.dumps({
+                "error": (
+                    f"Tool denied by dashboard governance: {_argument_decision.reason}"
+                    + (f" ({getattr(_argument_decision, 'detail', '')})" if getattr(_argument_decision, "detail", "") else "")
+                ),
+                **_deny_extra,
+                "governance": {
+                    "mode": _governance_mode,
+                    "tool": function_name,
+                    "reason": _argument_decision.reason,
+                    "detail": getattr(_argument_decision, "detail", ""),
+                },
+            }, ensure_ascii=False)
 
     _usage_decision = _governance_usage_decision(function_name, function_args)
     if _usage_decision is not None and not _usage_decision.allowed:
@@ -1579,22 +1699,22 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
-        # Check plugin hooks for a block/approve directive (unless caller
+        # Check plugin hooks for a block/approve/modify directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
         #
         # Single-fire contract: pre_tool_call fires exactly once per tool
-        # execution. resolve_pre_tool_block() internally calls
-        # invoke_hook("pre_tool_call", ...) once and returns the block message
-        # for a `block` directive OR for an `approve` directive whose human
-        # gate denied/timed-out/errored (fail-closed). Observer plugins see
+        # execution. _dispatch_pre_tool_call_hooks() internally calls
+        # invoke_hook("pre_tool_call", ...) once and returns both the block
+        # message (for `block`/`approve` directives) and any modified args
+        # (for `modify` directives). Observer plugins see
         # the hook on that same pass. When skip=True, the caller already
         # fired it — do nothing here.
         if not skip_pre_tool_call_hook:
             block_message: Optional[str] = None
             try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
+                from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+                block_message, modified_args = _dispatch_pre_tool_call_hooks(
                     function_name,
                     function_args,
                     task_id=task_id or "",
@@ -1604,6 +1724,8 @@ def handle_function_call(
                     api_request_id=api_request_id or "",
                     middleware_trace=list(_tool_middleware_trace),
                 )
+                if modified_args is not None:
+                    function_args = modified_args
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 

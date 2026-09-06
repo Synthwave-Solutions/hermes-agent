@@ -1,4 +1,5 @@
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
@@ -11,6 +12,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
+import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
@@ -20,6 +22,7 @@ import {
   updateComposerAttachment
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
+import { requestGatewayForAgent } from '@/store/gateway'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
@@ -29,12 +32,14 @@ import {
   $currentCwd,
   $messages,
   $terminalBackend,
+  getSessionOwnerHint,
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
+import { $sessionStates, isSessionRemote } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -54,6 +59,7 @@ import {
   applyBranchVisibility,
   applyReloadOptimistic,
   applyRewindOptimistic,
+  durableRowIdsForRebind,
   finalizeInterruptedMessages,
   planEdit,
   planReload,
@@ -336,8 +342,8 @@ export function usePromptActions({
       options: { updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
-      const remote = $connection.get()?.mode === 'remote'
       const storedSessionId = selectedStoredSessionIdRef.current
+      const remote = isSessionRemote(storedSessionId ?? sessionId)
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
@@ -426,7 +432,7 @@ export function usePromptActions({
   // image.attach_bytes.
   const eagerlyUploadAttachment = useCallback(
     async (sessionId: string, attachment: ComposerAttachment) => {
-      const remote = $connection.get()?.mode === 'remote'
+      const remote = isSessionRemote(sessionId)
 
       setComposerAttachmentUploadState(attachment.id, 'uploading')
 
@@ -480,6 +486,30 @@ export function usePromptActions({
     }
   }, [activeSessionId, composerAttachments, eagerlyUploadAttachment])
 
+  // Session resume can be routed through a registry connection while the
+  // render-time requestGateway still points at the local default socket. Keep
+  // every follow-up session RPC on the same composite owner; otherwise resume
+  // succeeds on HERMES01 and prompt.submit immediately fails locally with
+  // "session not found".
+  const requestForPromptSession = useCallback<GatewayRequest>(
+    (method, params = {}, timeoutMs) => {
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const owner = storedSessionId ? getSessionOwnerHint(storedSessionId) : undefined
+      const ambientConnection = $connection.get()
+
+      const connectionId =
+        owner?.connectionId ||
+        (ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : '')
+
+      if (connectionId) {
+        return requestGatewayForAgent(connectionId, owner?.profile || 'default', method, params, timeoutMs)
+      }
+
+      return timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
+    },
+    [requestGateway, selectedStoredSessionIdRef]
+  )
+
   const submitPromptText = useSubmitPrompt({
     activeSessionIdRef,
     busyRef,
@@ -488,7 +518,7 @@ export function usePromptActions({
     getRoutedStoredSessionId,
     getRuntimeIdForStoredSession,
     getRouteToken,
-    requestGateway,
+    requestGateway: requestForPromptSession,
     runtimeIdByStoredSessionIdRef,
     resumeStoredSession,
     selectedStoredSessionIdRef,
@@ -622,6 +652,18 @@ export function usePromptActions({
     async (audio: Blob) => {
       if (!sttEnabled) {
         throw new Error(copy.sttDisabled)
+      }
+
+      // Client-direct first: mic audio goes straight to the profile's STT
+      // provider (config + key fetched from the connected gateway), cutting
+      // the desktop→gateway audio hop. `null` = provider not client-callable
+      // (local whisper, command providers, older backend) → relay unchanged.
+      // Provider REJECTIONS surface — re-running the same request through
+      // the relay would fail identically, just slower.
+      const direct = await transcribeAudioClientDirect(audio)
+
+      if (direct !== null) {
+        return direct
       }
 
       const dataUrl = await blobToDataUrl(audio)
@@ -832,7 +874,8 @@ export function usePromptActions({
       truncateMessageId: string | undefined,
       interruptFirst: boolean,
       truncateRowId?: number,
-      sourceText?: string
+      sourceText?: string,
+      rebindRowIds?: readonly number[]
     ) =>
       runRewindSubmit(
         requestGateway,
@@ -849,7 +892,8 @@ export function usePromptActions({
           }
         },
         truncateRowId,
-        sourceText
+        sourceText,
+        rebindRowIds
       ),
     [activeSessionIdRef, requestGateway, selectedStoredSessionIdRef]
   )
@@ -860,11 +904,12 @@ export function usePromptActions({
       // stale session deletes the wrong transcript.
       const sessionId = activeSessionIdRef.current
 
-      if (!sessionId || $busy.get()) {
+      if (!sessionId || $sessionStates.get()[sessionId]?.busy) {
         return
       }
 
-      const plan = planReload($messages.get(), parentId)
+      const messages = $messages.get()
+      const plan = planReload(messages, parentId)
 
       if (!plan) {
         return
@@ -881,7 +926,8 @@ export function usePromptActions({
           plan.truncateMessageId,
           false,
           plan.truncateRowId,
-          plan.sourceText
+          plan.sourceText,
+          durableRowIdsForRebind(messages)
         )
 
         applySurvivorRowIds(sessionId, survivorRowIds)
@@ -889,7 +935,9 @@ export function usePromptActions({
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,
-          awaitingResponse: false
+          awaitingResponse: false,
+          turnLive: false,
+          turnStartedAt: null
         }))
         notifyError(err, copy.regenerateFailed)
       }
@@ -947,7 +995,8 @@ export function usePromptActions({
           plan.truncateMessageId,
           interruptFirst,
           plan.truncateRowId,
-          plan.sourceText
+          plan.sourceText,
+          durableRowIdsForRebind(messages)
         )
 
         applySurvivorRowIds(sessionId, survivorRowIds)
@@ -963,6 +1012,8 @@ export function usePromptActions({
           ...state,
           busy: false,
           awaitingResponse: false,
+          turnLive: false,
+          turnStartedAt: null,
           messages
         }))
         throw err
@@ -1003,6 +1054,25 @@ export function usePromptActions({
       setAwaitingResponse(true)
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
 
+      const isStaleTargetError = (err: unknown) =>
+        /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
+
+      const isCompressedAwayError = (err: unknown) => {
+        if (!(err instanceof JsonRpcGatewayError) || err.code !== 4018) {
+          return false
+        }
+
+        const data = err.data
+
+        if (!data || typeof data !== 'object') {
+          return false
+        }
+
+        const segmentOrdinal = (data as { segment_ordinal?: unknown }).segment_ordinal
+
+        return typeof segmentOrdinal === 'number' && segmentOrdinal < 0
+      }
+
       try {
         const survivorRowIds = await submitRewindPrompt(
           sessionId,
@@ -1011,22 +1081,84 @@ export function usePromptActions({
           plan.truncateMessageId,
           interruptFirst,
           plan.truncateRowId,
-          plan.sourceText
+          plan.sourceText,
+          durableRowIdsForRebind(messages)
         )
 
         applySurvivorRowIds(sessionId, survivorRowIds)
       } catch (err) {
+        let surfaced: unknown = err
+        let unavailable = isCompressedAwayError(err)
+
+        // Stale target after compression/resume drift (the cached rowId and
+        // ordinal address the pre-compression segment): reload server history,
+        // recompute the full edit plan against the refreshed transcript, and
+        // retry the real edit once. Do NOT plain-resubmit without a truncation
+        // address — that drops rewind semantics and silently appends the edit
+        // as a new turn (#82462).
+        if (!plan.isFailedTurn && !unavailable && isStaleTargetError(err)) {
+          try {
+            const storedId = selectedStoredSessionIdRef.current
+
+            if (storedId) {
+              await resumeStoredSession(storedId)
+            }
+
+            const refreshed = $messages.get()
+            const retryPlan = planEdit(refreshed, edited)
+
+            if (retryPlan && !retryPlan.isFailedTurn) {
+              const survivorRowIds = await submitRewindPrompt(
+                sessionId,
+                retryPlan.text,
+                retryPlan.truncateOrdinal,
+                retryPlan.truncateMessageId,
+                false,
+                retryPlan.truncateRowId,
+                retryPlan.sourceText,
+                durableRowIdsForRebind(refreshed)
+              )
+
+              applySurvivorRowIds(sessionId, survivorRowIds)
+
+              return
+            }
+
+            unavailable = true
+          } catch (retryErr) {
+            surfaced = retryErr
+            unavailable = isCompressedAwayError(retryErr) || isStaleTargetError(retryErr)
+          }
+        }
+
         // Roll the optimistic edit/truncation back to the original history so the
         // UI stays in sync with what's persisted instead of stranding a partial
         // timeline.
         setMutableRef(busyRef, false)
         setBusy(false)
         setAwaitingResponse(false)
-        updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false, messages }))
-        notifyError(err, copy.editFailed)
+        updateSessionState(sessionId, state => ({
+          ...state,
+          busy: false,
+          awaitingResponse: false,
+          turnLive: false,
+          turnStartedAt: null,
+          messages
+        }))
+        notifyError(surfaced, unavailable ? copy.editTurnUnavailable : copy.editFailed)
       }
     },
-    [activeSessionIdRef, applySurvivorRowIds, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
+    [
+      activeSessionIdRef,
+      applySurvivorRowIds,
+      busyRef,
+      copy.editFailed,
+      copy.editTurnUnavailable,
+      resumeStoredSession,
+      selectedStoredSessionIdRef,
+      submitRewindPrompt,
+      updateSessionState
+    ]
   )
 
   const handleThreadMessagesChange = useCallback(

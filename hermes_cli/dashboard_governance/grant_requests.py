@@ -15,6 +15,7 @@ Store shape (``~/.hermes/webui/governance-grant-requests.json``)::
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -148,7 +149,35 @@ def _trigger_from_env() -> str:
         return ""
 
 
-def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
+def _operation(ctx, email, gkind, value, tool, reason, call_id, dispatch_session_id, trigger, now):
+    """Provenance only: no arguments, credentials or replay authorization."""
+    def identifier(raw):
+        text = str(raw or "")
+        return text if re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", text) else ""
+
+    session = identifier(getattr(ctx, "session_id", ""))
+    request = identifier(getattr(ctx, "request_id", ""))
+    call = identifier(call_id)
+    # Context owner is authoritative; never override it with dispatch metadata.
+    matches = not dispatch_session_id or str(dispatch_session_id) == session
+    bound = bool(session and request and call and matches)
+    digest = str(getattr(ctx, "user_message_sha256", "") or "")
+    digest = digest if re.fullmatch(r"[0-9a-f]{64}", digest) else None
+    identity = [email, session, request, call, gkind, value, tool, reason]
+    op_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    return op_id, {
+        "version": 1, "operation_id": op_id, "actor_email": email,
+        "gkind": gkind, "value": value, "tool": tool, "reason": reason,
+        "session_id": session or None, "request_id": request or None,
+        "tool_call_id": call or None,
+        "binding_status": "bound" if bound else "unresolved",
+        "prompt_sha256": digest,
+        "freshness_status": "bound" if digest else "unresolved",
+        "trigger_redacted": trigger, "created_at": now,
+    }
+
+
+def record_denial(ctx, tool_name: str, reason: str, detail: str = "", *, tool_call_id: str = "", dispatch_session_id: str = "") -> bool:
     """Record one governance denial as an access request. Never raises."""
     try:
         email = str(
@@ -180,7 +209,10 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
                     store = {}
             except (FileNotFoundError, ValueError):
                 store = {}
-            trigger = _trigger_from_env()
+            # Trusted thread-bound request context wins over process-global env.
+            trigger = redact_trigger(getattr(ctx, "user_message_redacted", ""))
+            if not trigger and not getattr(ctx, "request_id", ""):
+                trigger = _trigger_from_env()
             entry = store.get(key)
             if isinstance(entry, dict):
                 entry["count"] = int(entry.get("count") or 0) + 1
@@ -205,6 +237,18 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "") -> bool:
                     "first_seen": now,
                     "last_seen": now,
                 }
+            op_id, operation = _operation(ctx, email, gkind, value, str(tool_name or ""),
+                                          str(reason or ""), tool_call_id, dispatch_session_id, trigger, now)
+            operations = store[key].setdefault("operations", {})
+            if not isinstance(operations, dict):
+                operations = store[key]["operations"] = {}
+            # Retries never overwrite the first immutable operation. Keep the
+            # spool bounded; overflow is explicit and cannot authorize replay.
+            if op_id not in operations:
+                if len(operations) < 128:
+                    operations[op_id] = operation
+                else:
+                    store[key]["operations_overflow"] = True
             tmp = store_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(store, ensure_ascii=False, indent=1), encoding="utf-8")
             os.replace(tmp, store_file)

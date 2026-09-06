@@ -79,6 +79,10 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/messaging/platforms",
   "/api/messaging/telegram/onboarding",
   "/api/messaging/whatsapp/onboarding",
+  // OAuth/account state is profile-owned too: status, login sessions, polling,
+  // cancellation, and disconnect must all follow the selected management
+  // profile rather than silently targeting the dashboard process's profile.
+  "/api/providers/oauth",
   "/api/model/info",
   "/api/model/set",
   "/api/model/auxiliary",
@@ -542,11 +546,18 @@ export const api = {
     source?: string,
     profile = getManagementProfile(),
   ) =>
-    fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
-    }),
+    fetchJSON<{ ok: boolean; removed: number; skipped_open: number }>(
+      "/api/sessions/prune",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          older_than_days,
+          source,
+          profile: profile || undefined,
+        }),
+      },
+    ),
   listFiles: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
     return fetchJSON<ManagedFilesResponse>(`/api/files${query}`);
@@ -2365,6 +2376,7 @@ export interface ProfileInfo {
   gateway_running: boolean;
   description: string;
   description_auto: boolean;
+  display_name?: string;
   distribution_name: string | null;
   distribution_version: string | null;
   distribution_source: string | null;
@@ -2460,6 +2472,7 @@ export interface CronJob {
   last_status?: string | null;
   last_error?: string | null;
   last_delivery_error?: string | null;
+  last_fire_error?: { at?: string | null; detail?: string | null } | null;
 }
 
 export interface CronDeliveryTarget {

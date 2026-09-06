@@ -49,6 +49,7 @@ def test_management_route_catalog_maps_core_endpoint_families():
         ("/api/ssh/ownership", "GET", "system:read"),
         ("/api/egress/status", "GET", "system:read"),
         ("/api/hermes/update", "POST", "system:ops"),
+        ("/api/hermes/update/receipt", "GET", "system:read"),
         ("/api/gateway/restart", "POST", "gateway:restart"),
         ("/api/webhooks", "GET", "webhooks:read"),
         ("/api/webhooks/foo", "DELETE", "webhooks:write"),
