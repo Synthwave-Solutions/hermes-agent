@@ -4446,6 +4446,9 @@ def run_conversation(
                         provider=_agg_cost_provider,
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
+                        # Accounting must not block delivery on a cold /models probe.
+                        # Missing cached pricing remains unknown, never fabricated zero.
+                        cached_only=True,
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)

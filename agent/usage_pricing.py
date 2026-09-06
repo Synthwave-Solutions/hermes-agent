@@ -1207,9 +1207,9 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     return None
 
 
-def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+def _openrouter_pricing_entry(route: BillingRoute, *, cached_only: bool = False) -> Optional[PricingEntry]:
     return _pricing_entry_from_metadata(
-        fetch_model_metadata(),
+        fetch_model_metadata(cached_only=True) if cached_only else fetch_model_metadata(),
         route.model,
         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
         pricing_version="openrouter-models-api",
@@ -1265,6 +1265,8 @@ def get_pricing_entry(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    cached_only: bool = False,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -1277,10 +1279,11 @@ def get_pricing_entry(
             pricing_version="included-route",
         )
     if route.provider == "openrouter":
-        return _openrouter_pricing_entry(route)
+        return _openrouter_pricing_entry(route, cached_only=True) if cached_only else _openrouter_pricing_entry(route)
     if route.base_url:
         entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
+            (fetch_endpoint_model_metadata(route.base_url, api_key=api_key or "", cached_only=True)
+             if cached_only else fetch_endpoint_model_metadata(route.base_url, api_key=api_key or "")),
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
@@ -1452,6 +1455,7 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    cached_only: bool = False,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -1464,7 +1468,7 @@ def estimate_usage_cost(
             notes=(_INCLUDED_NOTE,),
         )
 
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key, **({"cached_only": True} if cached_only else {}))
     if not entry:
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
 
