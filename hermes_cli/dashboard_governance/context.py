@@ -22,6 +22,7 @@ class DashboardGovernanceContext:
     session_id: str = ""
     request_id: str = ""
     user_message_sha256: str = ""
+    user_message_redacted: str = ""
     approval_waiter: Any = None
     approval_policy_path: str = ""
 

@@ -209,7 +209,10 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "", *, tool_ca
                     store = {}
             except (FileNotFoundError, ValueError):
                 store = {}
-            trigger = _trigger_from_env()
+            # Trusted thread-bound request context wins over process-global env.
+            trigger = redact_trigger(getattr(ctx, "user_message_redacted", ""))
+            if not trigger and not getattr(ctx, "request_id", ""):
+                trigger = _trigger_from_env()
             entry = store.get(key)
             if isinstance(entry, dict):
                 entry["count"] = int(entry.get("count") or 0) + 1
