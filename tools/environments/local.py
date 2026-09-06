@@ -823,7 +823,7 @@ def _hermes_dotenv_values(names: set[str]) -> dict[str, str]:
     except Exception:
         path = Path(os.path.expanduser("~/.hermes/.env"))
     try:
-        raw = path.read_text(errors="replace")
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return found
     for line in raw.splitlines():

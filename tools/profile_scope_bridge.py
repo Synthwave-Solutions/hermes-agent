@@ -38,7 +38,7 @@ def _real_home() -> str:
     """
     try:
         import pwd
-        return pwd.getpwuid(os.getuid()).pw_dir
+        return pwd.getpwuid(os.getuid()).pw_dir if hasattr(os, "getuid") else os.path.expanduser("~")
     except Exception:
         return os.path.expanduser("~")
 

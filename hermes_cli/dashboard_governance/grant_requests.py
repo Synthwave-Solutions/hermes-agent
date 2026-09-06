@@ -196,7 +196,7 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "", *, tool_ca
         store_file = _store_path()
         store_file.parent.mkdir(parents=True, exist_ok=True)
         lock_path = store_file.with_suffix(".lock")
-        with open(lock_path, "w") as lock_fh:
+        with open(lock_path, "w", encoding="utf-8") as lock_fh:
             try:
                 import fcntl
 

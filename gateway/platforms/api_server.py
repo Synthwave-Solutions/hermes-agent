@@ -293,7 +293,7 @@ def _beleidspad() -> str:
     try:
         import pwd
 
-        thuis = pwd.getpwuid(os.getuid()).pw_dir
+        thuis = pwd.getpwuid(os.getuid()).pw_dir if hasattr(os, "getuid") else os.path.expanduser("~")
     except Exception:
         thuis = os.path.expanduser("~")
     return os.path.join(thuis, ".hermes", "dashboard-governance.yaml")
