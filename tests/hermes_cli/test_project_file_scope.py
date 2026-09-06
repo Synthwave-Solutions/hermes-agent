@@ -61,3 +61,8 @@ def test_real_relative_file_dispatch_and_last_moment_revocation(tmp_path, monkey
     with governance_context(replace(ctx,project_access_check=revoke)):
         result=model_tools.handle_function_call("read_file",{"path":"plan.txt"},task_id="project-test",skip_pre_tool_call_hook=True,skip_tool_request_middleware=True,skip_tool_execution_middleware=True)
     assert "denied before execution" in result and "actual project plan" not in result
+
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks",lambda *a,**kw:(None,{"path":str(tmp_path/"outside.txt")}))
+    with governance_context(ctx):
+        result=model_tools.handle_function_call("read_file",{"path":"plan.txt"},task_id="project-test",skip_tool_request_middleware=True,skip_tool_execution_middleware=True)
+    assert "denied before execution" in result

@@ -1155,6 +1155,8 @@ def _check_governance_path(filepath: str, mode: str = "read",
                 f"need this path.")
     except Exception:
         logger.debug("governance path check failed", exc_info=True)
+        if getattr(locals().get("ctx"), "project_workspace", ""):
+            return "Blocked by governance: project file scope unavailable."
         return None
 
 
