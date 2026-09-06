@@ -75,6 +75,15 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        # SynthPulse captures OmniRoute routing headers through the SDK raw
+        # response API; retain each test's configured parsed-response mock.
+        def raw_create(**kwargs):
+            parsed = a.client.chat.completions.create(**kwargs)
+            raw = MagicMock()
+            raw.headers = {}
+            raw.parse.return_value = parsed
+            return raw
+        a.client.chat.completions.with_raw_response.create.side_effect = raw_create
         return a
 
 
@@ -4646,7 +4655,8 @@ class TestRunConversation:
         bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+        # The fork retries truncated arguments four times before closing the tail.
+        agent.client.chat.completions.create.side_effect = [good_resp] + [bad_resp] * 5
 
         with (
             patch("run_agent.handle_function_call", return_value='{"success":true}'),
