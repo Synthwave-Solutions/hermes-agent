@@ -21,6 +21,9 @@ class DashboardGovernanceContext:
     active_profile: str = "default"
     session_id: str = ""
     request_id: str = ""
+    user_message_sha256: str = ""
+    approval_waiter: Any = None
+    approval_policy_path: str = ""
 
     def cache_fingerprint(self) -> tuple:
         """Stable cache key component for schema filtering.
@@ -141,6 +144,7 @@ def serialize_context_for_env(ctx: DashboardGovernanceContext) -> str:
         "active_profile": ctx.active_profile,
         "session_id": ctx.session_id,
         "request_id": ctx.request_id,
+        "user_message_sha256": getattr(ctx, "user_message_sha256", ""),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -184,6 +188,7 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         active_profile=str(data.get("active_profile") or "default"),
         session_id=str(data.get("session_id") or ""),
         request_id=str(data.get("request_id") or ""),
+        user_message_sha256=str(data.get("user_message_sha256") or ""),
     )
 
 
