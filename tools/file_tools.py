@@ -371,6 +371,14 @@ def _resolve_base_dir(
 
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
+    resolved = _resolve_path_for_task_unchecked(filepath, task_id)
+    if not _uses_container_paths(task_id):
+        from tools.memory_tool import require_personal_file_access
+        require_personal_file_access(resolved)
+    return resolved
+
+
+def _resolve_path_for_task_unchecked(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
