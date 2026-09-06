@@ -1281,8 +1281,11 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
         cache.setdefault(bare_model, entry)
 
 
-def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-    """Fetch model metadata from OpenRouter (cached for 1 hour)."""
+def fetch_model_metadata(force_refresh: bool = False, *, cached_only: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Fetch model metadata from OpenRouter (cached for 1 hour).
+
+    ``cached_only`` never initiates network I/O; a cache miss returns empty.
+    """
     global _model_metadata_cache, _model_metadata_cache_time
 
     if not force_refresh and _model_metadata_cache and (time.time() - _model_metadata_cache_time) < _MODEL_CACHE_TTL:
@@ -1296,6 +1299,9 @@ def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any
                 _model_metadata_cache = disk_cache
                 _model_metadata_cache_time = time.time() - disk_age
                 return _model_metadata_cache
+
+    if cached_only:
+        return {}
 
     try:
         _ensure_requests()
@@ -1346,9 +1352,12 @@ def fetch_endpoint_model_metadata(
     base_url: str,
     api_key: str = "",
     force_refresh: bool = False,
+    *,
+    cached_only: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from an OpenAI-compatible ``/models`` endpoint.
 
+    ``cached_only`` returns only a fresh in-process snapshot, never a probe.
     This is used for explicit custom endpoints where hardcoded global model-name
     defaults are unreliable. Results are cached in memory per base URL.
     """
@@ -1362,6 +1371,9 @@ def fetch_endpoint_model_metadata(
         cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
         if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
             return cached
+
+    if cached_only:
+        return {}
 
     # Blackholed endpoint: every candidate below would spend its full 5s
     # connect budget. Returned empty rather than cached, so the endpoint is
