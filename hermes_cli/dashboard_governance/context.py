@@ -23,6 +23,8 @@ class DashboardGovernanceContext:
     request_id: str = ""
     user_message_sha256: str = ""
     user_message_redacted: str = ""
+    bot_access_ceiling: EffectiveAccess | None = None
+    bot_access_check: Any = None
     approval_waiter: Any = None
     approval_policy_path: str = ""
     project_workspace: str = ""
@@ -38,6 +40,7 @@ class DashboardGovernanceContext:
         grants = self.access.grants
         return (
             self.access.mode,
+            json.dumps(_serialize_grants(self.bot_access_ceiling.grants), sort_keys=True) if self.bot_access_ceiling else "",
             tuple(sorted(grants.tools)),
             tuple(sorted(grants.toolsets)),
             tuple(sorted(grants.mcp_servers)),
@@ -144,6 +147,7 @@ def serialize_context_for_env(ctx: DashboardGovernanceContext) -> str:
             "grant_sources": list(access.grant_sources),
             "grants": _serialize_grants(access.grants),
         },
+        "bot_access_ceiling": _serialize_grants(ctx.bot_access_ceiling.grants) if getattr(ctx, "bot_access_ceiling", None) else None,
         "active_profile": ctx.active_profile,
         "session_id": ctx.session_id,
         "request_id": ctx.request_id,
@@ -185,8 +189,19 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         grants=_deserialize_grants(grants_raw if isinstance(grants_raw, dict) else {}),
         grant_sources=tuple(str(item) for item in (access_data.get("grant_sources") or ()) if str(item)),
     )
+    ceiling_raw = data.get("bot_access_ceiling")
+    if ceiling_raw is not None and not isinstance(ceiling_raw, dict):
+        return None
+    ceiling = None
+    if ceiling_raw is not None:
+        ceiling = EffectiveAccess(subject=subject, mode="enforce",
+                                  roles=access.roles, groups=access.groups, grant_sources=access.grant_sources,
+                                  permissions=frozenset({"*"}),
+                                  profiles=frozenset({str(data.get("active_profile") or "default")}),
+                                  grants=_deserialize_grants(ceiling_raw))
     return DashboardGovernanceContext(
         subject=subject,
+        bot_access_ceiling=ceiling,
         access=access,
         active_profile=str(data.get("active_profile") or "default"),
         session_id=str(data.get("session_id") or ""),
