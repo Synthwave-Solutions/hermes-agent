@@ -1407,7 +1407,13 @@ def _wait_for_governance_grant(ctx, tool_name, function_args, reason, detail, to
         policy = load_governance_policy(path=policy_path)
         if policy.mode != "enforce":
             return False
-        fresh = replace(ctx, access=resolve_effective_access(policy, ctx.subject))
+        fresh_access = resolve_effective_access(policy, ctx.subject)
+        if getattr(ctx, "bot_access_ceiling", None) is not None:
+            checker = getattr(ctx, "bot_access_check", None)
+            if not callable(checker) or checker() is not True:
+                return False
+            fresh_access = replace(fresh_access, profiles=fresh_access.profiles | {ctx.active_profile})
+        fresh = replace(ctx, access=fresh_access)
         if not fresh.access.is_profile_allowed(ctx.active_profile):
             return False
         tool_decision = tool_allowed_for_context(fresh, tool_name, registry)
