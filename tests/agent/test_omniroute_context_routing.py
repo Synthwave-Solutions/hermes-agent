@@ -188,3 +188,41 @@ def test_route_switch_updates_compressor(monkeypatch):
     agent.context_compressor.update_model.assert_called_once()
     assert agent._effective_routed_model == "codex/gpt-5.6-sol"
     assert agent._effective_context_length == 400_000
+
+
+def test_codex_router_alias_preserves_resolved_context_without_network(monkeypatch):
+    agent = _agent()
+    agent.model = "codex/gpt-6-astra"
+    agent.context_compressor.model = agent.model
+    agent.context_compressor.context_length = 400_000
+    agent._omniroute_route_info = ("cx", "gpt-6-astra")
+    probe = MagicMock(return_value=256_000)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", probe)
+    capture_omniroute_route(agent, SimpleNamespace(model="gpt-6-astra"))
+    probe.assert_not_called()
+    agent.context_compressor.update_model.assert_not_called()
+    assert agent.context_compressor.context_length == 400_000
+    assert agent._omniroute_route_info is None
+
+
+def test_codex_alias_different_model_still_resolves_context(monkeypatch):
+    agent = _agent()
+    agent.model = "codex/gpt-6-astra"
+    agent._omniroute_route_info = ("cx", "gpt-5.6-sol")
+    probe = MagicMock(return_value=400_000)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", probe)
+    capture_omniroute_route(agent, SimpleNamespace(model="gpt-5.6-sol"))
+    probe.assert_called_once()
+    agent.context_compressor.update_model.assert_called_once()
+
+
+def test_alias_does_not_reuse_context_from_previous_different_route(monkeypatch):
+    agent = _agent()
+    agent.model = "codex/gpt-6-astra"
+    agent.context_compressor.model = "cc/claude-fable-5"
+    agent._omniroute_route_info = ("cx", "gpt-6-astra")
+    probe = MagicMock(return_value=400_000)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", probe)
+    capture_omniroute_route(agent, SimpleNamespace(model="gpt-6-astra"))
+    probe.assert_called_once()
+    agent.context_compressor.update_model.assert_called_once()

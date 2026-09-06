@@ -92,6 +92,20 @@ def capture_omniroute_route(agent, response) -> None:
         resolved_model = getattr(response, "model", None) if response else None
     if not resolved_model or resolved_model == agent.model:
         return
+    # OmniRoute's response header uses the short provider id "cx" for
+    # requests addressed to "codex". This is the same model, not a route
+    # change. Preserve the compressor's already-resolved context window;
+    # probing the unrecognized alias here blocks terminal delivery on HTTP
+    # metadata timeouts after the answer has already streamed to the user.
+    def canonical_route(model):
+        if isinstance(model, str) and model.startswith("cx/"):
+            return "codex/" + model[3:]
+        return model
+
+    compressor = getattr(agent, "context_compressor", None)
+    current_model = getattr(compressor, "model", None)
+    if canonical_route(resolved_model) == canonical_route(current_model):
+        return
     if getattr(agent, "_effective_routed_model", None) == resolved_model:
         return
     from agent.model_metadata import get_model_context_length
