@@ -439,7 +439,7 @@ _AWS_CREDENTIAL_ENV_VARS = [
 ]
 
 
-def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:
+def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None, *, metadata_timeout: Optional[float] = None) -> Optional[str]:
     """Return the name of the AWS auth source that is active, or None.
 
     Checks environment variables first, then falls back to boto3's credential
@@ -471,6 +471,11 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     try:
         import botocore.session
         session = botocore.session.get_session()
+        if metadata_timeout is not None:
+            # Discovery must not wait on unreachable EC2 metadata endpoints.
+            # Configure this Session only; never mutate process AWS settings.
+            session.set_config_variable("metadata_service_timeout", metadata_timeout)
+            session.set_config_variable("metadata_service_num_attempts", 1)
         credentials = session.get_credentials()
         if credentials is not None:
             resolved = credentials.get_frozen_credentials()
@@ -481,35 +486,13 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     return None
 
 
-def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
-    """Return True if any AWS credential source is detected.
+def has_aws_credentials(env: Optional[Dict[str, str]] = None, *, metadata_timeout: Optional[float] = None) -> bool:
+    """Detect explicit or implicit AWS credentials with one resolver pass.
 
-    Checks environment variables first (fast, no I/O), then falls back to
-    boto3's credential chain which covers EC2 instance roles, ECS task roles,
-    Lambda execution roles, and other IMDS-based sources that don't set
-    environment variables.
-
-    This two-tier approach mirrors the pattern from OpenClaw PR #62673:
-    cloud environments (EC2, ECS, Lambda) provide credentials via instance
-    metadata, not environment variables. The env-var check is a fast path
-    for local development; the boto3 fallback covers all cloud deployments.
+    Interactive discovery can bound the instance-metadata probe independently;
+    actual runtime authentication keeps the SDK's configured timeout/retries.
     """
-    if resolve_aws_auth_env_var(env) is not None:
-        return True
-    # Fall back to boto3's credential resolver — this covers EC2 instance
-    # metadata (IMDS), ECS container credentials, and other implicit sources
-    # that don't set environment variables.
-    try:
-        import botocore.session
-        session = botocore.session.get_session()
-        credentials = session.get_credentials()
-        if credentials is not None:
-            resolved = credentials.get_frozen_credentials()
-            if resolved and resolved.access_key:
-                return True
-    except Exception:
-        pass
-    return False
+    return resolve_aws_auth_env_var(env, metadata_timeout=metadata_timeout) is not None
 
 
 def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
