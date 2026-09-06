@@ -524,7 +524,7 @@ DELEGATION_POLICY_GUIDANCE = (
     "can run independently while you make useful progress. Use delegate_task "
     "with a tasks batch so those workers actually run in parallel; prefer leaf "
     "workers with a concrete deliverable, relevant context, scope and validation. "
-    "Use background=true when you can continue independently, then collect and "
+    "Continue independent work after starting the batch, then collect and "
     "review every result before combining it. Use list/steer/stop to coordinate "
     "existing children instead of spawning duplicate workers. Respect configured "
     "concurrency and iteration budgets; keep small or dependent tasks inline.\n"

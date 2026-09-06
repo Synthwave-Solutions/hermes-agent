@@ -350,6 +350,18 @@ def _governance_tool_decision(tool_name: str):
         return None
 
 
+def _normalize_project_file_args(function_name, function_args, task_id):
+    # Bind authorization and execution to the file backend's exact task cwd.
+    if (getattr(_current_dashboard_governance_context(), "project_workspace", "")
+            and function_name in {"read_file", "search_files", "write_file", "patch"}):
+        from pathlib import Path as _ProjectPath
+        from tools.file_tools import _resolve_base_dir, _uses_container_paths
+        raw = str(function_args.get("path") or ".")
+        if not _ProjectPath(raw).is_absolute() and not _uses_container_paths(task_id or "default"):
+            return {**function_args, "path": str(_resolve_base_dir(task_id or "default") / raw)}
+    return function_args
+
+
 def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any]):
     ctx = _current_dashboard_governance_context()
     try:
@@ -1655,6 +1667,8 @@ def handle_function_call(
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
 
+    function_args = _normalize_project_file_args(function_name, function_args, task_id)
+
     _argument_decision = _governance_argument_decision(function_name, function_args)
     if _argument_decision is not None and not _argument_decision.allowed:
         _governance_ctx = _current_dashboard_governance_context()
@@ -1832,6 +1846,14 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    # Execution middleware and plugin hooks may alter arguments.
+                    # Revalidate the exact final project file invocation, freshly.
+                    if (getattr(_current_dashboard_governance_context(), "project_workspace", "")
+                            and function_name in {"read_file", "search_files", "write_file", "patch"}):
+                        next_args = _normalize_project_file_args(function_name, next_args, task_id)
+                        decision = _governance_argument_decision(function_name, next_args)
+                        if decision is None or not decision.allowed:
+                            return tool_error("Project file access denied before execution")
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
