@@ -297,6 +297,19 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
 
 
 def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, registry: Any) -> AccessDecision:
+    ceiling = getattr(ctx, "bot_access_ceiling", None)
+    if ceiling is not None:
+        checker = getattr(ctx, "bot_access_check", None)
+        try:
+            if not callable(checker) or checker() is not True:
+                return AccessDecision(False, "bot_access_revoked")
+        except Exception:
+            return AccessDecision(False, "bot_access_revoked")
+        if tool_name == "terminal" and not ceiling.grants.cli_commands:
+            return AccessDecision(False, "bot_cli_not_selected")
+        bounded = decide_tool_access(ceiling, tool_name, registry)
+        if not bounded.allowed:
+            return bounded
     return decide_tool_access(ctx.access if ctx is not None else None, tool_name, registry)
 
 
@@ -519,6 +532,23 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
 
 
 def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
+    ceiling = getattr(ctx, "bot_access_ceiling", None)
+    if ceiling is not None:
+        checker = getattr(ctx, "bot_access_check", None)
+        try:
+            if not callable(checker) or checker() is not True:
+                return AccessDecision(False, "bot_access_revoked")
+        except Exception:
+            return AccessDecision(False, "bot_access_revoked")
+        if tool_name == "terminal" and not ceiling.grants.cli_commands:
+            return AccessDecision(False, "bot_cli_not_selected")
+        if tool_name == "skill_view":
+            name = str(args.get("name") or "")
+            if "*" not in ceiling.grants.skills_load and name not in ceiling.grants.skills_load:
+                return AccessDecision(False, "bot_skill_not_selected", detail=name)
+        bounded = decide_tool_argument_access(ceiling, tool_name, args)
+        if not bounded.allowed:
+            return bounded
     decision = decide_tool_argument_access(ctx.access if ctx is not None else None, tool_name, args)
     root = getattr(ctx, "project_workspace", "") if ctx is not None else ""
     if not root or tool_name not in {"read_file", "search_files", "write_file", "patch"}:
