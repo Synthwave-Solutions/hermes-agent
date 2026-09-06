@@ -718,7 +718,7 @@ class TestNativeScreenshots:
         cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "{shot}"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kwargs: True
         )
         monkeypatch.setattr(
             "tools.vision_tools._resize_image_for_vision",
@@ -736,7 +736,7 @@ class TestNativeScreenshots:
         cli = _fake_cli(tmp_path, f'cat > /dev/null\necho "{shot}"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: False
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kwargs: False
         )
         result = json.loads(bu_cli.browser_exec("print(capture_screenshot())"))
         assert result["screenshot_path"] == shot
@@ -797,18 +797,19 @@ class TestStepLabels:
 class TestHeaderVariants:
     def test_vision_header_forbids_vision_tool_detour(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kwargs: True
         )
         header = bu_cli._description_header()
         assert header.startswith(bu_cli._HEADER_BASE)
         assert "attached to your context automatically" in header
 
-    def test_text_only_header_teaches_text_workflow(self, monkeypatch):
+    def test_unconfirmed_vision_header_teaches_text_without_disabling_images(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: False
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kwargs: False
         )
         header = bu_cli._description_header()
-        assert "cannot view images" in header
+        assert "cannot view images" not in header
+        assert "when the screenshot is requested" in header
         assert "page_info()" in header
 
 
@@ -1205,7 +1206,7 @@ class TestLightpandaPreamble:
 class TestLightpandaHeader:
     def test_lightpanda_header_is_text_first_even_for_vision_models(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kwargs: True
         )
         monkeypatch.setattr(
             "tools.browser_tool.lightpanda_engine_status", lambda: (True, "used")
@@ -1221,7 +1222,7 @@ class TestLightpandaHeader:
 
     def test_shadowed_engine_keeps_default_header(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kwargs: True
         )
         monkeypatch.setattr(
             "tools.browser_tool.lightpanda_engine_status", lambda: (False, "cloud")

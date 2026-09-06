@@ -900,6 +900,12 @@ _HEADER_VISION = (
     "never send browser screenshots to a separate vision tool."
 )
 
+_HEADER_AUTO_VISION = (
+    " Work text-first with page_info() and DOM extraction. Screenshots may be "
+    "attached directly when the active model supports them; image routing is "
+    "resolved when the screenshot is requested."
+)
+
 _HEADER_TEXT_ONLY = (
     " Your model cannot view images, so work text-first: page_info() for "
     "state, js() for reading/extracting DOM text, fill_input(selector, "
@@ -936,11 +942,11 @@ def _description_header() -> str:
     try:
         from tools.vision_tools import _should_use_native_vision_fast_path
 
-        if _should_use_native_vision_fast_path():
+        if _should_use_native_vision_fast_path(allow_network=False):
             return _HEADER_BASE + _HEADER_VISION
     except Exception:
         pass
-    return _HEADER_BASE + _HEADER_TEXT_ONLY
+    return _HEADER_BASE + _HEADER_AUTO_VISION
 
 
 def _lightpanda_engine_in_use() -> bool:
