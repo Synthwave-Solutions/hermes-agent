@@ -519,4 +519,34 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
 
 
 def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
-    return decide_tool_argument_access(ctx.access if ctx is not None else None, tool_name, args)
+    decision = decide_tool_argument_access(ctx.access if ctx is not None else None, tool_name, args)
+    root = getattr(ctx, "project_workspace", "") if ctx is not None else ""
+    if not root or tool_name not in {"read_file", "search_files", "write_file", "patch"}:
+        return decision
+    raw = str(args.get("path") or ".")
+    # Grant only an explicit absolute file path. Relative paths retain the
+    # normal engine policy because a tool backend may resolve its cwd differently.
+    path = Path(os.path.expanduser(raw))
+    workspace = Path(root)
+    if not path.is_absolute() or not workspace.is_absolute():
+        return decision
+    try:
+        lexical = Path(os.path.abspath(path))
+        lexical.relative_to(workspace)
+    except (ValueError, OSError):
+        return decision
+    denied = AccessDecision(False, "project_file_access_denied", detail=raw)
+    try:
+        # No project scope follows symlinks, including symlinked ancestors.
+        if ".." in path.parts or any(p.is_symlink() for p in (path, *path.parents)):
+            return denied
+        path.resolve().relative_to(workspace.resolve())
+        check = getattr(ctx, "project_access_check", None)
+        if not callable(check) or check(str(path), tool_name in {"write_file", "patch"}) is not True:
+            return denied
+    except Exception:
+        return denied
+    # Never override denied globs, tool permissions, or other argument denials.
+    if decision.reason in {"file_read_root_not_allowed", "file_write_root_not_allowed"}:
+        return AccessDecision(True, "project_file_scope_allowed")
+    return decision

@@ -25,6 +25,8 @@ class DashboardGovernanceContext:
     user_message_redacted: str = ""
     approval_waiter: Any = None
     approval_policy_path: str = ""
+    project_workspace: str = ""
+    project_access_check: Any = None
 
     def cache_fingerprint(self) -> tuple:
         """Stable cache key component for schema filtering.

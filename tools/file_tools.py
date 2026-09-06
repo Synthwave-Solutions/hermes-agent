@@ -1134,7 +1134,7 @@ def _check_governance_path(filepath: str, mode: str = "read",
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
         from hermes_cli.dashboard_governance.tool_policy import (
-            decide_tool_argument_access,
+            tool_arguments_allowed_for_context,
         )
 
         ctx = current_governance_context()
@@ -1145,13 +1145,18 @@ def _check_governance_path(filepath: str, mode: str = "read",
         except (OSError, ValueError):
             resolved = filepath
         naam = "read_file" if mode == "read" else "write_file"
-        besluit = decide_tool_argument_access(ctx.access, naam, {"path": resolved})
+        if getattr(ctx, "project_workspace", ""):
+            raw = Path(filepath)
+            resolved = str(raw if raw.is_absolute() else _resolve_base_dir(task_id) / raw)
+        besluit = tool_arguments_allowed_for_context(ctx, naam, {"path": resolved})
         if besluit.allowed:
             return None
         return (f"Blocked by governance: {besluit.reason}. Ask Michael if you "
                 f"need this path.")
     except Exception:
         logger.debug("governance path check failed", exc_info=True)
+        if getattr(locals().get("ctx"), "project_workspace", ""):
+            return "Blocked by governance: project file scope unavailable."
         return None
 
 

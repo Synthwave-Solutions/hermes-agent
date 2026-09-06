@@ -7340,7 +7340,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if pconfig and pconfig.auth_type == "aws_sdk":
         try:
             from agent.bedrock_adapter import has_aws_credentials
-            return {"logged_in": has_aws_credentials(), "provider": target}
+            return {"logged_in": has_aws_credentials(metadata_timeout=0.25), "provider": target}
         except ImportError:
             return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
     return {"logged_in": False}

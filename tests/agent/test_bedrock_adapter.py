@@ -1433,3 +1433,23 @@ class TestBearerTokenRoutesToConverse:
         runtime = self._resolve(monkeypatch, bearer=False)
         assert runtime["api_mode"] == "anthropic_messages"
         assert runtime.get("bedrock_anthropic") is True
+
+
+def test_discovery_metadata_budget_is_session_local_and_single_pass():
+    from agent.bedrock_adapter import has_aws_credentials
+    mock_session = MagicMock()
+    mock_session.get_credentials.return_value = None
+    with _mock_botocore_session(return_value=mock_session):
+        assert not has_aws_credentials({}, metadata_timeout=0.25)
+    mock_session.get_credentials.assert_called_once()
+    mock_session.set_config_variable.assert_any_call("metadata_service_timeout", 0.25)
+    mock_session.set_config_variable.assert_any_call("metadata_service_num_attempts", 1)
+
+
+def test_runtime_metadata_probe_preserves_sdk_defaults():
+    from agent.bedrock_adapter import has_aws_credentials
+    mock_session = MagicMock()
+    mock_session.get_credentials.return_value = None
+    with _mock_botocore_session(return_value=mock_session):
+        assert not has_aws_credentials({})
+    mock_session.set_config_variable.assert_not_called()
