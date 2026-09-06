@@ -61,9 +61,34 @@ _memory_surface_flags: ContextVar[Optional[Tuple[bool, bool]]] = ContextVar(
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
+_personal_memory_dir: ContextVar[Optional[Path]] = ContextVar("personal_memory_dir", default=None)
+
+
+_personal_memory_disabled: ContextVar[bool] = ContextVar("personal_memory_disabled", default=False)
+
+
+def bind_personal_memory_dir(path: Path, *, enabled: bool = True):
+    """Bind a trusted adapter-owned scope; never accept model/tool arguments here."""
+    root = Path(path)
+    if not root.is_absolute():
+        raise ValueError("Personal memory directory must be absolute")
+    if any(part.is_symlink() for part in (root, *root.parents)):
+        raise PermissionError("Personal memory directory cannot contain symlinks")
+    return (_personal_memory_dir.set(root), _personal_memory_disabled.set(not enabled))
+
+
+def personal_memory_scope_active():
+    return _personal_memory_dir.get() is not None
+
+
+def reset_personal_memory_dir(token):
+    _personal_memory_disabled.reset(token[1])
+    _personal_memory_dir.reset(token[0])
+
+
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Prefer the authenticated adapter scope over a shared bot's home."""
+    return _personal_memory_dir.get() or (get_hermes_home() / "memories")
 
 # Stable header prefixes for the system-prompt memory blocks rendered by
 # MemoryStore._render_block. Exported so compression's prompt-retention check
@@ -181,6 +206,9 @@ class MemoryStore:
         memory_enabled: bool = True,
         user_profile_enabled: bool = True,
     ):
+        if _personal_memory_disabled.get():
+            raise PermissionError("Personal memory is unavailable in shared conversations")
+        self._bound_memory_dir = _personal_memory_dir.get()
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -241,11 +269,11 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
+        mem_dir = self._memory_directory()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.memory_entries = self._read_file(self._path_for("memory"))
+        self.user_entries = self._read_file(self._path_for("user"))
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -336,12 +364,18 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
-        mem_dir = get_memory_dir()
-        if target == "user":
-            return mem_dir / "USER.md"
-        return mem_dir / "MEMORY.md"
+    def _memory_directory(self) -> Path:
+        root = self._bound_memory_dir or get_memory_dir()
+        if self._bound_memory_dir and any(p.is_symlink() for p in (root, *root.parents)):
+            raise PermissionError("Personal memory directory cannot contain symlinks")
+        return root
+
+    def _path_for(self, target: str) -> Path:
+        mem_dir = self._memory_directory()
+        path = mem_dir / ("USER.md" if target == "user" else "MEMORY.md")
+        if self._bound_memory_dir and path.is_symlink():
+            raise PermissionError("Personal memory file cannot be a symlink")
+        return path
 
     def _reload_target(self, target: str, *, skip_drift: bool = False):
         """Re-read entries from disk into in-memory state.
@@ -386,7 +420,7 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
+        self._memory_directory().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
@@ -1197,6 +1231,8 @@ def get_builtin_memory_config(config: Optional[Dict[str, Any]] = None) -> Dict[s
 
 def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> Tuple[bool, bool]:
     """Return ``(memory_enabled, user_profile_enabled)`` from resolved config."""
+    if _personal_memory_disabled.get():
+        return False, False
     section = get_builtin_memory_config(config)
     return (
         is_truthy_value(section.get("memory_enabled"), default=True),
@@ -1392,3 +1428,19 @@ registry.register(
 
 
 
+
+
+def require_personal_file_access(path):
+    """Protect private documents in file tools, without claiming a host sandbox."""
+    scope = _personal_memory_dir.get()
+    if scope is None:
+        return
+    # Adapter layout: <personal root>/<actor>/memories.
+    own = scope.parent.resolve()
+    private_root = own.parent
+    target = Path(path).resolve()
+    if target == private_root or private_root.is_relative_to(target):
+        raise PermissionError("File access would include private personal context")
+    if target.is_relative_to(private_root):
+        if _personal_memory_disabled.get() or not target.is_relative_to(own):
+            raise PermissionError("Personal context is private to its authenticated owner")

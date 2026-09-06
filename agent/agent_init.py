@@ -1916,14 +1916,20 @@ def init_agent(
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
-            pass  # Memory is optional -- don't break agent init
+            from tools.memory_tool import personal_memory_scope_active
+            if personal_memory_scope_active():
+                raise  # An invalid private scope must never become shared fallback.
+            pass  # Memory is optional for legacy callers.
     
 
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    from tools.memory_tool import personal_memory_scope_active
+    # External plugins have no guaranteed actor-isolation contract. Do not
+    # attach a shared bot's provider to an authenticated private-memory turn.
+    if not skip_memory and not personal_memory_scope_active():
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
