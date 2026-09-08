@@ -1,10 +1,44 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from fnmatch import fnmatchcase
 from typing import Any, Mapping
 
 
 _ALLOWED_MODES = frozenset({"off", "report_only", "enforce"})
+
+ACCESS_LEVELS = frozenset({"user", "elevated", "admin"})
+ACCESS_MODES = frozenset({"whitelist", "blacklist"})
+APPROVAL_MODES = frozenset({"manual", "automatic"})
+
+
+def grant_matches(values, value: str, *, path: bool = False) -> bool:
+    """One matcher for retained denies, envelopes and runtime grant checks."""
+    return any(pattern == "*" or fnmatchcase(value, pattern)
+               or (path and value.startswith(pattern.rstrip("/") + "/"))
+               for pattern in values)
+
+
+def intersect_grants(grants: "GrantSet", ceiling: "GrantSet") -> "GrantSet":
+    def intersect(left, right, path=False):
+        return frozenset(v for v in left if grant_matches(right, v, path=path)) | frozenset(
+            v for v in right if grant_matches(left, v, path=path))
+    values = {}
+    for f in fields(GrantSet):
+        a, b = getattr(grants, f.name), getattr(ceiling, f.name)
+        if f.name == "usage_caps":
+            values[f.name] = dict(b)
+        elif f.name in {"file_denied_globs", "cli_denied_commands", "cli_approval_commands"}:
+            values[f.name] = a | b
+        elif f.name == "mcp_tools":
+            values[f.name] = {
+                server: intersect(a.get(server, a.get("*", frozenset())), b.get(server, b.get("*", frozenset())))
+                for server in set(a) | set(b) | set(grants.mcp_servers) | set(ceiling.mcp_servers)
+                if grant_matches(grants.mcp_servers, server) and grant_matches(ceiling.mcp_servers, server)
+            }
+        else:
+            values[f.name] = intersect(a, b, f.name in {"file_read_roots", "file_write_roots", "cli_workdir_roots"})
+    return GrantSet(**values)
 
 
 def _norm_email(value: str | None) -> str:
@@ -156,6 +190,7 @@ class GrantSet:
             file_allow_globs=_string_set(files.get("allow_globs") if isinstance(files, Mapping) else None),
             cli_commands=frozenset(command_ids),
             cli_approval_commands=_string_set(cli.get("approval_commands") if isinstance(cli, Mapping) else None),
+            cli_denied_commands=_string_set(cli.get("denied_commands")),
             cli_workdir_roots=_string_set(cli.get("workdir_roots") if isinstance(cli, Mapping) else None),
             workspaces=_string_set(data.get("workspaces")),
             env_vars=_string_set(env.get("vars") if isinstance(env, Mapping) else None),
@@ -168,6 +203,23 @@ class GrantSet:
     def is_empty(self) -> bool:
         """True when this grant set carries nothing (an absent deny block)."""
         return self == GrantSet()
+
+    def to_mapping(self) -> dict:
+        """Policy-shaped, secret-free effective grant/deny representation."""
+        return {
+            "permissions": sorted(self.permissions), "profiles": sorted(self.profiles),
+            "routes": sorted(self.routes), "workspaces": sorted(self.workspaces),
+            "settings": {"read": sorted(self.settings_read), "write": sorted(self.settings_write)},
+            "tools": {"builtins": sorted(self.tools), "toolsets": sorted(self.toolsets)},
+            "skills": {"view": sorted(self.skills_view), "load": sorted(self.skills_load), "manage": sorted(self.skills_manage)},
+            "mcp": {"servers": sorted(self.mcp_servers), "tools": {k: sorted(v) for k, v in self.mcp_tools.items()}},
+            "models": {"providers": sorted(self.model_providers), "models": sorted(self.models)},
+            "files": {"read_roots": sorted(self.file_read_roots), "write_roots": sorted(self.file_write_roots),
+                      "denied_globs": sorted(self.file_denied_globs), "allow_globs": sorted(self.file_allow_globs)},
+            "cli": {"commands": sorted(self.cli_commands), "approval_commands": sorted(self.cli_approval_commands),
+                    "denied_commands": sorted(self.cli_denied_commands), "workdir_roots": sorted(self.cli_workdir_roots)},
+            "env": {"vars": sorted(self.env_vars)}, "usage_caps": dict(self.usage_caps),
+        }
 
     def subtract(self, deny: "GrantSet") -> "GrantSet":
         """Return this grant set with everything in ``deny`` removed.
@@ -254,6 +306,14 @@ class GovernanceUser:
     # individually blocked from a capability the group otherwise hands out.
     deny: GrantSet = field(default_factory=GrantSet)
 
+    # Empty access controls identify a legacy entry; explicit modes never
+    # silently inherit legacy behavior.
+    access_level: str = ""
+    access_mode: str = ""
+    approval_mode: str = "manual"
+    approval_prompt: str = ""
+    approval_configured: bool = False
+
 
 @dataclass(frozen=True)
 class GovernancePolicy:
@@ -304,25 +364,47 @@ class EffectiveAccess:
     grants: GrantSet = field(default_factory=GrantSet)
     grant_sources: tuple[str, ...] = ()
     permission_sources: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    deny: GrantSet = field(default_factory=GrantSet)
+    role_ceiling: GrantSet | None = None
+    access_level: str = ""
+    access_mode: str = ""
+    approval_mode: str = "manual"
+    approval_prompt: str = ""
+    approval_configured: bool = False
+
+    def host_execution_restricted(self) -> bool:
+        return bool((self.access_mode or self.access_level or self.approval_configured) and (
+            self.deny.file_read_roots or self.deny.file_write_roots or self.deny.file_denied_globs or self.deny.env_vars))
+
+    def allows(self, dimension: str, value: str, *, path: bool = False) -> bool:
+        if self.host_execution_restricted() and (
+            (dimension == "permissions" and (value == "terminal:use" or value.startswith("git:")))
+            or (dimension == "tools" and value in {"terminal", "execute_code"})
+        ):
+            return False
+        if grant_matches(getattr(self.deny, dimension), value, path=path):
+            return False
+        if self.role_ceiling is not None and not grant_matches(getattr(self.role_ceiling, dimension), value, path=path):
+            return False
+        values = getattr(self, dimension) if dimension in {"permissions", "profiles", "routes"} else getattr(self.grants, dimension)
+        return grant_matches(values, value, path=path)
 
     def _allowed_by_set(self, values: frozenset[str], value: str) -> bool:
         return "*" in values or value in values
 
     def has_permission(self, permission: str) -> bool:
-        return self._allowed_by_set(self.permissions, permission)
+        return self.allows("permissions", permission)
 
     def is_profile_allowed(self, profile: str) -> bool:
-        return self._allowed_by_set(self.profiles, profile or "default")
+        return self.allows("profiles", profile or "default")
 
     def is_route_allowed(self, path: str) -> bool:
-        if "*" in self.routes:
-            return True
-        return any(path == route or (route.endswith("*") and path.startswith(route[:-1])) for route in self.routes)
+        return self.allows("routes", path)
 
     def is_tool_allowed(self, tool_name: str) -> bool:
-        return self._allowed_by_set(self.grants.tools, tool_name)
+        return self.allows("tools", tool_name)
 
     def explain_permission(self, permission: str) -> AccessDecision:
         if self.has_permission(permission):
             return AccessDecision(True, "allowed", tuple(self.permission_sources.get(permission) or self.permission_sources.get("*") or ()))
-        return AccessDecision(False, "not_whitelisted", ())
+        return AccessDecision(False, "explicit_deny" if grant_matches(self.deny.permissions, permission) else "not_whitelisted", ())

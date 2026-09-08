@@ -68,12 +68,34 @@ def _parse_group(name: str, raw: Any) -> GovernanceGroup:
 
 def _parse_user(email: str, raw: Any) -> GovernanceUser:
     data = raw if isinstance(raw, Mapping) else {}
+    from .models import ACCESS_LEVELS, ACCESS_MODES, APPROVAL_MODES
+    level = data.get("access_level", "")
+    access_mode = data.get("access_mode", "")
+    for name, value, allowed in (("access_level", level, ACCESS_LEVELS), ("access_mode", access_mode, ACCESS_MODES)):
+        if name in data and (not isinstance(value, str) or value not in allowed):
+            raise GovernancePolicyError(f"invalid user {name}: expected one of {', '.join(sorted(allowed))}")
+    approval = data.get("approval", {})
+    if not isinstance(approval, Mapping) or set(approval) - {"mode", "prompt"}:
+        raise GovernancePolicyError("user approval must contain mode and prompt only")
+    approval_mode = approval.get("mode", "manual")
+    prompt = approval.get("prompt", "")
+    if not isinstance(approval_mode, str) or approval_mode not in APPROVAL_MODES:
+        raise GovernancePolicyError("invalid user approval mode")
+    if not isinstance(prompt, str) or len(prompt) > 8000:
+        raise GovernancePolicyError("user approval prompt must be a string of at most 8000 characters")
+    if approval_mode == "automatic" and not prompt.strip():
+        raise GovernancePolicyError("automatic approval requires an administrator-authored prompt")
     return GovernanceUser(
         email=_norm_email(email),
         roles=tuple(str(v) for v in (data.get("roles") or []) if str(v).strip()),
         groups=tuple(str(v) for v in (data.get("groups") or []) if str(v).strip()),
         grants=GrantSet.from_mapping(data.get("grants")),
         deny=GrantSet.from_mapping(data.get("deny")),
+        access_level=level,
+        access_mode=access_mode,
+        approval_mode=approval_mode,
+        approval_prompt=prompt.strip(),
+        approval_configured="approval" in data,
     )
 
 

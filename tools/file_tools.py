@@ -1163,8 +1163,9 @@ def _check_governance_path(filepath: str, mode: str = "read",
                 f"need this path.")
     except Exception:
         logger.debug("governance path check failed", exc_info=True)
-        if getattr(locals().get("ctx"), "project_workspace", ""):
-            return "Blocked by governance: project file scope unavailable."
+        ctx = locals().get("ctx")
+        if getattr(ctx, "project_workspace", "") or getattr(getattr(ctx, "access", None), "mode", "") == "enforce":
+            return "Blocked by governance: file scope unavailable."
         return None
 
 
@@ -1181,13 +1182,16 @@ def _filter_profile_scope_search_results(result, task_id: str = "default") -> in
     # guard is unavailable under a scoped home (then the per-path check
     # below fails closed and drops everything).
     try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        ctx = current_governance_context()
+        governed = ctx is not None and ctx.access.mode == "enforce"
         mod = _profile_scope_mod()
-        if mod is not None and not mod.is_scoped(mod.resolve_profile()):
+        if not governed and mod is not None and not mod.is_scoped(mod.resolve_profile()):
             return 0
-        if mod is None and not _is_scoped_profile_home():
+        if not governed and mod is None and not _is_scoped_profile_home():
             return 0
     except Exception:
-        if not _is_scoped_profile_home():
+        if not locals().get("governed") and not _is_scoped_profile_home():
             return 0
 
     omitted = 0

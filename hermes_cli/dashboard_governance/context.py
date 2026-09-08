@@ -40,6 +40,9 @@ class DashboardGovernanceContext:
         grants = self.access.grants
         return (
             self.access.mode,
+            self.access.subject.normalized_email,
+            json.dumps(_serialize_grants(self.access.deny), sort_keys=True),
+            json.dumps(_serialize_grants(self.access.role_ceiling), sort_keys=True) if self.access.role_ceiling else "",
             json.dumps(_serialize_grants(self.bot_access_ceiling.grants), sort_keys=True) if self.bot_access_ceiling else "",
             tuple(sorted(grants.tools)),
             tuple(sorted(grants.toolsets)),
@@ -146,11 +149,20 @@ def serialize_context_for_env(ctx: DashboardGovernanceContext) -> str:
             "routes": _list(access.routes),
             "grant_sources": list(access.grant_sources),
             "grants": _serialize_grants(access.grants),
+            "policy_controls_version": 1,
+            "deny": _serialize_grants(access.deny),
+            "role_ceiling": _serialize_grants(access.role_ceiling) if access.role_ceiling is not None else None,
+            "access_level": access.access_level,
+            "access_mode": access.access_mode,
+            "approval_mode": access.approval_mode,
+            "approval_prompt": access.approval_prompt,
+            "approval_configured": access.approval_configured,
         },
         "bot_access_ceiling": _serialize_grants(ctx.bot_access_ceiling.grants) if getattr(ctx, "bot_access_ceiling", None) else None,
         "active_profile": ctx.active_profile,
         "session_id": ctx.session_id,
         "request_id": ctx.request_id,
+        "approval_policy_path": getattr(ctx, "approval_policy_path", ""),
         "user_message_sha256": getattr(ctx, "user_message_sha256", ""),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -187,6 +199,13 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         profiles=_set(access_data.get("profiles")),
         routes=_set(access_data.get("routes")),
         grants=_deserialize_grants(grants_raw if isinstance(grants_raw, dict) else {}),
+        deny=_deserialize_grants(access_data.get("deny") or {}),
+        role_ceiling=_deserialize_grants(access_data["role_ceiling"]) if isinstance(access_data.get("role_ceiling"), dict) else None,
+        access_level=str(access_data.get("access_level") or ""),
+        access_mode=str(access_data.get("access_mode") or ""),
+        approval_mode=str(access_data.get("approval_mode") or "manual"),
+        approval_prompt=str(access_data.get("approval_prompt") or ""),
+        approval_configured=access_data.get("approval_configured") is True,
         grant_sources=tuple(str(item) for item in (access_data.get("grant_sources") or ()) if str(item)),
     )
     ceiling_raw = data.get("bot_access_ceiling")
@@ -206,6 +225,7 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         active_profile=str(data.get("active_profile") or "default"),
         session_id=str(data.get("session_id") or ""),
         request_id=str(data.get("request_id") or ""),
+        approval_policy_path=str(data.get("approval_policy_path") or ""),
         user_message_sha256=str(data.get("user_message_sha256") or ""),
     )
 

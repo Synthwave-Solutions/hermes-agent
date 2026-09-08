@@ -1412,7 +1412,10 @@ def _wait_for_governance_grant(ctx, tool_name, function_args, reason, detail, to
             checker = getattr(ctx, "bot_access_check", None)
             if not callable(checker) or checker() is not True:
                 return False
-            fresh_access = replace(fresh_access, profiles=fresh_access.profiles | {ctx.active_profile})
+            role_ceiling = fresh_access.role_ceiling
+            if role_ceiling is not None:
+                role_ceiling = replace(role_ceiling, profiles=role_ceiling.profiles | {ctx.active_profile})
+            fresh_access = replace(fresh_access, profiles=fresh_access.profiles | {ctx.active_profile}, role_ceiling=role_ceiling)
         fresh = replace(ctx, access=fresh_access)
         if not fresh.access.is_profile_allowed(ctx.active_profile):
             return False
@@ -1866,6 +1869,16 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                     )
+            _unchecked_dispatch = _dispatch
+            def _dispatch(next_args: Dict[str, Any]) -> Any:
+                # Review the exact arguments AFTER all plugin/middleware edits.
+                # The action reviewer rechecks current profile/tool/argument
+                # policy and never grants a capability missing from whitelist.
+                from hermes_cli.dashboard_governance.action_approval import authorize_tool_action
+                reviewed = authorize_tool_action(_current_dashboard_governance_context(), function_name, next_args, registry)
+                if reviewed is not None and reviewed.get("approved") is not True:
+                    return tool_error("Action blocked by governance: " + str(reviewed.get("reason") or "approval denied"))
+                return _unchecked_dispatch(next_args)
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
