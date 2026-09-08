@@ -2261,6 +2261,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     owner_email: Optional[str] = None,
+    enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2328,10 +2329,15 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        enabled: Whether the job can run on schedule. False creates a paused
+                record atomically, so duplicating a job never briefly makes
+                the copy eligible for scheduler dispatch.
 
     Returns:
         The created job dict
     """
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite).
@@ -2453,9 +2459,9 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
+        "enabled": enabled,
+        "state": "scheduled" if enabled else "paused",
+        "paused_at": None if enabled else now,
         "paused_reason": None,
         "created_at": now,
         "next_run_at": next_run_at,
