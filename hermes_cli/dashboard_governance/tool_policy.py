@@ -313,6 +313,29 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
 
 
 def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, registry: Any) -> AccessDecision:
+    from .context import policy_contexts
+    try:
+        contexts = policy_contexts(ctx)
+        first = AccessDecision(True, "governance_inactive")
+        for index, bounded_ctx in enumerate(contexts):
+            if index and bounded_ctx.access.mode == "enforce" and not bounded_ctx.access.is_profile_allowed(bounded_ctx.active_profile):
+                return AccessDecision(False, "profile_not_allowed")
+            if index and bounded_ctx.access.mode == "enforce" and (bounded_ctx.access.access_mode or bounded_ctx.access.access_level) and not bounded_ctx.access.has_permission("chat:use"):
+                return AccessDecision(False, "chat_not_allowed")
+            decision = _tool_allowed_for_single_context(bounded_ctx, tool_name, registry)
+            if not decision.allowed:
+                return decision
+            if index == 0:
+                first = decision
+        return first
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")
+
+
+def _tool_allowed_for_single_context(ctx, tool_name, registry):
+    from .context import workspace_allowed_for_context
+    if not workspace_allowed_for_context(ctx):
+        return AccessDecision(False, "workspace_access_revoked")
     ceiling = getattr(ctx, "bot_access_ceiling", None)
     if ceiling is not None:
         checker = getattr(ctx, "bot_access_check", None)
@@ -584,6 +607,30 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
 
 
 def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
+    from .context import policy_contexts
+    try:
+        contexts = policy_contexts(ctx)
+        first = AccessDecision(True, "governance_inactive")
+        for index, bounded_ctx in enumerate(contexts):
+            decision = _tool_arguments_for_single_context(bounded_ctx, tool_name, args)
+            if not decision.allowed:
+                return decision
+            if index == 0:
+                first = decision
+        return first
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")
+
+
+def _tool_arguments_for_single_context(ctx, tool_name, args):
+    from .context import workspace_allowed_for_context
+    candidate = ""
+    if tool_name in {"read_file", "search_files", "write_file", "patch"}:
+        candidate = _resolve_candidate_path(args.get("path") or ".")
+    elif tool_name == "terminal":
+        candidate = _resolve_candidate_path(args.get("workdir") or getattr(ctx, "workspace_path", "") or ".")
+    if not workspace_allowed_for_context(ctx, candidate):
+        return AccessDecision(False, "workspace_access_revoked")
     ceiling = getattr(ctx, "bot_access_ceiling", None)
     if ceiling is not None:
         checker = getattr(ctx, "bot_access_check", None)

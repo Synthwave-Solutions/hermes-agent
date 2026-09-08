@@ -225,6 +225,17 @@ def _capture_routing_origin() -> Dict[str, Any]:
     omitted so CLI/contextvar-unaware paths persist nothing new.
     """
     origin: Dict[str, Any] = {}
+    # Only a trusted, already-loaded WebUI helper can stamp this reference.
+    # Never import a guessed host module or accept a model/tool argument.
+    import sys
+    import re
+    continuation = sys.modules.get("api.governance.continuation")
+    if continuation is not None:
+        ref = continuation.current_ref()
+        if ref:
+            if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
+                raise ValueError("Invalid trusted WebUI continuation reference")
+            origin["webui_continuation_ref"] = ref
     try:
         from gateway.session_context import get_session_env
 
@@ -255,7 +266,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            "scope_id", "user_id", "user_name", "webui_continuation_ref",
         )
         if key in record
     }
@@ -383,7 +394,7 @@ def recover_abandoned_delegations() -> int:
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            for _k in ("scope_id", "user_id", "user_name", "webui_continuation_ref"):
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -644,6 +655,66 @@ def active_for_session(origin_ui_session_id: str) -> int:
             and str(r.get("origin_ui_session_id") or "")
             == origin_ui_session_id
         )
+
+
+def pending_for_session(origin_ui_session_id: str, *, homes=None) -> int:
+    """Count live work and durable completions not yet accepted by the parent.
+
+    ``homes`` is an optional collection of trusted profile homes resolved by
+    the host from this session's own profile/bot roster. No request-supplied
+    paths or process environment mutation is needed. Each ledger is opened
+    read-only; duplicate delegation IDs across homes count once. Errors and
+    dropped delivery propagate as unknown, never false completion.
+
+    Old WebUI turns did not stamp origin_ui_session_id. They are recognized
+    only when BOTH their immutable parent ID and routing session key equal the
+    requested UI ID. An explicit UI origin can never be overridden by aliases.
+    """
+    if not origin_ui_session_id:
+        return 0
+
+    def matches(record):
+        exact = str(record.get("origin_ui_session_id") or "")
+        if exact:
+            return exact == origin_ui_session_id
+        return (str(record.get("parent_session_id") or "") == origin_ui_session_id
+                and str(record.get("session_key") or "") == origin_ui_session_id)
+
+    with _records_lock:
+        pending = {
+            key for key, record in _records.items()
+            if record.get("status") in {"running", "stalling", "finalizing"}
+            and matches(record)
+        }
+    if homes is None:
+        paths = [_db_path()]
+    else:
+        from pathlib import Path
+        paths = [Path(home) / "state.db" for home in homes]
+        if not paths:
+            raise ValueError("No authoritative profile homes supplied")
+    for path in dict.fromkeys(path.resolve() for path in paths):
+        if not path.is_file():
+            continue
+        with _DB_LOCK:
+            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+            try:
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='async_delegations'").fetchone():
+                    continue
+                rows = conn.execute(
+                    """SELECT delegation_id, state, delivery_state FROM async_delegations
+                       WHERE (origin_ui_session_id=? OR
+                         (COALESCE(origin_ui_session_id,'')='' AND parent_session_id=? AND origin_session=?))
+                         AND (state IN ('running','stalling','finalizing') OR delivery_state IN ('pending','dropped'))""",
+                    (origin_ui_session_id, origin_ui_session_id, origin_ui_session_id),
+                ).fetchall()
+                for delegation_id, _state, delivery in rows:
+                    if delivery == "dropped":
+                        raise RuntimeError("A delegated completion was not delivered to its parent")
+                    pending.add(delegation_id)
+            finally:
+                conn.close()
+    return len(pending)
 
 
 def active_task_count() -> int:
@@ -996,7 +1067,7 @@ def _push_completion_event(
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in ("scope_id", "user_id", "user_name", "webui_continuation_ref"):
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1210,7 +1281,7 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in ("scope_id", "user_id", "user_name", "webui_continuation_ref"):
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

@@ -797,9 +797,11 @@ def _inject_dwd_identity_env(env: dict[str, str]) -> None:
         from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
 
         ctx = current_governance_context()
-        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+        if ctx is None:
             return
-        identity = dwd_identity_for(ctx.access)
+        from hermes_cli.dashboard_governance.context import policy_contexts
+        identities = [dwd_identity_for(bound.access) for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
+        identity = next((value for value in identities if value is not None), None)
         if identity is None:  # admin: unrestricted, same as before
             return
         env["HERMES_DWD_IDENTITY"] = identity or "unresolved-identity"
@@ -858,9 +860,15 @@ def _inject_granted_env_vars(env: dict[str, str]) -> None:
         from hermes_cli.dashboard_governance.context import current_governance_context
 
         ctx = current_governance_context()
-        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+        if ctx is None:
             return
-        names = {str(n).strip() for n in getattr(ctx.access.grants, "env_vars", ()) if str(n).strip()}
+        from hermes_cli.dashboard_governance.context import policy_contexts
+        bounds = [bound for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
+        if not bounds:
+            return
+        names = {str(n).strip() for n in getattr(bounds[0].access.grants, "env_vars", ()) if str(n).strip()}
+        if getattr(ctx, "continuation_contexts", ()):
+            names = {name for name in names if all(bound.access.allows("env_vars", name) for bound in bounds)}
         if not names:
             return
         for key, value in _hermes_dotenv_values(names).items():

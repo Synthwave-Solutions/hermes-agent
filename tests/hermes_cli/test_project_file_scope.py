@@ -24,7 +24,9 @@ def test_fresh_membership_scoped_grant_and_revocation(tmp_path):
     denied=replace(ctx,access=replace(access,grants=replace(access.grants,file_denied_globs=frozenset({"*.md"}))))
     assert not decide(denied,"read_file",{"path":str(path)}).allowed
     restored=context_from_env_payload(serialize_context_for_env(ctx))
-    assert not restored.project_workspace and restored.project_access_check is None
+    # The original scope survives continuation/subprocess transport, while a
+    # callback must be rebound by the trusted host before it can authorize.
+    assert restored.project_workspace == str(root) and restored.project_access_check is None
     assert not decide(restored,"read_file",{"path":str(path)}).allowed
 
 

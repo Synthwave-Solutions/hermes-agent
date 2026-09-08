@@ -1204,6 +1204,8 @@ def direct_api_call(agent, api_kwargs: dict):
     outer retry loop reconnects with backoff / credential rotation /
     provider fallback.
     """
+    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    _enforce_dashboard_governance_model_policy(agent)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Request-lifecycle state, every transition under ``request_client_lock``
@@ -1419,6 +1421,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    _enforce_dashboard_governance_model_policy(agent)
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -3536,6 +3540,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    _enforce_dashboard_governance_model_policy(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 

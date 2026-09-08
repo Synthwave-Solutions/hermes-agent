@@ -67,3 +67,17 @@ def filter_model_options_payload(payload: dict[str, Any], access: EffectiveAcces
     filtered = dict(payload)
     filtered["providers"] = filtered_providers
     return filtered
+
+
+def model_allowed_for_context(ctx, *, provider: str, model: str) -> AccessDecision:
+    from .context import policy_contexts, workspace_allowed_for_context
+    try:
+        for bounded in policy_contexts(ctx):
+            if not workspace_allowed_for_context(bounded):
+                return AccessDecision(False, "workspace_access_revoked")
+            decision = decide_model_access(bounded.access, provider=provider, model=model)
+            if not decision.allowed:
+                return decision
+        return AccessDecision(True, "allowed")
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")
