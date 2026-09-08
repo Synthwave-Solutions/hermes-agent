@@ -198,3 +198,23 @@ def test_retained_inactive_permissions_do_not_become_enforced_for_live_workspace
     resumed = continuation(original, current)
     assert tool_allowed_for_context(resumed, "read_file", Registry()).allowed
     assert not tool_allowed_for_context(replace(resumed, workspace_access_check=lambda path: path != "/original"), "read_file", Registry()).allowed
+
+
+@pytest.mark.parametrize("failure", ["revoked", "missing", "unavailable"])
+@pytest.mark.parametrize("retained", [False, True])
+def test_live_bot_revoke_blocks_actual_provider_request_for_current_and_original_bot(failure, retained):
+    from agent.chat_completion_helpers import direct_api_call
+    permitted = replace(context(), bot_access_ceiling=context().access, bot_access_check=lambda: True)
+    if retained:
+        permitted = replace(continuation(permitted), bot_access_check=lambda: True)
+    assert model_allowed_for_context(permitted, provider="openai", model="any").allowed
+
+    def unavailable():
+        raise OSError("Bot membership source unavailable")
+    check = {"revoked": lambda: False, "missing": None, "unavailable": unavailable}[failure]
+    revoked = replace(permitted, bot_access_check=check)
+    # A permitted bot can become revoked after initialization. This actual
+    # provider entry must reject before touching the client's runtime fields.
+    agent = SimpleNamespace(provider="openai", model="any")
+    with governance_context(revoked), pytest.raises(PermissionError, match="bot_access_revoked"):
+        direct_api_call(agent, {})
