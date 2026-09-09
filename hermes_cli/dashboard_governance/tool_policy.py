@@ -251,9 +251,14 @@ def identify_tool(tool_name: str, registry: Any) -> ToolIdentity:
     if toolset.startswith("mcp-"):
         server = toolset[4:]
         local = tool_name
-        prefix = f"mcp_{server}_"
-        if tool_name.startswith(prefix):
-            local = tool_name[len(prefix):]
+        # Native registration uses mcp__<sanitized server>__<tool>. Keep
+        # legacy names readable too, but derive the server from the trusted
+        # registry toolset rather than guessing at underscore boundaries.
+        safe_server = re.sub(r"[^A-Za-z0-9_]", "_", server)
+        for prefix in (f"mcp__{safe_server}__", f"mcp_{server}_", f"mcp_{safe_server}_"):
+            if tool_name.startswith(prefix):
+                local = tool_name[len(prefix):]
+                break
         return ToolIdentity(name=tool_name, toolset=toolset, mcp_server=server, mcp_tool=local)
     return ToolIdentity(name=tool_name, toolset=toolset)
 
