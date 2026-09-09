@@ -3047,7 +3047,7 @@ def preflight_db_writability(
         except (OSError, ValueError):
             return False
 
-    def _ensure_writable(p: Path, *, is_dir: bool = False) -> None:
+    def _ensure_writable(p: Path, *, is_dir: bool = False, may_disappear: bool = False) -> None:
         import stat as _stat
 
         if os.access(p, os.R_OK | os.W_OK):
@@ -3065,6 +3065,14 @@ def preflight_db_writability(
                     p,
                     "x" if is_dir else "",
                 )
+                return
+        if may_disappear:
+            # A concurrent SQLite close/checkpoint can remove an optional
+            # sidecar after is_file() but before access()/chmod(). Missing is
+            # not read-only; SQLite can recreate it in the checked directory.
+            try:
+                p.stat()
+            except FileNotFoundError:
                 return
         kind = "directory" if is_dir else "file"
         wal_note = (
@@ -3089,7 +3097,7 @@ def preflight_db_writability(
     for suffix in ("", "-wal", "-shm"):
         p = db_path.with_name(db_path.name + suffix) if suffix else db_path
         if p.is_file():
-            _ensure_writable(p)
+            _ensure_writable(p, may_disappear=bool(suffix))
 
 
 def _connect_repair_durable(
