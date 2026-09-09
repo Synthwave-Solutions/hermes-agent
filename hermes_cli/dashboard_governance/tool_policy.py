@@ -178,11 +178,12 @@ _REDIRECT_TOKEN_RE = re.compile(r"^\d*(>>|>|<|>&|<&|&>>|&>)\d*$")
 def _split_shell_segments(command: str) -> list[list[str]]:
     """Split a shell command on ;, &&, ||, |, & and newlines into token lists,
     respecting quoting. Raises ValueError on unparseable input."""
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";|&")
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";|&\n")
+    lex.whitespace = " \t\r"
     lex.whitespace_split = True
     segments: list[list[str]] = [[]]
     for token in lex:
-        if token in {";", "|", "||", "&&", "&", ";;", "|&"}:
+        if token and all(char in ";|&\n" for char in token):
             if segments[-1]:
                 segments.append([])
             continue
@@ -537,6 +538,21 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
             if seg_argv0 not in grants.cli_commands and seg_base not in grants.cli_commands:
                 return AccessDecision(False, "cli_command_not_allowed", detail=seg_argv0)
     return AccessDecision(True, "arguments_allowed")
+
+
+def cli_command_requires_manual_approval(access: EffectiveAccess, command: str) -> bool:
+    """Use the command permission parser for the current policy's review floor.
+
+    This is a review requirement, never a permission grant. Any matching
+    executable (including a nested substitution) or unsupported parse needs
+    a human; the caller must still perform the full hard checks first.
+    """
+    from .models import GrantSet
+    required = access.grants.cli_approval_commands
+    if not required or "bootstrap_admin" in access.grant_sources:
+        return False
+    review_selectors = GrantSet(cli_denied_commands=required)
+    return not _check_cli_command(command, review_selectors).allowed
 
 
 def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
