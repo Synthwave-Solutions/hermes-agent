@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 from .models import EffectiveAccess, GovernanceSubject, GrantSet
@@ -29,6 +30,11 @@ class DashboardGovernanceContext:
     approval_policy_path: str = ""
     project_workspace: str = ""
     project_access_check: Any = None
+    workspace_path: str = ""
+    workspace_access_check: Any = None
+    # Original full policy envelopes retained by a trusted server continuation.
+    # These are additional ceilings, never substitutes for current access.
+    continuation_contexts: tuple[str, ...] = ()
 
     def cache_fingerprint(self) -> tuple:
         """Stable cache key component for schema filtering.
@@ -48,6 +54,8 @@ class DashboardGovernanceContext:
             tuple(sorted(grants.toolsets)),
             tuple(sorted(grants.mcp_servers)),
             tuple(sorted((server, tuple(sorted(names))) for server, names in grants.mcp_tools.items())),
+            tuple(hashlib.sha256(value.encode()).hexdigest() for value in self.continuation_contexts),
+            self.workspace_path,
         )
 
 
@@ -164,16 +172,27 @@ def serialize_context_for_env(ctx: DashboardGovernanceContext) -> str:
         "request_id": ctx.request_id,
         "approval_policy_path": getattr(ctx, "approval_policy_path", ""),
         "user_message_sha256": getattr(ctx, "user_message_sha256", ""),
+        "project_workspace": getattr(ctx, "project_workspace", ""),
+        "workspace_path": getattr(ctx, "workspace_path", ""),
+        "continuation_contexts": list(getattr(ctx, "continuation_contexts", ())),
     }
+    if getattr(ctx, "bot_access_ceiling", None) is not None:
+        payload["bot_access_ceiling_context"] = serialize_context_for_env(DashboardGovernanceContext(
+            subject=ctx.bot_access_ceiling.subject, access=ctx.bot_access_ceiling))
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
+    if not isinstance(payload, str) or len(payload) > 1024 * 1024:
+        return None
     try:
         data = json.loads(payload)
     except (TypeError, ValueError):
         return None
     if not isinstance(data, dict):
+        return None
+    retained = data.get("continuation_contexts", [])
+    if not isinstance(retained, list) or len(retained) > 16 or any(not isinstance(value, str) for value in retained):
         return None
     subject_raw = data.get("subject")
     access_raw = data.get("access")
@@ -218,6 +237,11 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
                                   permissions=frozenset({"*"}),
                                   profiles=frozenset({str(data.get("active_profile") or "default")}),
                                   grants=_deserialize_grants(ceiling_raw))
+    if data.get("bot_access_ceiling_context") is not None:
+        full_ceiling = context_from_env_payload(data["bot_access_ceiling_context"])
+        if full_ceiling is None:
+            return None
+        ceiling = full_ceiling.access
     return DashboardGovernanceContext(
         subject=subject,
         bot_access_ceiling=ceiling,
@@ -227,7 +251,68 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         request_id=str(data.get("request_id") or ""),
         approval_policy_path=str(data.get("approval_policy_path") or ""),
         user_message_sha256=str(data.get("user_message_sha256") or ""),
+        project_workspace=str(data.get("project_workspace") or ""),
+        workspace_path=str(data.get("workspace_path") or ""),
+        continuation_contexts=tuple(retained),
     )
+
+
+def policy_contexts(ctx: DashboardGovernanceContext | None) -> tuple[DashboardGovernanceContext, ...]:
+    """Current envelope plus bounded, validated original continuation ceilings.
+
+    Serialized snapshots cannot restore callbacks. Current live membership
+    checks are reused only for the same principal/profile/project workspace;
+    the original grants/denies remain intact and cannot add authorization.
+    """
+    if ctx is None:
+        return ()
+    result = [replace(ctx, continuation_contexts=())]
+    pending = [(payload, 1) for payload in ctx.continuation_contexts]
+    seen = set()
+    while pending:
+        payload, depth = pending.pop()
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        if digest in seen:
+            continue
+        if depth > 8 or len(seen) >= 16:
+            raise ValueError("continuation_policy_limit")
+        seen.add(digest)
+        original = context_from_env_payload(payload)
+        if original is None:
+            raise ValueError("continuation_policy_invalid")
+        if (original.subject.normalized_email != ctx.subject.normalized_email
+                or original.active_profile != ctx.active_profile
+                or (original.subject.org_id and original.subject.org_id != ctx.subject.org_id)
+                or (original.workspace_path and original.workspace_path != ctx.workspace_path)
+                or (original.project_workspace and original.project_workspace != ctx.project_workspace)):
+            raise ValueError("continuation_principal_mismatch")
+        pending.extend((child, depth + 1) for child in original.continuation_contexts)
+        if (original.access.mode == "enforce" or original.workspace_path
+                or original.bot_access_ceiling is not None or original.project_workspace):
+            result.append(replace(original, continuation_contexts=(),
+                                  bot_access_check=ctx.bot_access_check,
+                                  workspace_access_check=ctx.workspace_access_check,
+                                  project_access_check=ctx.project_access_check))
+    return tuple(result)
+
+
+def workspace_allowed_for_context(ctx, candidate_path: str = "") -> bool:
+    """Live application membership is a ceiling even with governance disabled.
+
+    A serialized path without a trusted host callback cannot authorize a child.
+    Candidate paths are checked independently: ordinary sessions may still use
+    any otherwise granted root, provided that root's owner permits the actor.
+    """
+    root = getattr(ctx, "workspace_path", "")
+    check = getattr(ctx, "workspace_access_check", None)
+    if not root and check is None:
+        return True
+    if not callable(check):
+        return False
+    try:
+        return all(check(path) is True for path in dict.fromkeys((root, candidate_path)) if path)
+    except Exception:
+        return False
 
 
 def _context_from_env() -> DashboardGovernanceContext | None:

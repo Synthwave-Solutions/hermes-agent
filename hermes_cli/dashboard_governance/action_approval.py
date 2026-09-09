@@ -104,11 +104,11 @@ def _audit(ctx, tool_name, operation_id, revision, source, decision, reason):
 
 def authorize_tool_action(ctx, tool_name, args, registry):
     """Return approved/source/reason. None means unchanged legacy behavior."""
-    if ctx is None or ctx.access.mode != "enforce":
+    if ctx is None or (ctx.access.mode != "enforce" and not ctx.continuation_contexts):
         return None
     access = ctx.access
     managed = bool(access.access_mode or access.access_level or access.approval_configured)
-    if not managed and not ctx.approval_policy_path:
+    if not managed and not ctx.approval_policy_path and not ctx.continuation_contexts:
         return None
     operation_id = uuid.uuid4().hex
     revision = ""

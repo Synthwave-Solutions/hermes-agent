@@ -78,7 +78,9 @@ def test_waiter_capabilities_do_not_serialize():
     ctx = replace(_context(), approval_waiter=lambda _:True, approval_policy_path='/private/policy')
     payload = serialize_context_for_env(ctx)
     assert 'approval_waiter' not in payload
-    assert '/private/policy' not in payload
+    # A policy source is required for the delegated action's fresh policy
+    # check. The callable capability remains exclusively in the trusted host.
+    assert context_from_env_payload(payload).approval_policy_path == '/private/policy'
     assert context_from_env_payload(payload).approval_waiter is None
 
 

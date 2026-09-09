@@ -1164,7 +1164,8 @@ def _check_governance_path(filepath: str, mode: str = "read",
     except Exception:
         logger.debug("governance path check failed", exc_info=True)
         ctx = locals().get("ctx")
-        if getattr(ctx, "project_workspace", "") or getattr(getattr(ctx, "access", None), "mode", "") == "enforce":
+        if (getattr(ctx, "project_workspace", "") or getattr(ctx, "workspace_path", "")
+                or getattr(getattr(ctx, "access", None), "mode", "") == "enforce" or getattr(ctx, "continuation_contexts", ())):
             return "Blocked by governance: file scope unavailable."
         return None
 
@@ -1184,7 +1185,8 @@ def _filter_profile_scope_search_results(result, task_id: str = "default") -> in
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
         ctx = current_governance_context()
-        governed = ctx is not None and ctx.access.mode == "enforce"
+        governed = ctx is not None and (ctx.access.mode == "enforce" or getattr(ctx, "continuation_contexts", ())
+                                        or getattr(ctx, "workspace_path", ""))
         mod = _profile_scope_mod()
         if not governed and mod is not None and not mod.is_scoped(mod.resolve_profile()):
             return 0
