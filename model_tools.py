@@ -325,7 +325,8 @@ def _governance_cache_fingerprint():
     if ctx is None:
         return None
     try:
-        if getattr(ctx.access, "mode", "off") != "enforce":
+        if (getattr(ctx.access, "mode", "off") != "enforce" and not getattr(ctx, "continuation_contexts", ())
+                and not getattr(ctx, "workspace_path", "")):
             return None
         return ctx.cache_fingerprint()
     except Exception:
@@ -342,7 +343,7 @@ def _governance_tool_decision(tool_name: str):
         # Fail closed only when an enforce context is active; otherwise preserve
         # legacy CLI/gateway behavior if the governance package cannot import.
         try:
-            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 from hermes_cli.dashboard_governance.models import AccessDecision
                 return AccessDecision(False, "governance_policy_error")
         except Exception:
@@ -352,7 +353,8 @@ def _governance_tool_decision(tool_name: str):
 
 def _normalize_project_file_args(function_name, function_args, task_id):
     # Bind authorization and execution to the file backend's exact task cwd.
-    if (getattr(_current_dashboard_governance_context(), "project_workspace", "")
+    ctx = _current_dashboard_governance_context()
+    if ((getattr(ctx, "project_workspace", "") or getattr(ctx, "workspace_path", ""))
             and function_name in {"read_file", "search_files", "write_file", "patch"}):
         from pathlib import Path as _ProjectPath
         from tools.file_tools import _resolve_base_dir, _uses_container_paths
@@ -370,7 +372,7 @@ def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any])
     except Exception as exc:
         logger.debug("dashboard governance argument policy failed for %s: %s", tool_name, exc)
         try:
-            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 from hermes_cli.dashboard_governance.models import AccessDecision
                 return AccessDecision(False, "governance_argument_policy_error")
         except Exception:
@@ -386,7 +388,7 @@ def _governance_usage_decision(tool_name: str, args: Optional[Dict[str, Any]] = 
     except Exception as exc:
         logger.debug("dashboard governance usage cap check failed for %s: %s", tool_name, exc)
         try:
-            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 from hermes_cli.dashboard_governance.models import AccessDecision
                 return AccessDecision(False, "governance_usage_policy_error")
         except Exception:
@@ -405,7 +407,8 @@ def _governance_record_tool_usage(tool_name: str, args: Optional[Dict[str, Any]]
 
 def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ctx = _current_dashboard_governance_context()
-    if ctx is None or getattr(ctx.access, "mode", "off") != "enforce":
+    if ctx is None or (getattr(ctx.access, "mode", "off") != "enforce" and not getattr(ctx, "continuation_contexts", ())
+                       and not getattr(ctx, "workspace_path", "")):
         return tool_defs
     filtered: List[Dict[str, Any]] = []
     for td in tool_defs:
@@ -1412,7 +1415,10 @@ def _wait_for_governance_grant(ctx, tool_name, function_args, reason, detail, to
             checker = getattr(ctx, "bot_access_check", None)
             if not callable(checker) or checker() is not True:
                 return False
-            fresh_access = replace(fresh_access, profiles=fresh_access.profiles | {ctx.active_profile})
+            role_ceiling = fresh_access.role_ceiling
+            if role_ceiling is not None:
+                role_ceiling = replace(role_ceiling, profiles=role_ceiling.profiles | {ctx.active_profile})
+            fresh_access = replace(fresh_access, profiles=fresh_access.profiles | {ctx.active_profile}, role_ceiling=role_ceiling)
         fresh = replace(ctx, access=fresh_access)
         if not fresh.access.is_profile_allowed(ctx.active_profile):
             return False
@@ -1866,6 +1872,16 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                     )
+            _unchecked_dispatch = _dispatch
+            def _dispatch(next_args: Dict[str, Any]) -> Any:
+                # Review the exact arguments AFTER all plugin/middleware edits.
+                # The action reviewer rechecks current profile/tool/argument
+                # policy and never grants a capability missing from whitelist.
+                from hermes_cli.dashboard_governance.action_approval import authorize_tool_action
+                reviewed = authorize_tool_action(_current_dashboard_governance_context(), function_name, next_args, registry)
+                if reviewed is not None and reviewed.get("approved") is not True:
+                    return tool_error("Action blocked by governance: " + str(reviewed.get("reason") or "approval denied"))
+                return _unchecked_dispatch(next_args)
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import Iterable
 
 from .models import (
@@ -9,6 +10,8 @@ from .models import (
     GovernancePolicy,
     GovernanceSubject,
     _norm_email,
+    intersect_grants,
+    grant_matches,
 )
 
 
@@ -68,6 +71,27 @@ def _wildcard_grants() -> GrantSet:
     )
 
 
+def _level_ceiling(grants: GrantSet, level: str) -> GrantSet:
+    """Levels constrain configured role scopes; they do not invent resources."""
+    if level == "admin":
+        return grants
+    from .route_catalog import ROUTE_CATALOG
+    known = {p for rule in ROUTE_CATALOG for p in (rule.read_permission, rule.write_permission) if p}
+    known.update({"self:read", "config:write", "terminal:use"})
+    def permitted(p):
+        if p.startswith("governance:"):
+            return False
+        if level == "user" and (p.endswith(":admin") or p in {
+            "terminal:use", "config:write", "system:write", "system:ops", "gateway:restart",
+            "model:write", "mcp:write", "plugins:write",
+        }):
+            return False
+        return True
+    return replace(grants, permissions=frozenset(
+        p for p in known | set(grants.permissions)
+        if not any(char in p for char in "*?[") and permitted(p) and grant_matches(grants.permissions, p)))
+
+
 def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubject) -> EffectiveAccess:
     email = _norm_email(subject.email)
     sources: list[str] = []
@@ -97,28 +121,35 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
         group = policy.groups.get(group_name)
         if group:
             grants = _merge_grant(grants, group.grants, f"group:{group_name}", sources, permission_sources)
+    role_ceiling = None
+    if user and (user.access_mode or user.access_level) and email not in policy.bootstrap_admins:
+        level = user.access_level or "user"
+        # The assignable admin preset is powerful, but unlike bootstrap
+        # ownership remains subject to explicit per-user denies.
+        if level == "admin":
+            grants = grants.merge(_wildcard_grants())
+        if not user.access_mode:
+            grants = grants.merge(user.grants)
+        role_ceiling = _level_ceiling(grants, level)
+        grants = intersect_grants(user.grants, role_ceiling) if user.access_mode == "whitelist" else role_ceiling
+        sources.append(f"access_mode:{user.access_mode or 'legacy'}")
+        roles.difference_update({"owner", "admin"})
     if user:
-        grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
-
-    # Deny overrides grants, applied LAST so a per-user (or per-group) deny
-    # beats anything a role or group handed out. Bootstrap admins are
-    # never-deny: their wildcard access is not subtractable (a deny on an owner
-    # is refused at write time and ignored here as defence in depth).
-    # Mirrors the hermes-webui vendored resolver (api/governance/resolver.py):
-    # only the per-USER deny is subtracted, so a person is individually blocked
-    # from a capability a role or group otherwise grants. Kept identical across
-    # the two copies on purpose: a deny that applied in one layer but not the
-    # other would be a silent hole.
-    ud = getattr(user, "deny", None) if user else None
-    if user and ud is not None and not ud.is_empty() and email not in policy.bootstrap_admins:
-        grants = grants.subtract(ud)
+        if role_ceiling is None:
+            grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
+        else:
+            sources.append(f"user:{email}")
+    if user and not user.deny.is_empty() and email not in policy.bootstrap_admins:
+        # Per-user off-toggles subtract AFTER the full union so they win from
+        # any role/group grant. Bootstrap admins are exempt (never-deny
+        # principals: a stray deny: "*" must not brick the owner).
+        grants = grants.subtract(user.deny)
         sources.append(f"deny:user:{email}")
-        # A subtracted permission must also leave the source map, or a preview
-        # would still name a source for a permission the subject no longer holds.
-        for perm in list(permission_sources):
-            if perm not in grants.permissions:
-                permission_sources.pop(perm, None)
+        for permission in user.deny.permissions:
+            permission_sources.pop(permission, None)
 
+    if role_ceiling is not None and user.access_level == "admin" and grant_matches(grants.permissions, "governance:write") and not grant_matches(user.deny.permissions, "governance:write"):
+        roles.add("admin")
     return EffectiveAccess(
         subject=subject,
         mode=policy.mode,
@@ -130,4 +161,11 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
         grants=grants,
         grant_sources=tuple(sources),
         permission_sources={key: tuple(sorted(value)) for key, value in permission_sources.items()},
+        deny=user.deny if user and email not in policy.bootstrap_admins else GrantSet(),
+        role_ceiling=role_ceiling,
+        access_level=user.access_level if user else "",
+        access_mode=user.access_mode if user else "",
+        approval_mode=user.approval_mode if user else "manual",
+        approval_prompt=user.approval_prompt if user else "",
+        approval_configured=user.approval_configured if user else False,
     )

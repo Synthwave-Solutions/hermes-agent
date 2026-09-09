@@ -536,16 +536,16 @@ def _refuse_checkpoint_required_on_codex_app_server(
 def _enforce_dashboard_governance_model_policy(agent) -> None:
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
-        from hermes_cli.dashboard_governance.model_policy import decide_model_access
+        from hermes_cli.dashboard_governance.model_policy import model_allowed_for_context
 
         ctx = current_governance_context()
         if ctx is None:
             return
-        decision = decide_model_access(ctx.access, provider=agent.provider, model=agent.model)
+        decision = model_allowed_for_context(ctx, provider=agent.provider, model=agent.model)
     except Exception as exc:
         try:
             ctx = current_governance_context()  # type: ignore[name-defined]
-            if ctx is not None and getattr(ctx.access, "mode", "off") == "enforce":
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 raise PermissionError("dashboard governance denied model: governance_model_policy_error") from exc
         except NameError:
             pass

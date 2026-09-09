@@ -259,9 +259,16 @@ def identify_tool(tool_name: str, registry: Any) -> ToolIdentity:
 
 
 def _mcp_tool_allowed(access: EffectiveAccess, identity: ToolIdentity) -> bool:
+    from .models import grant_matches
     grants = access.grants
     server_keys = {identity.mcp_server, identity.toolset}
-    server_allowed = "*" in grants.mcp_servers or any(key and key in grants.mcp_servers for key in server_keys)
+    if any(key and grant_matches(access.deny.mcp_servers, key) for key in server_keys):
+        return False
+    for key in ("*", identity.mcp_server, identity.toolset):
+        denied = access.deny.mcp_tools.get(key, frozenset())
+        if grant_matches(denied, identity.name) or grant_matches(denied, identity.mcp_tool):
+            return False
+    server_allowed = any(key and access.allows("mcp_servers", key) for key in server_keys)
     if not server_allowed:
         return False
     for key in ("*", identity.mcp_server, identity.toolset):
@@ -283,7 +290,16 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
         return AccessDecision(True, "governance_inactive")
     identity = identify_tool(tool_name, registry)
     grants = access.grants
-    if _contains(grants.tools, tool_name):
+    from .models import grant_matches
+    if grant_matches(access.deny.tools, tool_name) or (identity.toolset and grant_matches(access.deny.toolsets, identity.toolset)):
+        return AccessDecision(False, "explicit_deny", detail=tool_name)
+    if (access.access_mode or access.access_level) and (access.access_level or "user") == "user" and tool_name in {"terminal", "execute_code"}:
+        return AccessDecision(False, "access_level_not_allowed", detail=tool_name)
+    if access.host_execution_restricted() and tool_name in {"terminal", "execute_code"}:
+        # A host process can derive paths/environment names internally. Human
+        # and AI review cannot turn string inspection into process isolation.
+        return AccessDecision(False, "host_execution_conflicts_with_resource_deny", detail=tool_name)
+    if access.allows("tools", tool_name):
         if identity.mcp_server and not _mcp_tool_allowed(access, identity):
             return AccessDecision(False, "tool_not_allowed")
         return AccessDecision(True, "tool_allowed")
@@ -291,12 +307,35 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
         if _mcp_tool_allowed(access, identity):
             return AccessDecision(True, "mcp_tool_allowed")
         return AccessDecision(False, "tool_not_allowed")
-    if identity.toolset and _contains(grants.toolsets, identity.toolset):
+    if identity.toolset and access.allows("toolsets", identity.toolset):
         return AccessDecision(True, "toolset_allowed")
     return AccessDecision(False, "tool_not_allowed")
 
 
 def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, registry: Any) -> AccessDecision:
+    from .context import policy_contexts
+    try:
+        contexts = policy_contexts(ctx)
+        first = AccessDecision(True, "governance_inactive")
+        for index, bounded_ctx in enumerate(contexts):
+            if index and bounded_ctx.access.mode == "enforce" and not bounded_ctx.access.is_profile_allowed(bounded_ctx.active_profile):
+                return AccessDecision(False, "profile_not_allowed")
+            if index and bounded_ctx.access.mode == "enforce" and (bounded_ctx.access.access_mode or bounded_ctx.access.access_level) and not bounded_ctx.access.has_permission("chat:use"):
+                return AccessDecision(False, "chat_not_allowed")
+            decision = _tool_allowed_for_single_context(bounded_ctx, tool_name, registry)
+            if not decision.allowed:
+                return decision
+            if index == 0:
+                first = decision
+        return first
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")
+
+
+def _tool_allowed_for_single_context(ctx, tool_name, registry):
+    from .context import workspace_allowed_for_context
+    if not workspace_allowed_for_context(ctx):
+        return AccessDecision(False, "workspace_access_revoked")
     ceiling = getattr(ctx, "bot_access_ceiling", None)
     if ceiling is not None:
         checker = getattr(ctx, "bot_access_check", None)
@@ -473,7 +512,8 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
             seg_base = os.path.basename(seg_argv0) if seg_argv0 else ""
             if not seg_argv0 or seg_argv0 == _CMD_SUBSTITUTION_MARK:
                 continue
-            if seg_argv0 in grants.cli_denied_commands or seg_base in grants.cli_denied_commands:
+            from .models import grant_matches
+            if grant_matches(grants.cli_denied_commands, seg_argv0) or grant_matches(grants.cli_denied_commands, seg_base):
                 return AccessDecision(False, "cli_command_denied", detail=seg_argv0)
     if grants.cli_commands and "*" not in grants.cli_commands:
         try:
@@ -498,6 +538,41 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
     if access is None or access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
     grants = access.grants
+    from .models import grant_matches
+    if tool_name in {"skill_view", "skill_manage"}:
+        dim = "skills_view" if tool_name == "skill_view" else "skills_manage"
+        name = str(args.get("name") or "")
+        if grant_matches(getattr(access.deny, dim), name) or grant_matches(getattr(access.deny, dim), name.rsplit("/", 1)[-1]):
+            return AccessDecision(False, "explicit_deny", detail=name)
+        if tool_name == "skill_view" and (grant_matches(access.deny.skills_load, name) or
+                                          grant_matches(access.deny.skills_load, name.rsplit("/", 1)[-1])):
+            return AccessDecision(False, "explicit_deny", detail=name)
+        if (access.access_mode or access.access_level) and not access.allows(dim, name):
+            return AccessDecision(False, "skill_not_allowed", detail=name)
+    if tool_name in {"read_file", "search_files", "write_file", "patch"}:
+        path = str(args.get("path") or ".")
+        canonical = _resolve_candidate_path(path)
+        dim = "file_read_roots" if tool_name in {"read_file", "search_files"} else "file_write_roots"
+        if (_matches_denied_glob(path, access.deny.file_denied_globs)
+                or _matches_denied_glob(canonical, access.deny.file_denied_globs)
+                or grant_matches(getattr(access.deny, dim), canonical, path=True)):
+            return AccessDecision(False, "explicit_deny", detail=path)
+        if (access.access_mode or access.access_level) and not access.allows(dim, canonical, path=True):
+            return AccessDecision(False, "file_root_not_allowed", detail=path)
+    if tool_name == "terminal" and (access.access_mode or access.access_level):
+        if not grants.cli_commands:
+            return AccessDecision(False, "cli_command_not_allowed")
+        workdir = _resolve_candidate_path(args.get("workdir") or ".")
+        if not access.allows("cli_workdir_roots", workdir, path=True):
+            return AccessDecision(False, "cli_workdir_not_allowed", detail=workdir)
+        if not access.has_permission("terminal:use"):
+            return AccessDecision(False, "terminal_not_allowed")
+        for candidate in _PATHLIKE_RE.findall(str(args.get("command") or "")):
+            canonical = _resolve_candidate_path(candidate)
+            if (grant_matches(access.deny.file_read_roots | access.deny.file_write_roots, canonical, path=True)
+                    or _matches_denied_glob(candidate, access.deny.file_denied_globs)
+                    or _matches_denied_glob(canonical, access.deny.file_denied_globs)):
+                return AccessDecision(False, "explicit_deny", detail=candidate)
     if tool_name == "skill_view":
         if not _skill_name_allowed(grants.skills_view, args.get("name")):
             return AccessDecision(False, "skill_not_allowed", detail=str(args.get("name") or ""))
@@ -532,6 +607,30 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
 
 
 def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
+    from .context import policy_contexts
+    try:
+        contexts = policy_contexts(ctx)
+        first = AccessDecision(True, "governance_inactive")
+        for index, bounded_ctx in enumerate(contexts):
+            decision = _tool_arguments_for_single_context(bounded_ctx, tool_name, args)
+            if not decision.allowed:
+                return decision
+            if index == 0:
+                first = decision
+        return first
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")
+
+
+def _tool_arguments_for_single_context(ctx, tool_name, args):
+    from .context import workspace_allowed_for_context
+    candidate = ""
+    if tool_name in {"read_file", "search_files", "write_file", "patch"}:
+        candidate = _resolve_candidate_path(args.get("path") or ".")
+    elif tool_name == "terminal":
+        candidate = _resolve_candidate_path(args.get("workdir") or getattr(ctx, "workspace_path", "") or ".")
+    if not workspace_allowed_for_context(ctx, candidate):
+        return AccessDecision(False, "workspace_access_revoked")
     ceiling = getattr(ctx, "bot_access_ceiling", None)
     if ceiling is not None:
         checker = getattr(ctx, "bot_access_check", None)

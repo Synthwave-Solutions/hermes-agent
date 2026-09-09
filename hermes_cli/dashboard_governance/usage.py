@@ -154,10 +154,14 @@ def _check_counter_cap(caps: dict[str, Any], counters: dict[str, int], counter: 
 
 
 def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any] | None = None) -> AccessDecision:
-    if ctx is None or ctx.access.mode != "enforce":
+    if ctx is None:
         return AccessDecision(True, "governance_inactive")
-    caps = dict(ctx.access.grants.usage_caps or {})
-    if not caps:
+    from .context import policy_contexts
+    try:
+        cap_sets = [dict(bound.access.grants.usage_caps or {}) for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")
+    if not any(cap_sets):
         return AccessDecision(True, "usage_caps_inactive")
 
     with _UsageFileLock(_usage_lock_file()):
@@ -166,9 +170,10 @@ def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str, arg
         for period, prefix in (("days", "daily"), ("months", "monthly")):
             counters = _counter_bucket(state, ctx, period)
             for counter in counter_names:
-                decision = _check_counter_cap(caps, counters, counter, prefix)
-                if decision is not None:
-                    return decision
+                for caps in cap_sets:
+                    decision = _check_counter_cap(caps, counters, counter, prefix)
+                    if decision is not None:
+                        return decision
         for period in ("days", "months"):
             counters = _counter_bucket(state, ctx, period)
             for counter in counter_names:
@@ -178,9 +183,10 @@ def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str, arg
 
 
 def record_tool_usage(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any] | None = None) -> None:
-    if ctx is None or ctx.access.mode != "enforce":
+    if ctx is None:
         return
-    if not dict(ctx.access.grants.usage_caps or {}):
+    from .context import policy_contexts
+    if not any(bound.access.mode == "enforce" and bound.access.grants.usage_caps for bound in policy_contexts(ctx)):
         return
     with _UsageFileLock(_usage_lock_file()):
         state = _load_state(_usage_file())

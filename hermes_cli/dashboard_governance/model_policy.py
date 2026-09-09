@@ -32,9 +32,9 @@ def decide_model_access(
     model_name = _norm(model)
     if not provider_name:
         return AccessDecision(False, "model_provider_required")
-    if not _allowed_by(grants.model_providers, provider_name):
+    if not access.allows("model_providers", provider_name):
         return AccessDecision(False, "model_provider_not_allowed")
-    if model_name and not _allowed_by(grants.models, model_name):
+    if model_name and not access.allows("models", model_name):
         return AccessDecision(False, "model_not_allowed")
     if not model_name and "*" not in grants.models:
         return AccessDecision(False, "model_required")
@@ -54,12 +54,12 @@ def filter_model_options_payload(payload: dict[str, Any], access: EffectiveAcces
         if not isinstance(provider_row, dict):
             continue
         slug = _norm_provider(provider_row.get("slug") or provider_row.get("provider"))
-        if not slug or not _allowed_by(access.grants.model_providers, slug):
+        if not slug or not access.allows("model_providers", slug):
             continue
         row = deepcopy(provider_row)
         models = row.get("models")
-        if isinstance(models, list) and "*" not in access.grants.models:
-            row["models"] = [model for model in models if _allowed_by(access.grants.models, _norm(model))]
+        if isinstance(models, list):
+            row["models"] = [model for model in models if access.allows("models", _norm(model))]
             if not row["models"]:
                 continue
         filtered_providers.append(row)
@@ -67,3 +67,24 @@ def filter_model_options_payload(payload: dict[str, Any], access: EffectiveAcces
     filtered = dict(payload)
     filtered["providers"] = filtered_providers
     return filtered
+
+
+def model_allowed_for_context(ctx, *, provider: str, model: str) -> AccessDecision:
+    from .context import policy_contexts, workspace_allowed_for_context
+    try:
+        for bounded in policy_contexts(ctx):
+            if not workspace_allowed_for_context(bounded):
+                return AccessDecision(False, "workspace_access_revoked")
+            if bounded.bot_access_ceiling is not None:
+                check = bounded.bot_access_check
+                try:
+                    if not callable(check) or check() is not True:
+                        return AccessDecision(False, "bot_access_revoked")
+                except Exception:
+                    return AccessDecision(False, "bot_access_revoked")
+            decision = decide_model_access(bounded.access, provider=provider, model=model)
+            if not decision.allowed:
+                return decision
+        return AccessDecision(True, "allowed")
+    except Exception:
+        return AccessDecision(False, "continuation_policy_unavailable")

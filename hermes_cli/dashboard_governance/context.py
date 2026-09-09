@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 from .models import EffectiveAccess, GovernanceSubject, GrantSet
@@ -29,6 +30,11 @@ class DashboardGovernanceContext:
     approval_policy_path: str = ""
     project_workspace: str = ""
     project_access_check: Any = None
+    workspace_path: str = ""
+    workspace_access_check: Any = None
+    # Original full policy envelopes retained by a trusted server continuation.
+    # These are additional ceilings, never substitutes for current access.
+    continuation_contexts: tuple[str, ...] = ()
 
     def cache_fingerprint(self) -> tuple:
         """Stable cache key component for schema filtering.
@@ -40,11 +46,16 @@ class DashboardGovernanceContext:
         grants = self.access.grants
         return (
             self.access.mode,
+            self.access.subject.normalized_email,
+            json.dumps(_serialize_grants(self.access.deny), sort_keys=True),
+            json.dumps(_serialize_grants(self.access.role_ceiling), sort_keys=True) if self.access.role_ceiling else "",
             json.dumps(_serialize_grants(self.bot_access_ceiling.grants), sort_keys=True) if self.bot_access_ceiling else "",
             tuple(sorted(grants.tools)),
             tuple(sorted(grants.toolsets)),
             tuple(sorted(grants.mcp_servers)),
             tuple(sorted((server, tuple(sorted(names))) for server, names in grants.mcp_tools.items())),
+            tuple(hashlib.sha256(value.encode()).hexdigest() for value in self.continuation_contexts),
+            self.workspace_path,
         )
 
 
@@ -146,22 +157,42 @@ def serialize_context_for_env(ctx: DashboardGovernanceContext) -> str:
             "routes": _list(access.routes),
             "grant_sources": list(access.grant_sources),
             "grants": _serialize_grants(access.grants),
+            "policy_controls_version": 1,
+            "deny": _serialize_grants(access.deny),
+            "role_ceiling": _serialize_grants(access.role_ceiling) if access.role_ceiling is not None else None,
+            "access_level": access.access_level,
+            "access_mode": access.access_mode,
+            "approval_mode": access.approval_mode,
+            "approval_prompt": access.approval_prompt,
+            "approval_configured": access.approval_configured,
         },
         "bot_access_ceiling": _serialize_grants(ctx.bot_access_ceiling.grants) if getattr(ctx, "bot_access_ceiling", None) else None,
         "active_profile": ctx.active_profile,
         "session_id": ctx.session_id,
         "request_id": ctx.request_id,
+        "approval_policy_path": getattr(ctx, "approval_policy_path", ""),
         "user_message_sha256": getattr(ctx, "user_message_sha256", ""),
+        "project_workspace": getattr(ctx, "project_workspace", ""),
+        "workspace_path": getattr(ctx, "workspace_path", ""),
+        "continuation_contexts": list(getattr(ctx, "continuation_contexts", ())),
     }
+    if getattr(ctx, "bot_access_ceiling", None) is not None:
+        payload["bot_access_ceiling_context"] = serialize_context_for_env(DashboardGovernanceContext(
+            subject=ctx.bot_access_ceiling.subject, access=ctx.bot_access_ceiling))
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
+    if not isinstance(payload, str) or len(payload) > 1024 * 1024:
+        return None
     try:
         data = json.loads(payload)
     except (TypeError, ValueError):
         return None
     if not isinstance(data, dict):
+        return None
+    retained = data.get("continuation_contexts", [])
+    if not isinstance(retained, list) or len(retained) > 16 or any(not isinstance(value, str) for value in retained):
         return None
     subject_raw = data.get("subject")
     access_raw = data.get("access")
@@ -187,6 +218,13 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         profiles=_set(access_data.get("profiles")),
         routes=_set(access_data.get("routes")),
         grants=_deserialize_grants(grants_raw if isinstance(grants_raw, dict) else {}),
+        deny=_deserialize_grants(access_data.get("deny") or {}),
+        role_ceiling=_deserialize_grants(access_data["role_ceiling"]) if isinstance(access_data.get("role_ceiling"), dict) else None,
+        access_level=str(access_data.get("access_level") or ""),
+        access_mode=str(access_data.get("access_mode") or ""),
+        approval_mode=str(access_data.get("approval_mode") or "manual"),
+        approval_prompt=str(access_data.get("approval_prompt") or ""),
+        approval_configured=access_data.get("approval_configured") is True,
         grant_sources=tuple(str(item) for item in (access_data.get("grant_sources") or ()) if str(item)),
     )
     ceiling_raw = data.get("bot_access_ceiling")
@@ -199,6 +237,11 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
                                   permissions=frozenset({"*"}),
                                   profiles=frozenset({str(data.get("active_profile") or "default")}),
                                   grants=_deserialize_grants(ceiling_raw))
+    if data.get("bot_access_ceiling_context") is not None:
+        full_ceiling = context_from_env_payload(data["bot_access_ceiling_context"])
+        if full_ceiling is None:
+            return None
+        ceiling = full_ceiling.access
     return DashboardGovernanceContext(
         subject=subject,
         bot_access_ceiling=ceiling,
@@ -206,8 +249,70 @@ def context_from_env_payload(payload: str) -> DashboardGovernanceContext | None:
         active_profile=str(data.get("active_profile") or "default"),
         session_id=str(data.get("session_id") or ""),
         request_id=str(data.get("request_id") or ""),
+        approval_policy_path=str(data.get("approval_policy_path") or ""),
         user_message_sha256=str(data.get("user_message_sha256") or ""),
+        project_workspace=str(data.get("project_workspace") or ""),
+        workspace_path=str(data.get("workspace_path") or ""),
+        continuation_contexts=tuple(retained),
     )
+
+
+def policy_contexts(ctx: DashboardGovernanceContext | None) -> tuple[DashboardGovernanceContext, ...]:
+    """Current envelope plus bounded, validated original continuation ceilings.
+
+    Serialized snapshots cannot restore callbacks. Current live membership
+    checks are reused only for the same principal/profile/project workspace;
+    the original grants/denies remain intact and cannot add authorization.
+    """
+    if ctx is None:
+        return ()
+    result = [replace(ctx, continuation_contexts=())]
+    pending = [(payload, 1) for payload in ctx.continuation_contexts]
+    seen = set()
+    while pending:
+        payload, depth = pending.pop()
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        if digest in seen:
+            continue
+        if depth > 8 or len(seen) >= 16:
+            raise ValueError("continuation_policy_limit")
+        seen.add(digest)
+        original = context_from_env_payload(payload)
+        if original is None:
+            raise ValueError("continuation_policy_invalid")
+        if (original.subject.normalized_email != ctx.subject.normalized_email
+                or original.active_profile != ctx.active_profile
+                or (original.subject.org_id and original.subject.org_id != ctx.subject.org_id)
+                or (original.workspace_path and original.workspace_path != ctx.workspace_path)
+                or (original.project_workspace and original.project_workspace != ctx.project_workspace)):
+            raise ValueError("continuation_principal_mismatch")
+        pending.extend((child, depth + 1) for child in original.continuation_contexts)
+        if (original.access.mode == "enforce" or original.workspace_path
+                or original.bot_access_ceiling is not None or original.project_workspace):
+            result.append(replace(original, continuation_contexts=(),
+                                  bot_access_check=ctx.bot_access_check,
+                                  workspace_access_check=ctx.workspace_access_check,
+                                  project_access_check=ctx.project_access_check))
+    return tuple(result)
+
+
+def workspace_allowed_for_context(ctx, candidate_path: str = "") -> bool:
+    """Live application membership is a ceiling even with governance disabled.
+
+    A serialized path without a trusted host callback cannot authorize a child.
+    Candidate paths are checked independently: ordinary sessions may still use
+    any otherwise granted root, provided that root's owner permits the actor.
+    """
+    root = getattr(ctx, "workspace_path", "")
+    check = getattr(ctx, "workspace_access_check", None)
+    if not root and check is None:
+        return True
+    if not callable(check):
+        return False
+    try:
+        return all(check(path) is True for path in dict.fromkeys((root, candidate_path)) if path)
+    except Exception:
+        return False
 
 
 def _context_from_env() -> DashboardGovernanceContext | None:

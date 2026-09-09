@@ -5370,6 +5370,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    allow_pending: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5380,6 +5381,11 @@ def complete_task(
     :func:`request_review` — even when it has no active run
     (``current_run_id IS NULL``), the handoff fields are preserved via
     :func:`_synthesize_ended_run`.
+
+    An explicit human completion surface may set ``allow_pending`` to accept
+    ``todo`` and ``triage`` without first queuing a worker. Dependency checks
+    still apply. This opt-in never broadens run-fenced worker completion:
+    when ``expected_run_id`` is supplied, only the original states qualify.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -5463,9 +5469,10 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND (status IN ('running', 'ready', 'blocked', 'review')
+                        OR (? AND status IN ('triage', 'todo')))
                 """,
-                (result, now, task_id),
+                (result, now, task_id, bool(allow_pending)),
             )
         else:
             cur = conn.execute(
@@ -6261,8 +6268,13 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    allow_todo: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    An explicit human surface may opt into blocking ``todo`` with
+    ``allow_todo``. This does not broaden run-fenced worker transitions or
+    dependency-kind routing; unblock still rechecks unfinished parents.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6294,6 +6306,7 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    manual_todo = bool(allow_todo and expected_run_id is None)
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6304,7 +6317,7 @@ def block_task(
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
-            else "ready"
+            else "todo" if manual_todo and cur_row["status"] == "todo" else "ready"
         )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -6366,7 +6379,7 @@ def block_task(
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
+        # normally fires from running/ready (after an unblock returned the task to
         # the work pool), so a stored block_kind that matches the incoming kind
         # means: blocked → unblocked → about-to-re-block for the same cause.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
@@ -6386,10 +6399,10 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND (status IN ('running', 'ready') OR (? AND status = 'todo'))
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, task_id, manual_todo) if expected_run_id is None
+                else (kind, recurrences, task_id, False, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6425,9 +6438,9 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND (status IN ('running', 'ready') OR (? AND status = 'todo'))
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, task_id, manual_todo),
                 )
             else:
                 cur = conn.execute(

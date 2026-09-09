@@ -4165,6 +4165,38 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
+def request_governance_action_approval(tool_name, display_target, reason, operation_id):
+    """One governed invocation, with no yolo/session/permanent shortcuts."""
+    session_key = get_current_session_key()
+    from hermes_cli.dashboard_governance.context import current_governance_context
+    governance = current_governance_context()
+    # A delegated child has its own session id but its human review interface
+    # belongs to the authenticated parent run captured in the trusted context.
+    if governance is not None and governance.session_id:
+        session_key = governance.session_id
+    with _lock:
+        notify = _gateway_notify_cbs.get(session_key)
+    data = {"command": display_target, "description": reason,
+            "pattern_key": f"governance_action:{operation_id}",
+            "pattern_keys": [f"governance_action:{operation_id}"],
+            "allow_permanent": False, "allow_session": False,
+            "governance_action": True, "tool": tool_name}
+    if notify is not None:
+        decision = _await_gateway_decision(session_key, notify, data, surface="gateway")
+        if decision.get("resolved") and decision.get("choice") == "once":
+            return {"approved": True, "message": "Approved for this action by the user."}
+        return {"approved": False, "message": str(decision.get("reason") or "Manual approval was denied or did not complete.")}
+    callback = _resolve_cli_approval_callback()
+    if callable(callback):
+        from agent.delegation_context import is_delegated_child_process_context
+        if is_delegated_child_process_context():
+            return {"approved": False, "message": "Delegated manual approval requires the connected parent review interface."}
+        choice = prompt_dangerous_approval(display_target, reason, approval_callback=callback,
+                                          allow_permanent=False, allow_session=False)
+        return {"approved": choice == "once", "message": "Manual approval " + ("accepted." if choice == "once" else "denied or unavailable.")}
+    return {"approved": False, "message": "Manual approval requires a connected approval interface."}
+
+
 def request_tool_approval(
     tool_name: str,
     reason: str,
