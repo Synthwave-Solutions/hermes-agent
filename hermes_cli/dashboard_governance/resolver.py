@@ -139,6 +139,9 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
             grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
         else:
             sources.append(f"user:{email}")
+        # Approval selectors restrict existing command access; unlike grants,
+        # they must survive blacklist mode's role-only resource envelope.
+        grants = replace(grants, cli_approval_commands=grants.cli_approval_commands | user.grants.cli_approval_commands)
     if user and not user.deny.is_empty() and email not in policy.bootstrap_admins:
         # Per-user off-toggles subtract AFTER the full union so they win from
         # any role/group grant. Bootstrap admins are exempt (never-deny

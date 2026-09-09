@@ -71,6 +71,7 @@ grants:
     denied_globs: ["**/.env", "**/*secret*"]
   cli:
     commands: [git, python, npm]
+    approval_commands: [git]
     workdir_roots: [/home/user/work]
   usage_caps:
     daily_tool_calls: 500
@@ -85,10 +86,13 @@ grants:
 - Unknown `/api/*` routes are denied in governance-enabled modes until classified in the backend route catalog.
 - Backend authorization is authoritative; frontend filtering is UX only.
 - Report-only audit redacts secret-like fields and stores subject hashes, not raw emails.
-- MCP tools require both server and tool grants. Granting `mcp-<server>` as a toolset alone does not allow calls.
+- MCP tools require both server and tool grants. Granting `mcp-<server>` as a toolset alone does not allow calls. Tool lists accept local names (such as `list_issues`) or the complete registered name (`mcp__github__list_issues`). Local-name denies also block native registered names, including when a server name is sanitized for registration.
 - `skill_view` and `skill_manage` require name-specific skill grants.
 - File roots are checked after path normalization; denied globs apply before root allowlists.
-- Terminal command allowlists check `argv0` and reject shell operators such as `&&`, `;`, pipes, redirects, command substitution and process substitution.
+- Terminal command permissions check each parsed executable (`argv0` or its basename), including command chains, newlines and nested `$(...)` substitutions. Backticks and process substitutions remain blocked.
+- `cli.approval_commands` requires one-shot **manual** approval for matching terminal invocations, even when the person's general approval mode is automatic or omitted. Matching uses the same executable parser as command permissions and accepts wildcard selectors. Hard denies and missing permissions are checked first; human approval cannot override them. The authoritative policy is read again after the decision, and a changed policy cancels that invocation. Nonmatching commands keep their existing per-user approval behavior.
+- Compound shell syntax (conditions, loops, functions and command grouping) exceeds this parser's command-by-command verification. It is denied when a command deny or finite command allowlist applies. With an otherwise unrestricted command envelope and configured approval selectors, it requires manual review. Comments, quoted heredoc examples and line breaks cannot hide subsequent commands; actual heredoc payloads retain their expansion rules.
+- Command selectors govern parsed executable names, not arbitrary code inside a permitted interpreter or a separate executable. They are not an operating-system sandbox. Grant powerful interpreters only within the intended host privilege envelope; use a broad `approval_commands: ['*']` floor when every terminal invocation needs a human. Async continuations retain their original hard permission ceilings while using the current policy's approval rules.
 
 ## Dashboard UX
 

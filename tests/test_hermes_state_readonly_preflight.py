@@ -155,6 +155,30 @@ class TestSkips:
         preflight_db_writability(db)
         assert stat.S_IMODE(db.stat().st_mode) == before
 
+    @pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+    @pytest.mark.parametrize("inside_home", [True, False])
+    def test_sidecar_checkpointed_after_discovery_is_not_readonly(
+        self, hermes_home, tmp_path, monkeypatch, suffix, inside_home
+    ):
+        db = (hermes_home if inside_home else tmp_path) / "checkpoint.db"
+        _make_db(db)
+        sidecar = db.with_name(db.name + suffix)
+        sidecar.write_bytes(b"synthetic sidecar")
+        real_access = os.access
+        removed = []
+
+        def checkpoint_before_access(path, mode, **kwargs):
+            if Path(path) == sidecar and not removed:
+                sidecar.unlink()
+                removed.append(True)
+            return real_access(path, mode, **kwargs)
+
+        monkeypatch.setattr(os, "access", checkpoint_before_access)
+        preflight_db_writability(db)
+        assert removed and not sidecar.exists()
+        with sqlite3.connect(db) as connection:
+            assert connection.execute("SELECT x FROM t").fetchall() == [(1,)]
+
 
 class TestSessionDBIntegration:
     def test_sessiondb_selfheals_readonly_db_in_home(self, hermes_home):

@@ -107,7 +107,8 @@ def authorize_tool_action(ctx, tool_name, args, registry):
     if ctx is None or (ctx.access.mode != "enforce" and not ctx.continuation_contexts):
         return None
     access = ctx.access
-    managed = bool(access.access_mode or access.access_level or access.approval_configured)
+    managed = bool(access.access_mode or access.access_level or access.approval_configured
+                   or access.grants.cli_approval_commands)
     if not managed and not ctx.approval_policy_path and not ctx.continuation_contexts:
         return None
     operation_id = uuid.uuid4().hex
@@ -120,7 +121,10 @@ def authorize_tool_action(ctx, tool_name, args, registry):
             return {"approved": False, "source": "policy", "reason": denied}
         access = fresh.access
         from .context import bind_governance_context
-        if not access.approval_configured:
+        from .tool_policy import cli_command_requires_manual_approval
+        command_review = tool_name == "terminal" and cli_command_requires_manual_approval(
+            access, str(args.get("command") or ""))
+        if not access.approval_configured and not command_review:
             bind_governance_context(fresh)
             return None
         from agent.redact import redact_sensitive_text
@@ -129,8 +133,9 @@ def authorize_tool_action(ctx, tool_name, args, registry):
         # Never decide against truncated arguments: the omitted part could
         # change what executes. Oversize actions get human review instead.
         verdict = None
-        fallback = "Manual approval is configured for this user."
-        if access.approval_mode == "automatic":
+        fallback = ("This command requires manual approval under the current CLI policy."
+                    if command_review else "Manual approval is configured for this user.")
+        if access.approval_mode == "automatic" and not command_review:
             if len(serialized) <= 12000 and tool_name not in {"execute_code"}:
                 try:
                     verdict = _ask_model(access, json.loads(serialized))

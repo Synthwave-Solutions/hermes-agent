@@ -113,6 +113,37 @@ _HEREDOC_OPEN_RE = re.compile(
 )
 
 
+def _heredoc_openers(line: str, quote: str) -> tuple[list[Any], str]:
+    """Locate real redirection headers, not quoted or commented examples."""
+    matches = []
+    index = 0
+    word_start = True
+    while index < len(line):
+        char = line[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            word_start = False
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+            word_start = False
+        elif char == "#" and word_start:
+            break
+        else:
+            match = _HEREDOC_OPEN_RE.match(line, index)
+            if match:
+                matches.append(match)
+                index = match.end()
+                word_start = False
+                continue
+            word_start = char.isspace() or char in ";|&()<>"
+        index += 1
+    return matches, quote
+
+
 def _strip_heredocs(command: str) -> tuple[str, list[str]]:
     """Remove heredoc bodies before segmentation, returning the remaining
     command plus the bodies the shell would still expand.
@@ -137,14 +168,18 @@ def _strip_heredocs(command: str) -> tuple[str, list[str]]:
     kept: list[str] = []
     expanded: list[str] = []
     index = 0
+    quote = ""
     while index < len(lines):
         line = lines[index]
         index += 1
+        matches, quote = _heredoc_openers(line, quote)
         openers = [
             (match.group(3) or match.group(4), match.group(2) is None, match.group(1) == "-")
-            for match in _HEREDOC_OPEN_RE.finditer(line)
+            for match in matches
         ]
-        kept.append(_HEREDOC_OPEN_RE.sub(" ", line) if openers else line)
+        for match in reversed(matches):
+            line = line[:match.start()] + " " + line[match.end():]
+        kept.append(line)
         for delimiter, expands, strip_tabs in openers:
             body: list[str] = []
             while index < len(lines):
@@ -164,8 +199,8 @@ def _strip_heredocs(command: str) -> tuple[str, list[str]]:
 _SHELL_BUILTINS = frozenset({
     "export", "cd", "set", "unset", "true", "false", "test", "[", "[[", "pwd",
     "wait", "exit", "read", "umask", "ulimit", "echo", "printf",
-    # Shell keywords/control flow: no execution surface of their own; the
-    # commands inside the construct are still segment-checked individually.
+    # Compound syntax is recognized separately and refused when command
+    # constraints apply; these names never grant its nested executables.
     "for", "while", "until", "do", "done", "if", "then", "else", "elif", "fi",
     "case", "esac", "select", "in", "time", "{", "}", "!", "break", "continue",
     "return", "local", "declare", "shift",
@@ -175,14 +210,53 @@ _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _REDIRECT_TOKEN_RE = re.compile(r"^\d*(>>|>|<|>&|<&|&>>|&>)\d*$")
 
 
+def _strip_shell_comments(command: str) -> str:
+    """Remove shell comments without losing the newline command boundary.
+
+    shlex's built-in comment handling consumes that newline, merging the
+    next executable into the previous command's arguments. Quoted/escaped
+    hashes and hashes inside a word are ordinary data and must survive.
+    """
+    out = []
+    quote = ""
+    word_start = True
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'" and index + 1 < len(command):
+            out.append(command[index:index + 2])
+            if command[index + 1] != "\n":
+                word_start = False
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+            word_start = False
+        elif char == "#" and word_start:
+            index = command.find("\n", index)
+            if index < 0:
+                break
+            continue
+        else:
+            word_start = char.isspace() or char in ";|&()<>"
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _split_shell_segments(command: str) -> list[list[str]]:
     """Split a shell command on ;, &&, ||, |, & and newlines into token lists,
     respecting quoting. Raises ValueError on unparseable input."""
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";|&")
+    lex = shlex.shlex(_strip_shell_comments(command), posix=True, punctuation_chars=";|&\n")
+    lex.commenters = ""
+    lex.whitespace = " \t\r"
     lex.whitespace_split = True
     segments: list[list[str]] = [[]]
     for token in lex:
-        if token in {";", "|", "||", "&&", "&", ";;", "|&"}:
+        if token and all(char in ";|&\n" for char in token):
             if segments[-1]:
                 segments.append([])
             continue
@@ -194,6 +268,10 @@ def _split_shell_segments(command: str) -> list[list[str]]:
 # own. Without this, `command gchat --as someone-else` read as a call to
 # `command` and slipped past both the allowlist and the identity binding.
 _COMMAND_WRAPPERS = frozenset({"command", "builtin", "exec", "nohup", "time"})
+_SHELL_CONTROL_HEADS = frozenset({
+    "for", "while", "until", "do", "done", "if", "then", "else", "elif", "fi",
+    "case", "esac", "select", "in", "function", "coproc", "{", "}", "!",
+})
 
 
 def _segment_argv0(tokens: list[str]) -> str:
@@ -251,9 +329,14 @@ def identify_tool(tool_name: str, registry: Any) -> ToolIdentity:
     if toolset.startswith("mcp-"):
         server = toolset[4:]
         local = tool_name
-        prefix = f"mcp_{server}_"
-        if tool_name.startswith(prefix):
-            local = tool_name[len(prefix):]
+        # Native registration uses mcp__<sanitized server>__<tool>. Keep
+        # legacy names readable too, but derive the server from the trusted
+        # registry toolset rather than guessing at underscore boundaries.
+        safe_server = re.sub(r"[^A-Za-z0-9_]", "_", server)
+        for prefix in (f"mcp__{safe_server}__", f"mcp_{server}_", f"mcp_{safe_server}_"):
+            if tool_name.startswith(prefix):
+                local = tool_name[len(prefix):]
+                break
         return ToolIdentity(name=tool_name, toolset=toolset, mcp_server=server, mcp_tool=local)
     return ToolIdentity(name=tool_name, toolset=toolset)
 
@@ -484,6 +567,19 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
     denied_path = _check_denied_paths(command_s, grants)
     if not denied_path.allowed:
         return denied_path
+    if grants.cli_denied_commands or (grants.cli_commands and "*" not in grants.cli_commands):
+        # shlex identifies ordinary command chains; it is not a shell AST.
+        # A compound head can hide a second executable in the same segment.
+        # With hard command constraints, unknown structure must remain denied.
+        # The review-only caller uses this same result to require a human.
+        try:
+            segments = _split_shell_segments(command_s)
+        except ValueError:
+            return AccessDecision(False, "cli_shell_operator_not_allowed")
+        for tokens in segments:
+            head = _segment_argv0(tokens)
+            if head in _SHELL_CONTROL_HEADS or any(char in head for char in "(){}"):
+                return AccessDecision(False, "cli_compound_command_not_allowed")
     if dwd_identity is not _DWD_UNRESTRICTED:
         tamper = _check_identity_env_tamper(command_s)
         if not tamper.allowed:
@@ -532,6 +628,21 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
             if seg_argv0 not in grants.cli_commands and seg_base not in grants.cli_commands:
                 return AccessDecision(False, "cli_command_not_allowed", detail=seg_argv0)
     return AccessDecision(True, "arguments_allowed")
+
+
+def cli_command_requires_manual_approval(access: EffectiveAccess, command: str) -> bool:
+    """Use the command permission parser for the current policy's review floor.
+
+    This is a review requirement, never a permission grant. Any matching
+    executable (including a nested substitution) or unsupported parse needs
+    a human; the caller must still perform the full hard checks first.
+    """
+    from .models import GrantSet
+    required = access.grants.cli_approval_commands
+    if not required or "bootstrap_admin" in access.grant_sources:
+        return False
+    review_selectors = GrantSet(cli_denied_commands=required)
+    return not _check_cli_command(command, review_selectors).allowed
 
 
 def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
