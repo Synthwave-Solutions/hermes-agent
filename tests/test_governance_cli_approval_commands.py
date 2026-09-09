@@ -110,6 +110,58 @@ def test_manual_deny_prevents_real_effect_and_consumes_only_one_request(runtime,
     assert not approval.list_gateway_approvals("cli-test")
 
 
+def test_comment_cannot_hide_next_command_from_manual_review(runtime):
+    shown = respond_manually(runtime)
+    assert runtime.run("printf ok # comment\ntouch effect.txt")["exit_code"] == 0
+    assert len(shown) == 1 and runtime.effect.exists()
+
+
+def test_commented_heredoc_opener_cannot_hide_real_executable(runtime):
+    shown = respond_manually(runtime)
+    assert runtime.run("printf ok # <<EOF\ntouch effect.txt\n# EOF")["exit_code"] == 0
+    assert len(shown) == 1 and runtime.effect.exists()
+
+
+def test_quoted_heredoc_example_cannot_hide_real_executable(runtime):
+    shown = respond_manually(runtime)
+    assert runtime.run('printf "<<EOF "\ntouch effect.txt\n# EOF')["exit_code"] == 0
+    assert len(shown) == 1 and runtime.effect.exists()
+
+
+@pytest.mark.parametrize("command", [
+    "if touch effect.txt; then printf ok; fi",
+    "! touch effect.txt",
+    "while touch effect.txt; do break; done",
+    "(touch effect.txt)",
+])
+def test_compound_command_with_review_rule_parks_before_real_effect(runtime, monkeypatch, command):
+    runtime.user["approval"] = {"mode": "automatic", "prompt": "Allow terminal work."}
+    runtime.write()
+    monkeypatch.setattr(review, "_ask_model", lambda *args: pytest.fail("unsupported compound cannot be AI approved"))
+    shown = respond_manually(runtime)
+    assert "error" not in runtime.run(command)
+    assert len(shown) == 1 and runtime.effect.exists()
+
+
+@pytest.mark.parametrize("constraint", ["deny", "finite_allow"])
+@pytest.mark.parametrize("command", [
+    "if touch effect.txt; then printf ok; fi",
+    "! touch effect.txt",
+    "while touch effect.txt; do break; done",
+    "f() { touch effect.txt; }; f",
+    "(touch effect.txt)",
+])
+def test_compound_command_cannot_override_hard_command_constraints(runtime, constraint, command):
+    if constraint == "deny":
+        runtime.user["deny"] = {"cli": {"commands": ["touch"]}}
+    else:
+        runtime.role["cli"]["commands"] = ["touch", "printf"]
+    runtime.write()
+    shown = respond_manually(runtime)
+    assert "cli_compound_command_not_allowed" in runtime.run(command)["error"]
+    assert not shown and not runtime.dispatched and not runtime.effect.exists()
+
+
 def test_deny_section_cannot_turn_off_required_review(runtime):
     runtime.user["deny"] = {"cli": {"approval_commands": ["touch", "*"]}}
     runtime.write()
@@ -212,9 +264,18 @@ def test_continuation_uses_current_review_mode_without_replaying_historical_manu
 @pytest.mark.parametrize("command,required", [
     ("touch file", True), ("/usr/bin/touch file", True), ("printf touch", False),
     ("printf ok; touch file", True), ("printf ok\ntouch file", True),
+    ("printf ok # comment\ntouch file", True),
+    ("printf ok # <<EOF\ntouch file\nEOF", True),
+    ('printf "<<EOF "\ntouch file\nEOF', True),
+    ('printf "example\n<<EOF "\ntouch file\nEOF', True),
+    ("printf '# touch file'", False), ("printf \"# touch file\"", False),
+    ("printf x#word\ntouch file", True), ("printf \\#literal\ntouch file", True),
+    ("printf ok # touch file", False),
     ("printf '%s' $(touch file)", True), ("printf '%s' $(printf '%s' $(touch file))", True),
     ("env X=ok command touch file", True),
     ("cat <<EOF\n$(touch file)\nEOF", True), ("cat <<'EOF'\ntouch file\nEOF", False),
+    ("cat <<EOF\n# $(touch file)\nEOF", True),
+    ("cat <<'EOF'\n# $(touch file)\nEOF", False),
     ("printf 'unterminated", True),
 ])
 def test_review_selectors_share_permission_parser(command, required):
@@ -223,7 +284,8 @@ def test_review_selectors_share_permission_parser(command, required):
     assert cli_command_requires_manual_approval(access, command) is required
 
 
-def test_newline_cannot_hide_denied_second_command():
+@pytest.mark.parametrize("command", ["printf ok\ntouch file", "printf ok # comment\ntouch file", "printf ok # <<EOF\ntouch file\nEOF"])
+def test_newline_cannot_hide_denied_second_command(command):
     access = EffectiveAccess(subject=GovernanceSubject(email="test@example.test"), mode="enforce",
                              grants=GrantSet(cli_commands=frozenset({"*"}), cli_denied_commands=frozenset({"touch"})))
-    assert not decide_tool_argument_access(access, "terminal", {"command": "printf ok\ntouch file"}).allowed
+    assert not decide_tool_argument_access(access, "terminal", {"command": command}).allowed
