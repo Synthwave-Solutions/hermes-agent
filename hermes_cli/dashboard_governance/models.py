@@ -377,6 +377,18 @@ class EffectiveAccess:
             self.deny.file_read_roots or self.deny.file_write_roots or self.deny.file_denied_globs or self.deny.env_vars))
 
     def allows(self, dimension: str, value: str, *, path: bool = False) -> bool:
+        # Operational default-allow does not turn a non-admin into a policy
+        # administrator. Apply level limits to concrete permissions at use
+        # time, including capabilities introduced after the route catalog.
+        if self.access_mode == "blacklist" and "bootstrap_admin" not in self.grant_sources and dimension == "permissions":
+            level = self.access_level or "user"
+            if level != "admin" and value.startswith("governance:"):
+                return False
+            if level == "user" and (value.endswith(":admin") or value in {
+                "terminal:use", "config:write", "system:write", "system:ops", "gateway:restart",
+                "model:write", "mcp:write", "plugins:write",
+            }):
+                return False
         if self.host_execution_restricted() and (
             (dimension == "permissions" and (value == "terminal:use" or value.startswith("git:")))
             or (dimension == "tools" and value in {"terminal", "execute_code"})
@@ -388,6 +400,25 @@ class EffectiveAccess:
             return False
         values = getattr(self, dimension) if dimension in {"permissions", "profiles", "routes"} else getattr(self.grants, dimension)
         return grant_matches(values, value, path=path)
+
+    def configuration_denies_file(self, *paths: str) -> bool:
+        """A technical-data exception cannot reopen a specific sensitive deny.
+
+        Blacklist exceptions may cross the generic Hermes storage boundary;
+        credentials/financial paths retain their configured explicit denial.
+        Callers provide resolved and raw paths so aliases cannot hide a deny.
+        Legacy/whitelist exception behavior is intentionally unchanged.
+        """
+        values = {str(p) for p in paths if p}
+        values.update(p.rsplit("/", 1)[-1] for p in tuple(values))
+        denied = {pattern for pattern in self.grants.file_denied_globs
+                  if any(grant_matches({pattern}, value) for value in values)}
+        if not denied:
+            return False
+        exception = any(grant_matches(self.grants.file_allow_globs, value) for value in values)
+        if not exception:
+            return True
+        return self.access_mode == "blacklist" and bool(denied - {"**/.hermes/**"})
 
     def _allowed_by_set(self, values: frozenset[str], value: str) -> bool:
         return "*" in values or value in values

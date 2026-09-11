@@ -49,7 +49,7 @@ def parse_verdict(text):
 def _ask_model(access, request):
     from agent.auxiliary_client import call_llm
     response = call_llm(
-        task="approval_advice",
+        task="approval",
         messages=[{"role": "system", "content": _SYSTEM},
                   {"role": "user", "content": json.dumps({"administrator_rules": access.approval_prompt,
                                                             "request": request}, ensure_ascii=False)}],

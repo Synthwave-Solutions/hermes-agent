@@ -156,6 +156,9 @@ def test_compound_command_cannot_override_hard_command_constraints(runtime, cons
         runtime.user["deny"] = {"cli": {"commands": ["touch"]}}
     else:
         runtime.role["cli"]["commands"] = ["touch", "printf"]
+        runtime.user["access_mode"] = "whitelist"
+        runtime.user["grants"] = deepcopy(runtime.role)
+        runtime.user["grants"]["cli"]["approval_commands"] = ["touch"]
     runtime.write()
     shown = respond_manually(runtime)
     assert "cli_compound_command_not_allowed" in runtime.run(command)["error"]
@@ -172,6 +175,9 @@ def test_deny_section_cannot_turn_off_required_review(runtime):
 
 def test_approval_selector_never_grants_missing_command_permission(runtime):
     runtime.role["cli"]["commands"] = ["printf"]
+    runtime.user["access_mode"] = "whitelist"
+    runtime.user["grants"] = deepcopy(runtime.role)
+    runtime.user["grants"]["cli"]["approval_commands"] = ["touch"]
     runtime.write()
     shown = respond_manually(runtime)
     assert "cli_command_not_allowed" in runtime.run()["error"]

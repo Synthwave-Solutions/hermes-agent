@@ -77,32 +77,92 @@ def _check_dwd_identity(segments: list[list[str]], identity: str) -> AccessDecis
     return AccessDecision(True, "arguments_allowed")
 
 
-def _extract_cmd_substitutions(command: str) -> tuple[str, list[str]]:
-    """Replace every balanced $(...) span with a placeholder and return the
-    rewritten command plus the extracted inner commands (outermost level;
-    nested substitutions stay inside the inner string and are handled by the
-    recursive check). Raises ValueError on unbalanced parentheses."""
+def _command_substitution_end(command: str, start: int) -> int:
+    """Find the closing shell parenthesis, respecting each nested quote scope."""
+    index, depth, quote, word_start = start, 1, "", True
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+        elif char == "\\" and index + 1 < len(command) and (
+                not quote or command[index + 1] in '$`"\\\n'):
+            if command[index + 1] != "\n":
+                word_start = False
+            index += 2
+            continue
+        elif char == quote and quote:
+            quote = ""
+        elif char in "\"'" and not quote:
+            quote = char
+        elif command.startswith("$(", index):
+            index = _command_substitution_end(command, index + 2) + 1
+            word_start = False
+            continue
+        elif not quote:
+            if char == "#" and word_start:
+                newline = command.find("\n", index)
+                if newline < 0:
+                    break
+                index = newline
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return index
+        word_start = not quote and (char.isspace() or char in ";|&()<>")
+        index += 1
+    raise ValueError("unbalanced command substitution")
+
+
+def _extract_cmd_substitutions(command: str, *, shell_quotes: bool = True) -> tuple[str, list[str]]:
+    """Extract only substitutions the shell actually executes.
+
+    Single-quoted and escaped payloads are data, including Python/JS source.
+    Double quotes still expand backticks and $(...), but not process
+    substitutions. Bare heredoc bodies do not treat quote marks specially.
+    Unsupported active backticks/process substitutions remain refused.
+    """
     out: list[str] = []
     inners: list[str] = []
     i, n = 0, len(command)
+    quote, word_start = "", True
     while i < n:
-        if command[i] == "$" and i + 1 < n and command[i + 1] == "(":
-            depth = 1
-            j = i + 2
-            while j < n and depth:
-                if command[j] == "(":
-                    depth += 1
-                elif command[j] == ")":
-                    depth -= 1
-                j += 1
-            if depth:
-                raise ValueError("unbalanced command substitution")
-            inners.append(command[i + 2:j - 1])
+        char = command[i]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+        elif char == "\\" and i + 1 < n and (
+                (shell_quotes and not quote) or command[i + 1] in '$`"\\\n'):
+            out.append(command[i:i + 2])
+            if command[i + 1] != "\n":
+                word_start = False
+            i += 2
+            continue
+        elif shell_quotes and char == quote and quote:
+            quote = ""
+        elif shell_quotes and char in "\"'" and not quote:
+            quote = char
+        elif shell_quotes and not quote and char == "#" and word_start:
+            newline = command.find("\n", i)
+            end = n if newline < 0 else newline
+            out.append(command[i:end])
+            i = end
+            continue
+        elif char == "`" or (not quote and (command.startswith("<(", i) or command.startswith(">(", i))):
+            raise ValueError("unsupported active shell substitution")
+        elif command.startswith("$(", i):
+            end = _command_substitution_end(command, i + 2)
+            inners.append(command[i + 2:end])
             out.append(_CMD_SUBSTITUTION_MARK)
-            i = j
-        else:
-            out.append(command[i])
-            i += 1
+            i = end + 1
+            word_start = False
+            continue
+        out.append(char)
+        word_start = not quote and (char.isspace() or char in ";|&()<>")
+        i += 1
     return "".join(out), inners
 
 # Heredoc opener: << or <<- plus a delimiter word, quoted or bare. The
@@ -478,6 +538,71 @@ def _command_id(command: Any) -> tuple[str, str]:
     return argv0, os.path.basename(argv0)
 
 
+def _interpreter_targets(tokens: list[str]) -> list[str]:
+    """Directly named interpreter scripts/modules, never inline code text.
+
+    This recognizes ordinary Python, Node and shell invocation operands. It
+    does not attempt to inspect arbitrary program text or resolve aliases.
+    """
+    skip_next = False
+    saw_env = False
+    words = []
+    for index, token in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+        if _REDIRECT_TOKEN_RE.match(token):
+            skip_next = True
+            continue
+        if _ENV_ASSIGNMENT_RE.match(token):
+            continue
+        if token == "env" and not saw_env:
+            saw_env = True
+            continue
+        if token in _COMMAND_WRAPPERS:
+            continue
+        words = tokens[index:]
+        break
+    if not words:
+        return []
+    name = os.path.basename(words[0])
+    python = bool(re.fullmatch(r"(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?", name))
+    node = name in {"node", "nodejs"}
+    shell = name in {"sh", "bash", "dash", "zsh", "ksh"}
+    if not (python or node or shell):
+        return []
+    targets = []
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            return targets + words[index + 1:index + 2]
+        if not word.startswith("-"):
+            return targets + [word]
+        if word == "-":
+            return targets
+        # -c / --eval / -e / -p contain program text, not a script operand.
+        if (python and word.startswith("-c")) or (shell and word.startswith("-") and not word.startswith("--") and "c" in word[1:]):
+            return targets
+        if node and (word in {"--eval", "--print"} or word.startswith(("--eval=", "--print=", "-e", "-p"))):
+            return targets
+        if python and word.startswith("-m"):
+            return targets + ([word[2:]] if len(word) > 2 else words[index + 1:index + 2])
+        if node and (word.startswith(("--require=", "--import=", "--loader=")) or (word.startswith("-r") and not word.startswith("--") and len(word) > 2)):
+            targets.append(word.split("=", 1)[1] if "=" in word else word[2:])
+            index += 1
+            continue
+        if node and word in {"--require", "-r", "--loader", "--import"}:
+            targets.extend(words[index + 1:index + 2])
+            index += 2
+            continue
+        if (python and word in {"-W", "-X"}) or (shell and word in {"-o", "-O"}):
+            index += 2
+        else:
+            index += 1
+    return targets
+
+
 def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
     skill = str(name or "").strip()
     if not skill:
@@ -535,7 +660,7 @@ def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICT
     if _SHELL_SUBSTITUTION_RE.search(body):
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     try:
-        _, inners = _extract_cmd_substitutions(body)
+        _, inners = _extract_cmd_substitutions(body, shell_quotes=False)
     except ValueError:
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     for inner in inners:
@@ -554,8 +679,6 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
         body_decision = _check_expanded_heredoc_body(body, grants, dwd_identity)
         if not body_decision.allowed:
             return body_decision
-    if _SHELL_SUBSTITUTION_RE.search(command_s):
-        return AccessDecision(False, "cli_shell_operator_not_allowed")
     try:
         command_s, inners = _extract_cmd_substitutions(command_s)
     except ValueError:
@@ -611,6 +734,10 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
             from .models import grant_matches
             if grant_matches(grants.cli_denied_commands, seg_argv0) or grant_matches(grants.cli_denied_commands, seg_base):
                 return AccessDecision(False, "cli_command_denied", detail=seg_argv0)
+            for target in _interpreter_targets(tokens):
+                if target and (grant_matches(grants.cli_denied_commands, target)
+                               or grant_matches(grants.cli_denied_commands, os.path.basename(target))):
+                    return AccessDecision(False, "cli_command_denied", detail=target)
     if grants.cli_commands and "*" not in grants.cli_commands:
         try:
             segments = _split_shell_segments(command_s)
@@ -664,6 +791,8 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         path = str(args.get("path") or ".")
         canonical = _resolve_candidate_path(path)
         dim = "file_read_roots" if tool_name in {"read_file", "search_files"} else "file_write_roots"
+        if access.access_mode == "blacklist" and access.configuration_denies_file(path, canonical):
+            return AccessDecision(False, "file_denied_glob", detail=path)
         if (_matches_denied_glob(path, access.deny.file_denied_globs)
                 or _matches_denied_glob(canonical, access.deny.file_denied_globs)
                 or grant_matches(getattr(access.deny, dim), canonical, path=True)):
@@ -680,6 +809,8 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
             return AccessDecision(False, "terminal_not_allowed")
         for candidate in _PATHLIKE_RE.findall(str(args.get("command") or "")):
             canonical = _resolve_candidate_path(candidate)
+            if access.access_mode == "blacklist" and access.configuration_denies_file(candidate, canonical):
+                return AccessDecision(False, "file_denied_glob", detail=candidate)
             if (grant_matches(access.deny.file_read_roots | access.deny.file_write_roots, canonical, path=True)
                     or _matches_denied_glob(candidate, access.deny.file_denied_globs)
                     or _matches_denied_glob(canonical, access.deny.file_denied_globs)):
