@@ -409,16 +409,20 @@ class EffectiveAccess:
         Callers provide resolved and raw paths so aliases cannot hide a deny.
         Legacy/whitelist exception behavior is intentionally unchanged.
         """
-        values = {str(p) for p in paths if p}
-        values.update(p.rsplit("/", 1)[-1] for p in tuple(values))
-        denied = {pattern for pattern in self.grants.file_denied_globs
-                  if any(grant_matches({pattern}, value) for value in values)}
-        if not denied:
-            return False
-        exception = any(grant_matches(self.grants.file_allow_globs, value) for value in values)
-        if not exception:
-            return True
-        return self.access_mode == "blacklist" and bool(denied - {"**/.hermes/**"})
+        # Keep each pathname's exception attached to that pathname. A raw
+        # workspace alias must not authorize a different canonical target.
+        for path in paths:
+            if not path:
+                continue
+            values = {str(path), str(path).rsplit("/", 1)[-1]}
+            denied = {pattern for pattern in self.grants.file_denied_globs
+                      if any(grant_matches({pattern}, value) for value in values)}
+            if not denied:
+                continue
+            exception = any(grant_matches(self.grants.file_allow_globs, value) for value in values)
+            if not exception or (self.access_mode == "blacklist" and denied - {"**/.hermes/**"}):
+                return True
+        return False
 
     def _allowed_by_set(self, values: frozenset[str], value: str) -> bool:
         return "*" in values or value in values
