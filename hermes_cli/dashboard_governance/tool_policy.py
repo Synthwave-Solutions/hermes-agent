@@ -461,10 +461,9 @@ def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: 
         contexts = policy_contexts(ctx)
         first = AccessDecision(True, "governance_inactive")
         for index, bounded_ctx in enumerate(contexts):
-            if index and bounded_ctx.access.mode == "enforce" and not bounded_ctx.access.is_profile_allowed(bounded_ctx.active_profile):
-                return AccessDecision(False, "profile_not_allowed")
-            if index and bounded_ctx.access.mode == "enforce" and (bounded_ctx.access.access_mode or bounded_ctx.access.access_level) and not bounded_ctx.access.has_permission("chat:use"):
-                return AccessDecision(False, "chat_not_allowed")
+            continuation = _continuation_scope_decision(bounded_ctx, index)
+            if not continuation.allowed:
+                return continuation
             decision = _tool_allowed_for_single_context(bounded_ctx, tool_name, registry)
             if not decision.allowed:
                 return decision
@@ -475,7 +474,15 @@ def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: 
         return AccessDecision(False, "continuation_policy_unavailable")
 
 
-def _tool_allowed_for_single_context(ctx, tool_name, registry):
+def _continuation_scope_decision(ctx, index):
+    if index and ctx.access.mode == "enforce" and not ctx.access.is_profile_allowed(ctx.active_profile):
+        return AccessDecision(False, "profile_not_allowed")
+    if index and ctx.access.mode == "enforce" and (ctx.access.access_mode or ctx.access.access_level) and not ctx.access.has_permission("chat:use"):
+        return AccessDecision(False, "chat_not_allowed")
+    return AccessDecision(True, "continuation_scope_allowed")
+
+
+def _live_tool_scope_decision(ctx):
     from .context import workspace_allowed_for_context
     if not workspace_allowed_for_context(ctx):
         return AccessDecision(False, "workspace_access_revoked")
@@ -487,12 +494,80 @@ def _tool_allowed_for_single_context(ctx, tool_name, registry):
                 return AccessDecision(False, "bot_access_revoked")
         except Exception:
             return AccessDecision(False, "bot_access_revoked")
+    return AccessDecision(True, "tool_scope_allowed")
+
+
+def _tool_allowed_for_validated_scope(ctx, tool_name, registry):
+    """Per-tool ceilings; private to a freshly checked runtime call or projection."""
+    ceiling = getattr(ctx, "bot_access_ceiling", None)
+    if ceiling is not None:
         if tool_name == "terminal" and not ceiling.grants.cli_commands:
             return AccessDecision(False, "bot_cli_not_selected")
         bounded = decide_tool_access(ceiling, tool_name, registry)
         if not bounded.allowed:
             return bounded
     return decide_tool_access(ctx.access if ctx is not None else None, tool_name, registry)
+
+
+def _tool_allowed_for_single_context(ctx, tool_name, registry):
+    scope = _live_tool_scope_decision(ctx)
+    if not scope.allowed:
+        return scope
+    return _tool_allowed_for_validated_scope(ctx, tool_name, registry)
+
+
+def _projection_contexts_allowed(contexts):
+    return all(_continuation_scope_decision(ctx, index).allowed
+               and _live_tool_scope_decision(ctx).allowed
+               for index, ctx in enumerate(contexts))
+
+
+def tool_projection_scope_allowed(ctx: DashboardGovernanceContext | None) -> bool:
+    """Recheck live ceilings before reusing an already assembled schema list.
+
+    The schema cache fingerprint already includes immutable grants/denies. Live
+    callbacks cannot be represented by that fingerprint and are never cached.
+    """
+    from .context import policy_contexts
+    try:
+        return _projection_contexts_allowed(policy_contexts(ctx))
+    except Exception:
+        return False
+
+
+@dataclass(frozen=True)
+class ToolSchemaProjection:
+    names: frozenset[str]
+    scope_allowed: bool
+
+
+def project_tool_names_for_context(ctx, tool_names, registry) -> ToolSchemaProjection:
+    """Project schemas using one local envelope expansion, never execution rights.
+
+    Read live workspace/bot membership before and after the projection. Keep all
+    original per-tool and continuation ceilings; if membership is revoked while
+    building the list, discard the entire result. Nothing survives this call.
+    Runtime dispatch and argument checks use their independent live paths.
+    """
+    from .context import policy_contexts
+    try:
+        contexts = policy_contexts(ctx)
+        if not _projection_contexts_allowed(contexts):
+            return ToolSchemaProjection(frozenset(), False)
+        allowed = set()
+        for name in tool_names:
+            try:
+                if all(_tool_allowed_for_validated_scope(bounded_ctx, name, registry).allowed
+                       for bounded_ctx in contexts):
+                    allowed.add(name)
+            except Exception:
+                # Match a failed single-tool decision without exposing it.
+                continue
+        if not _projection_contexts_allowed(contexts):
+            return ToolSchemaProjection(frozenset(), False)
+        return ToolSchemaProjection(frozenset(allowed), True)
+    except Exception:
+        return ToolSchemaProjection(frozenset(), False)
 
 
 def _resolve_candidate_path(value: Any) -> str:
