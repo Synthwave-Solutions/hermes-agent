@@ -189,6 +189,26 @@ def _ollama_probe_miss_seen(key: str, *, record: bool = False) -> bool:
                 _ollama_probe_misses.pop(next(iter(_ollama_probe_misses)))
         return key in _ollama_probe_misses
 
+
+# LM Studio-only detection must not suppress a later Ollama/full probe (or
+# borrow a failure from another profile or credential). No HTTP under this lock.
+_LMSTUDIO_PROBE_MISS_MAX_SIZE = 256
+_lmstudio_probe_misses: Dict[str, float] = {}
+_lmstudio_probe_miss_lock = threading.Lock()
+
+
+def _lmstudio_probe_miss_seen(key: str, *, record: bool = False) -> bool:
+    now = time.monotonic()
+    with _lmstudio_probe_miss_lock:
+        for stale_key, seen in list(_lmstudio_probe_misses.items()):
+            if now - seen >= _ENDPOINT_PROBE_FAILURE_TTL_SECONDS:
+                del _lmstudio_probe_misses[stale_key]
+        if record:
+            _lmstudio_probe_misses[key] = now
+            while len(_lmstudio_probe_misses) > _LMSTUDIO_PROBE_MISS_MAX_SIZE:
+                _lmstudio_probe_misses.pop(next(iter(_lmstudio_probe_misses)))
+        return key in _lmstudio_probe_misses
+
 # A configured endpoint that is routable-but-dead — e.g. a corp LAN address
 # while off-VPN — blackholes TCP: the SYN draws no SYN-ACK, no RST and no ICMP
 # error, so a probe waits out its full timeout instead of failing fast. Startup
@@ -1029,7 +1049,8 @@ def _localhost_to_ipv4(url: str) -> str:
 
 
 def detect_local_server_type(
-    base_url: str, api_key: str = "", *, ollama_only: bool = False
+    base_url: str, api_key: str = "", *, ollama_only: bool = False,
+    lmstudio_only: bool = False,
 ) -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
@@ -1044,7 +1065,13 @@ def detect_local_server_type(
     a generic local API gateway need not pay every server's discovery timeout.
     An Ollama-only miss never populates the generic negative cache; a separate
     bounded, profile/endpoint/credential-scoped cache preserves warm startup.
+
+    ``lmstudio_only`` asks only whether native LM Studio loaded-context metadata
+    should precede a standard /models listing. Unrelated local protocols are
+    still detected by the full context fallback if that listing lacks metadata.
     """
+    if ollama_only and lmstudio_only:
+        raise ValueError("Only one targeted local server probe may be selected")
     import httpx
 
     normalized = _normalize_base_url(base_url)
@@ -1070,7 +1097,9 @@ def detect_local_server_type(
             if cached[0] is not None
             else _ENDPOINT_PROBE_FAILURE_TTL_SECONDS
         )
-        if (time.monotonic() - cached[1]) < ttl:
+        if (time.monotonic() - cached[1]) < ttl and not (
+            lmstudio_only and cached[0] is None
+        ):
             return cached[0]
 
     # The host already blackholed a connect: skip the waterfall below, each leg
@@ -1091,6 +1120,7 @@ def detect_local_server_type(
     # targeted miss. Never share a failed authenticated probe across profiles
     # or key rotation, and never retain or persist the credential itself.
     ollama_miss_key = None
+    lmstudio_miss_key = None
     if ollama_only:
         from hermes_constants import get_hermes_home
 
@@ -1098,6 +1128,14 @@ def detect_local_server_type(
             str(get_hermes_home()), server_url, api_key,
         ]).encode("utf-8")).hexdigest()
         if _ollama_probe_miss_seen(ollama_miss_key):
+            return None
+    elif lmstudio_only:
+        from hermes_constants import get_hermes_home
+
+        lmstudio_miss_key = hashlib.sha256(json.dumps([
+            "lm-studio", str(get_hermes_home()), server_url, api_key,
+        ]).encode("utf-8")).hexdigest()
+        if _lmstudio_probe_miss_seen(lmstudio_miss_key):
             return None
 
     headers = _auth_headers(api_key)
@@ -1123,7 +1161,7 @@ def detect_local_server_type(
                         result = "lm-studio"
                 except Exception as exc:
                     _probe_failed(exc)
-            if result is None:
+            if result is None and not lmstudio_only:
                 # Ollama exposes /api/tags and responds with {"models": [...]}
                 # LM Studio returns {"error": "Unexpected endpoint"} with status 200
                 # on this path, so we must verify the response contains "models".
@@ -1138,7 +1176,7 @@ def detect_local_server_type(
                             pass
                 except Exception as exc:
                     _probe_failed(exc)
-            if result is None and not ollama_only:
+            if result is None and not (ollama_only or lmstudio_only):
                 # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
                 try:
                     r = client.get(f"{server_url}/v1/props")
@@ -1148,7 +1186,7 @@ def detect_local_server_type(
                         result = "llamacpp"
                 except Exception as exc:
                     _probe_failed(exc)
-            if result is None and not ollama_only:
+            if result is None and not (ollama_only or lmstudio_only):
                 # vLLM: /version
                 try:
                     r = client.get(f"{server_url}/version")
@@ -1166,7 +1204,9 @@ def detect_local_server_type(
         _local_probe_disk_put("server_type", server_url, result)
     elif ollama_miss_key is not None:
         _ollama_probe_miss_seen(ollama_miss_key, record=True)
-    elif not ollama_only:
+    elif lmstudio_miss_key is not None:
+        _lmstudio_probe_miss_seen(lmstudio_miss_key, record=True)
+    elif not (ollama_only or lmstudio_only):
         # Cache the negative verdict in memory only (never on disk — a
         # failure is often transient: server starting, key being fixed)
         # so the very next turn does not re-run the whole waterfall
@@ -1439,7 +1479,7 @@ def fetch_endpoint_model_metadata(
 
     if is_local_endpoint(normalized):
         try:
-            if detect_local_server_type(normalized, api_key=api_key) == "lm-studio":
+            if detect_local_server_type(normalized, api_key=api_key, lmstudio_only=True) == "lm-studio":
                 server_url = _lmstudio_server_root(normalized)
                 response = requests.get(
                     server_url.rstrip("/") + "/api/v1/models",
