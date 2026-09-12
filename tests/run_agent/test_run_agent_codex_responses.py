@@ -964,17 +964,14 @@ def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
 
 
 
-def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fails(
+def test_run_codex_stream_returns_terminal_response_without_post_terminal_drain(
     monkeypatch, caplog
 ):
     """Regression test for issue #74310.
 
-    A transport error while draining the SSE iterator *after* a valid
-    ``response.completed`` has already been observed (and the response
-    object fully assembled) must NOT discard that response and retry with
-    a brand-new physical request -- that would silently duplicate an
-    already-billed inference. Only errors that occur BEFORE a terminal
-    event is captured should trigger the retry-with-new-request path.
+    After a valid terminal response there is no reason to pull the network
+    again. A dropped or hanging tail must neither delay that response nor
+    trigger another physical request for an already-billed inference.
     """
     import logging
 
@@ -996,6 +993,7 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
 
         def __iter__(self):
             yield from super().__iter__()
+            calls["tail_reads"] += 1
             raise httpx.RemoteProtocolError("connection dropped during drain")
 
     events = [
@@ -1010,7 +1008,7 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
         ),
     ]
 
-    calls = {"count": 0}
+    calls = {"count": 0, "tail_reads": 0}
 
     def _fake_create(**kwargs):
         calls["count"] += 1
@@ -1024,10 +1022,11 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
     # Only ONE physical request was ever opened -- the drain failure did not
     # trigger a second call to responses.create(stream=True).
     assert calls["count"] == 1
+    assert calls["tail_reads"] == 0
     assert response.status == "completed"
     assert response.usage is usage
     assert response.id == "resp_post_terminal_1"
-    assert any(
+    assert not any(
         "finalization" in record.message for record in caplog.records
     )
 

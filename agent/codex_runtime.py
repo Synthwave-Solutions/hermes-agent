@@ -1009,6 +1009,42 @@ def _event_field(event: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+class _TerminalBoundedCodexStream:
+    """Let Relay finish at the Responses terminal frame without another read.
+
+    The HTTP connection can linger after response.completed/failed/incomplete.
+    Relay still needs to exhaust its provider iterator to run its finalizer;
+    expose EOF there without waiting for an already-finished network response.
+    Explicit close remains responsible for the underlying SDK resource, also
+    when interruption abandons this iterator before its first event.
+    """
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self._iterator = iter(stream)
+        self._terminal_seen = False
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed or self._terminal_seen:
+            raise StopIteration
+        event = next(self._iterator)
+        event_type = _event_field(event, "type", "")
+        self._terminal_seen = isinstance(event_type, str) and event_type in _TERMINAL_EVENT_TYPES
+        return event
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._stream, "close", None)
+        if callable(close):
+            close()
+
+
 def _item_field(item: Any, name: str, default: Any = None) -> Any:
     """Field access for nested Response items (attr-style SDK object or dict)."""
     value = getattr(item, name, None)
@@ -1629,7 +1665,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            raw_stream = active_client.responses.create(**stream_kwargs)
+            # Compatible providers can return a completed object despite
+            # stream=True. Keep Relay's existing completed-response path.
+            if hasattr(raw_stream, "output") and not hasattr(raw_stream, "__iter__"):
+                return raw_stream
+            return _TerminalBoundedCodexStream(raw_stream)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
