@@ -21,6 +21,13 @@ a timing-sensitive sleep. All six pass after the change. Two extra cases cover
 closing before the first event and malformed nonterminal event types. Managed
 cases verify the finalizer runs once and retains terminal status and usage.
 
+Review added three cleanup regressions: interruption closes a separately owned
+generator in direct and managed execution, and an iterator cleanup error still
+closes the outer SDK resource. The wrapper closes both distinct layers exactly
+once and propagates the first cleanup failure. Two of these cases failed before
+the cleanup correction; the generator is retained by the test so garbage
+collection cannot substitute for explicit closure.
+
 This is an independently reproduced latency defect. It is not the established
 cause of the reported 50-second production question: the matched production
 measurement attributed about 29 seconds before the gateway request and about

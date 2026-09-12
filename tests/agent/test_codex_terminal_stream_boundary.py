@@ -131,3 +131,68 @@ def test_close_before_first_event_closes_raw_resource_once():
 def test_malformed_nonterminal_type_does_not_crash_or_end_the_stream():
     events = [{"type": []}, {"type": "response.completed"}, {"type": "not-read"}]
     assert list(_TerminalBoundedCodexStream(iter(events))) == events[:2]
+
+
+def test_interruption_closes_separate_provider_iterator(managed_turn):
+    del managed_turn
+    closed = []
+
+    class IterableStream:
+        def __init__(self):
+            self.iterator = self.events()
+
+        def __iter__(self):
+            return self.iterator
+
+        def events(self):
+            try:
+                yield {"type": "response.output_text.delta", "delta": "Partial"}
+                yield {"type": "response.in_progress"}
+            finally:
+                closed.append("iterator")
+
+    def interrupt_after_delta(_text):
+        agent._interrupt_requested = True
+
+    raw = IterableStream()  # Retain the generator so GC cannot fake cleanup.
+    agent = SimpleNamespace(
+        _interrupt_requested=False, session_id="fixture-session", provider="custom",
+        model="fixture-model", _current_api_request_id="fixture-request",
+        _fire_stream_delta=interrupt_after_delta, _fire_reasoning_delta=lambda _: None,
+        _touch_activity=lambda _: None, _client_log_context=lambda: "fixture",
+        _abort_request_openai_client=lambda *args, **kwargs: None,
+    )
+    result = run_codex_stream(
+        agent, {"model": "fixture-model", "input": [], "instructions": "Fixture", "store": False},
+        client=SimpleNamespace(responses=SimpleNamespace(create=lambda **_: raw)),
+    )
+    assert result.output_text == "Partial"
+    assert closed == ["iterator"]
+
+
+def test_outer_resource_is_closed_even_when_distinct_iterator_close_fails():
+    closed = []
+
+    class Iterator:
+        def __next__(self):
+            raise StopIteration
+
+        def __iter__(self):
+            return self
+
+        def close(self):
+            closed.append("iterator")
+            raise RuntimeError("iterator cleanup failed")
+
+    class Resource:
+        def __iter__(self):
+            return Iterator()
+
+        def close(self):
+            closed.append("resource")
+
+    bounded = _TerminalBoundedCodexStream(Resource())
+    with pytest.raises(RuntimeError, match="iterator cleanup failed"):
+        bounded.close()
+    bounded.close()
+    assert closed == ["iterator", "resource"]

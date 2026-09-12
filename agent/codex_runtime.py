@@ -1040,9 +1040,24 @@ class _TerminalBoundedCodexStream:
         if self._closed:
             return
         self._closed = True
-        close = getattr(self._stream, "close", None)
-        if callable(close):
-            close()
+        close_error = None
+        closed_ids = set()
+        # Compatibility streams can be iterables that own a distinct generator.
+        # Close both layers, including the SDK resource if generator cleanup
+        # raises; Relay otherwise cannot reach the hidden iterator on cancel.
+        for resource in (self._iterator, self._stream):
+            if id(resource) in closed_ids:
+                continue
+            closed_ids.add(id(resource))
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+        if close_error is not None:
+            raise close_error
 
 
 def _item_field(item: Any, name: str, default: Any = None) -> Any:
