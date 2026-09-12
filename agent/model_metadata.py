@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -167,6 +168,26 @@ _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
 # recoverable within minutes instead of pinning "undetected" for an hour.
 _ENDPOINT_PROBE_FAILURE_TTL_SECONDS = 300.0
 _endpoint_probe_path_cache: Dict[str, tuple] = {}
+
+# An Ollama-only miss says nothing about the other server protocols. Keep it
+# separate from generic detection, memory-only, bounded and scoped to the
+# profile, normalized endpoint and credentials. Keys contain only a digest.
+_OLLAMA_PROBE_MISS_MAX_SIZE = 256
+_ollama_probe_misses: Dict[str, float] = {}
+_ollama_probe_miss_lock = threading.Lock()
+
+
+def _ollama_probe_miss_seen(key: str, *, record: bool = False) -> bool:
+    now = time.monotonic()
+    with _ollama_probe_miss_lock:
+        for stale_key, seen in list(_ollama_probe_misses.items()):
+            if now - seen >= _ENDPOINT_PROBE_FAILURE_TTL_SECONDS:
+                del _ollama_probe_misses[stale_key]
+        if record:
+            _ollama_probe_misses[key] = now
+            while len(_ollama_probe_misses) > _OLLAMA_PROBE_MISS_MAX_SIZE:
+                _ollama_probe_misses.pop(next(iter(_ollama_probe_misses)))
+        return key in _ollama_probe_misses
 
 # A configured endpoint that is routable-but-dead — e.g. a corp LAN address
 # while off-VPN — blackholes TCP: the SYN draws no SYN-ACK, no RST and no ICMP
@@ -1007,7 +1028,9 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
-def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+def detect_local_server_type(
+    base_url: str, api_key: str = "", *, ollama_only: bool = False
+) -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
     Returns one of: "ollama", "lm-studio", "vllm", "llamacpp", or None.
@@ -1015,6 +1038,12 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     The result is cached for the lifetime of the process so that repeated
     calls (e.g. every 5-minute metadata refresh) never re-run the waterfall
     and never spray 404s at endpoints the server does not expose.
+
+    ``ollama_only`` reuses known server verdicts but probes only ``/api/tags``
+    on a cache miss. It is for the Ollama num_ctx safeguard during agent init:
+    a generic local API gateway need not pay every server's discovery timeout.
+    An Ollama-only miss never populates the generic negative cache; a separate
+    bounded, profile/endpoint/credential-scoped cache preserves warm startup.
     """
     import httpx
 
@@ -1058,6 +1087,19 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
         _endpoint_probe_path_cache[server_url] = (disk_hit, time.monotonic())
         return disk_hit
 
+    # Newer positive generic/disk verdicts above take precedence over a prior
+    # targeted miss. Never share a failed authenticated probe across profiles
+    # or key rotation, and never retain or persist the credential itself.
+    ollama_miss_key = None
+    if ollama_only:
+        from hermes_constants import get_hermes_home
+
+        ollama_miss_key = hashlib.sha256(json.dumps([
+            str(get_hermes_home()), server_url, api_key,
+        ]).encode("utf-8")).hexdigest()
+        if _ollama_probe_miss_seen(ollama_miss_key):
+            return None
+
     headers = _auth_headers(api_key)
 
     def _probe_failed(exc: Exception) -> None:
@@ -1074,12 +1116,13 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     try:
         with httpx.Client(timeout=2.0, headers=headers) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
-            try:
-                r = client.get(f"{lmstudio_url}/api/v1/models")
-                if r.status_code == 200:
-                    result = "lm-studio"
-            except Exception as exc:
-                _probe_failed(exc)
+            if not ollama_only:
+                try:
+                    r = client.get(f"{lmstudio_url}/api/v1/models")
+                    if r.status_code == 200:
+                        result = "lm-studio"
+                except Exception as exc:
+                    _probe_failed(exc)
             if result is None:
                 # Ollama exposes /api/tags and responds with {"models": [...]}
                 # LM Studio returns {"error": "Unexpected endpoint"} with status 200
@@ -1095,7 +1138,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
                             pass
                 except Exception as exc:
                     _probe_failed(exc)
-            if result is None:
+            if result is None and not ollama_only:
                 # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
                 try:
                     r = client.get(f"{server_url}/v1/props")
@@ -1105,7 +1148,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
                         result = "llamacpp"
                 except Exception as exc:
                     _probe_failed(exc)
-            if result is None:
+            if result is None and not ollama_only:
                 # vLLM: /version
                 try:
                     r = client.get(f"{server_url}/version")
@@ -1121,7 +1164,9 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     if result is not None:
         _endpoint_probe_path_cache[server_url] = (result, time.monotonic())
         _local_probe_disk_put("server_type", server_url, result)
-    else:
+    elif ollama_miss_key is not None:
+        _ollama_probe_miss_seen(ollama_miss_key, record=True)
+    elif not ollama_only:
         # Cache the negative verdict in memory only (never on disk — a
         # failure is often transient: server starting, key being fixed)
         # so the very next turn does not re-run the whole waterfall
@@ -2001,7 +2046,9 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
         server_url = server_url[:-3]
 
     try:
-        server_type = detect_local_server_type(base_url, api_key=api_key)
+        server_type = detect_local_server_type(
+            base_url, api_key=api_key, ollama_only=True
+        )
     except Exception:
         return None
     if server_type != "ollama":
