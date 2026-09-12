@@ -1335,6 +1335,10 @@ def _consume_codex_event_stream(
 
         if event_type in _TERMINAL_EVENT_TYPES:
             saw_terminal = True
+            # The terminal frame is authoritative. An omitted or stale nested
+            # response.status must not leave the optimistic EOF-recovery
+            # default (completed) on a failed/incomplete stream.
+            terminal_status = event_type.removeprefix("response.")
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
                 terminal_usage = getattr(resp_obj, "usage", None)
@@ -1344,11 +1348,6 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
-                rstatus = getattr(resp_obj, "status", None)
-                if rstatus is None and isinstance(resp_obj, dict):
-                    rstatus = resp_obj.get("status")
-                if isinstance(rstatus, str):
-                    terminal_status = rstatus
                 if event_type == "response.incomplete":
                     terminal_incomplete_details = getattr(resp_obj, "incomplete_details", None)
                     if terminal_incomplete_details is None and isinstance(resp_obj, dict):
@@ -1359,11 +1358,6 @@ def _consume_codex_event_stream(
                         terminal_error = resp_obj.get("error")
             if event_type == "response.completed":
                 saw_response_completed = True
-                terminal_status = terminal_status or "completed"
-            elif event_type == "response.incomplete":
-                terminal_status = terminal_status or "incomplete"
-            elif event_type == "response.failed":
-                terminal_status = terminal_status or "failed"
             # Stop on terminal event.
             break
 
