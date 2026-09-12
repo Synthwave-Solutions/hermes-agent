@@ -151,6 +151,29 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_ENDPOINT_MODEL_CACHE_MAX_SIZE = 256
+_ENDPOINT_MODEL_FETCH_WAIT_SECONDS = 60.0
+_endpoint_model_metadata_lock = threading.Lock()
+
+
+class _EndpointMetadataFetch:
+    def __init__(self):
+        self.done = threading.Event()
+        self.result: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+_endpoint_model_metadata_inflight: Dict[str, _EndpointMetadataFetch] = {}
+
+
+def _endpoint_metadata_cache_key(base_url: str, api_key: str = "") -> str:
+    """Scope authenticated catalogs to the active profile without retaining keys."""
+    from hermes_constants import get_hermes_home
+
+    return hashlib.sha256(json.dumps([
+        str(get_hermes_home()), _normalize_base_url(base_url), api_key or "",
+    ]).encode("utf-8")).hexdigest()
+
+
 # Bounded-lifetime cache: after the first successful probe we remember the
 # server type so subsequent refreshes skip the full waterfall (no more 404
 # spam every 5 minutes on non-matching endpoints like /api/v1/models on vllm).
@@ -1444,27 +1467,63 @@ def fetch_endpoint_model_metadata(
 
     ``cached_only`` returns only a fresh in-process snapshot, never a probe.
     This is used for explicit custom endpoints where hardcoded global model-name
-    defaults are unreliable. Results are cached in memory per base URL.
+    defaults are unreliable. Snapshots and concurrent requests are scoped to
+    the active profile, normalized base URL and credentials. No HTTP or waiting
+    occurs under the cache lock; cached-only accounting never joins a probe.
     """
     normalized = _normalize_base_url(base_url)
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
+    key = _endpoint_metadata_cache_key(normalized, api_key)
+    with _endpoint_model_metadata_lock:
+        if not force_refresh:
+            cached = _endpoint_model_metadata_cache.get(key)
+            cached_at = _endpoint_model_metadata_cache_time.get(key, 0)
+            if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
+                return cached
+        if cached_only:
+            return {}
+        # Do not cache a host's short-lived connect timeout as a full-TTL miss.
+        if _endpoint_blackholed(normalized):
+            return {}
+        flight = _endpoint_model_metadata_inflight.get(key)
+        leader = flight is None
+        if leader:
+            flight = _EndpointMetadataFetch()
+            _endpoint_model_metadata_inflight[key] = flight
+
+    if not leader:
+        # Optional metadata must not wait indefinitely on another worker's
+        # stuck socket. A timeout does not cancel or duplicate the leader.
+        if flight.done.wait(_ENDPOINT_MODEL_FETCH_WAIT_SECONDS):
+            return flight.result if flight.result is not None else {}
+        return {}
+
+    try:
+        result = _fetch_endpoint_model_metadata_uncached(normalized, api_key)
+        with _endpoint_model_metadata_lock:
+            flight.result = result
+            _endpoint_model_metadata_cache[key] = result
+            _endpoint_model_metadata_cache_time[key] = time.time()
+            while len(_endpoint_model_metadata_cache) > _ENDPOINT_MODEL_CACHE_MAX_SIZE:
+                oldest = min(_endpoint_model_metadata_cache,
+                             key=lambda item: _endpoint_model_metadata_cache_time.get(item, 0))
+                del _endpoint_model_metadata_cache[oldest]
+                _endpoint_model_metadata_cache_time.pop(oldest, None)
+        return result
+    finally:
+        # Also release followers after cancellation/BaseException. They get an
+        # unknown snapshot, and a later call may retry; no failure is invented.
+        with _endpoint_model_metadata_lock:
+            _endpoint_model_metadata_inflight.pop(key, None)
+            flight.done.set()
+
+
+def _fetch_endpoint_model_metadata_uncached(
+    normalized: str, api_key: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Existing probe ladder; invoked once for each in-flight metadata scope."""
     _ensure_requests()
-
-    if not force_refresh:
-        cached = _endpoint_model_metadata_cache.get(normalized)
-        cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
-        if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
-            return cached
-
-    if cached_only:
-        return {}
-
-    # Blackholed endpoint: every candidate below would spend its full 5s
-    # connect budget. Returned empty rather than cached, so the endpoint is
-    # retried as soon as the blackhole entry expires.
-    if _endpoint_blackholed(normalized):
-        return {}
 
     candidates = [normalized]
     if normalized.endswith("/v1"):
@@ -1523,8 +1582,6 @@ def fetch_endpoint_model_metadata(
                     if isinstance(alt_id, str) and alt_id and alt_id != model_id:
                         _add_model_aliases(cache, alt_id, entry)
 
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
                 return cache
         except Exception as exc:
             last_error = exc
@@ -1602,8 +1659,6 @@ def fetch_endpoint_model_metadata(
                 except Exception:
                     pass
 
-            _endpoint_model_metadata_cache[normalized] = cache
-            _endpoint_model_metadata_cache_time[normalized] = time.time()
             return cache
         except Exception as exc:
             last_error = exc
@@ -1615,8 +1670,6 @@ def fetch_endpoint_model_metadata(
 
     if last_error:
         logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
-    _endpoint_model_metadata_cache[normalized] = {}
-    _endpoint_model_metadata_cache_time[normalized] = time.time()
     return {}
 
 
