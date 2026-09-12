@@ -86,7 +86,12 @@ def intercepted_http(monkeypatch):
             "gate_url", str(url)
         ) == str(url):
             behavior["entered"].set()
-            behavior["release"].wait(min(_client.timeout.read, 5))
+            if behavior.get("gate_until_release"):
+                # This mode tests lock ownership, not HTTP timeout behavior.
+                # The caller's finally block always releases the gate.
+                behavior["release"].wait()
+            else:
+                behavior["release"].wait(min(_client.timeout.read, 5))
             raise TimeoutError("synthetic hung local gateway")
         if not behavior["ollama"] and not behavior["vllm"]:
             raise TimeoutError("synthetic unavailable local gateway")
@@ -364,6 +369,7 @@ def test_unrelated_probe_is_not_blocked_by_cache_lock_during_http(
         entered=threading.Event(),
         release=threading.Event(),
         gate_url="http://fixture-gateway:8080/api/tags",
+        gate_until_release=True,
     )
     executor = ThreadPoolExecutor(max_workers=2)
     first = executor.submit(
