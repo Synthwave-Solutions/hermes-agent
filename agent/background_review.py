@@ -1460,6 +1460,7 @@ def _run_review_in_thread(
     review_agent = None
     review_messages: List[Dict] = []
     review_usage: Dict[str, Any] = {}
+    actions: List[str] = []
 
     def _unregister_review_agent(agent_ref) -> None:
         """Idempotent: clears the review fork from both tracking slots.
@@ -1655,10 +1656,26 @@ def _run_review_in_thread(
                 # returned or startup cancellation has fenced it out.
                 _finish_request_phase(review_agent)
 
-            # Snapshot review actions before teardown. close() is allowed to
-            # clean per-session state, but the user-visible self-improvement
-            # summary still needs the completed review agent's tool results.
-            review_messages = list(getattr(review_agent, "_session_messages", []))
+                # A review may complete real writes before a later provider
+                # step raises or is cancelled. Observe those results exactly
+                # once on every request exit, before close() can clear them.
+                # Keep request completion published first so this optional
+                # observation cannot delay a waiting foreground turn.
+                try:
+                    review_messages = list(getattr(review_agent, "_session_messages", []))
+                    actions = summarize_background_review_actions(
+                        review_messages,
+                        messages_snapshot,
+                        notification_mode=getattr(agent, "memory_notifications", "on"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "summarize_background_review_actions returned partial results "
+                        "after exception (treating as empty); suppressing AttributeError "
+                        "that previously aborted the entire review (#59437): %s",
+                        e,
+                    )
+                    actions = []
 
             # Tear down memory providers while stdout is still
             # redirected so background thread teardown (Honcho flush,
@@ -1674,36 +1691,9 @@ def _run_review_in_thread(
                 pass
             review_agent = None
 
-        # Scan the review agent's messages for successful tool actions
-        # and surface a compact summary to the user. Tool messages
-        # already present in messages_snapshot must be skipped, since
-        # the review agent inherits that history and would otherwise
-        # re-surface stale "created"/"updated" messages from the prior
-        # conversation as if they just happened (issue #14944).
-        #
-        # Wrapped in try/except: a buggy/legacy tool response shape
-        # (e.g. ``_change`` returned as a list instead of a dict, #59437)
-        # must NOT take down the whole review with an AttributeError,
-        # since the caller's outer except logs only "Background
-        # memory/skill review failed" and discards every successful
-        # action the fork DID complete before the crash. Coerce an
-        # exception into an empty actions list so the partial valid
-        # actions from earlier in the messages are returned instead.
-        try:
-            actions = summarize_background_review_actions(
-                review_messages,
-                messages_snapshot,
-                notification_mode=getattr(agent, "memory_notifications", "on"),
-            )
-        except Exception as e:
-            logger.warning(
-                "summarize_background_review_actions returned partial results "
-                "after exception (treating as empty); suppressing AttributeError "
-                "that previously aborted the entire review (#59437): %s",
-                e,
-            )
-            actions = []
-
+        # The request-exit observer already excluded inherited tool results.
+        # Keep normal completion logging and callbacks on the success path;
+        # partial failure remains an error, even when some writes succeeded.
         _log_review_completion(
             review_usage, _classify_review_result(actions)
         )
