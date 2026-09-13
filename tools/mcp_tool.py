@@ -3470,8 +3470,12 @@ class MCPServerTask:
             client_kwargs["cert"] = client_cert
 
         probe_headers = dict(headers) if headers else {}
+        # httpx timeouts apply to individual I/O phases, not the combined
+        # HEAD -> GET -> POST probe. Share one budget across the client
+        # lifetime so this optional diagnosis cannot stack those waits.
+        deadline = asyncio.timeout(timeout)
         try:
-            async with _httpx.AsyncClient(**client_kwargs) as client:
+            async with deadline, _httpx.AsyncClient(**client_kwargs) as client:
                 # HEAD is cheapest; fall back to GET if the server doesn't
                 # implement it (405 Method Not Allowed / 501 Not Implemented).
                 resp = await client.head(url, headers=probe_headers)
@@ -3518,6 +3522,10 @@ class MCPServerTask:
                         )
                         if post_ct in self._MCP_CONTENT_TYPES:
                             resp = post_resp
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            return  # Probe budget exhausted — let the real SDK handshake try.
         except _httpx.HTTPError:
             return  # DNS/connect/timeout/transport error — let the SDK try.
 
