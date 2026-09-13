@@ -190,6 +190,7 @@ _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
 # Short TTL keeps a transient failure (server starting up, key being fixed)
 # recoverable within minutes instead of pinning "undetected" for an hour.
 _ENDPOINT_PROBE_FAILURE_TTL_SECONDS = 300.0
+_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS = 3.0
 _endpoint_probe_path_cache: Dict[str, tuple] = {}
 
 # An Ollama-only miss says nothing about the other server protocols. Keep it
@@ -1176,28 +1177,65 @@ def detect_local_server_type(
     result: Optional[str] = None
     try:
         with httpx.Client(timeout=2.0, headers=headers) as client:
+            paths = {"ollama": "/api/tags", "llamacpp": "/v1/props", "vllm": "/version"}
+
+            def recognized(protocol, response):
+                if response.status_code != 200:
+                    return None
+                if protocol == "llamacpp":
+                    return protocol if "default_generation_settings" in response.text else None
+                field = "models" if protocol == "ollama" else "version"
+                return protocol if field in response.json() else None
+
             def probe(protocol):
                 # Workers return observations only. Apply failure/blackhole
                 # state below in protocol priority order, never arrival order.
                 try:
-                    if protocol == "ollama":
-                        r = client.get(f"{server_url}/api/tags")
-                        # LM Studio can return200/error for unknown endpoints.
-                        if r.status_code == 200 and "models" in r.json():
-                            return protocol, None
-                    elif protocol == "llamacpp":
-                        r = client.get(f"{server_url}/v1/props")
-                        if r.status_code != 200:
-                            r = client.get(f"{server_url}/props")
-                        if r.status_code == 200 and "default_generation_settings" in r.text:
-                            return protocol, None
-                    else:
-                        r = client.get(f"{server_url}/version")
-                        if r.status_code == 200 and "version" in r.json():
-                            return protocol, None
+                    r = client.get(server_url + paths[protocol])
+                    if protocol == "llamacpp" and r.status_code != 200:
+                        r = client.get(f"{server_url}/props")
+                    return recognized(protocol, r), None
                 except Exception as exc:
                     return None, exc
-                return None, None
+
+            incomplete = object()
+
+            async def speculate(protocols):
+                import asyncio
+                async with httpx.AsyncClient(timeout=2.0, headers=headers) as async_client:
+                    async def run(protocol):
+                        deadline = asyncio.timeout(_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS)
+                        try:
+                            # HTTPX's read timeout alone permits indefinitely
+                            # trickling headers/bodies. Speculation must end;
+                            # an incomplete needed probe falls back to serial.
+                            async with deadline:
+                                r = await async_client.get(server_url + paths[protocol])
+                                if protocol == "llamacpp" and r.status_code != 200:
+                                    r = await async_client.get(f"{server_url}/props")
+                                return recognized(protocol, r), None
+                        except TimeoutError as exc:
+                            return None, incomplete if deadline.expired() else exc
+                        except Exception as exc:
+                            return None, exc
+
+                    tasks = [asyncio.create_task(run(protocol)) for protocol in protocols]
+                    outcomes = []
+                    try:
+                        for task in tasks:
+                            outcome = await task
+                            outcomes.append(outcome)
+                            result, error = outcome
+                            if result is not None or error is incomplete or (
+                                error is not None and _is_connect_timeout(error)
+                            ):
+                                break
+                        return outcomes
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
 
             first_read_timeout = False
             # LM Studio exposes /api/v1/models — check first (most specific)
@@ -1214,11 +1252,18 @@ def detect_local_server_type(
                 if first_read_timeout and not ollama_only:
                     # A slow non-native gateway can time out every optional
                     # protocol endpoint. Overlap the remaining reads, keeping
-                    # the same timeout, endpoints and result precedence. Join
-                    # all workers before closing their shared HTTPX client.
+                    # the same request timeout/endpoints/result precedence.
+                    # One owned loop worker permits cancellation even when
+                    # called from an existing event loop; it is always joined.
+                    import asyncio
+                    import itertools
                     from concurrent.futures import ThreadPoolExecutor
-                    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="hermes-local-probe") as pool:
-                        outcomes = list(pool.map(probe, protocols))
+                    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-local-probe") as pool:
+                        outcomes = pool.submit(lambda: asyncio.run(speculate(protocols))).result()
+                    if outcomes and outcomes[-1][1] is incomplete:
+                        # Do not classify a large/slow native response as a
+                        # negative verdict just because speculation expired.
+                        outcomes = itertools.chain(outcomes[:-1], map(probe, protocols[len(outcomes) - 1:]))
                 else:
                     # Responsive native endpoints and targeted probes retain
                     # their original early exit without speculative requests.
