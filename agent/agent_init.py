@@ -38,6 +38,7 @@ from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
     is_local_endpoint,
+    is_explicit_remote_router,
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -2785,6 +2786,8 @@ def init_agent(
             config_context_length=_effective_context_length,
             provider=agent.provider,
             custom_providers=_custom_providers,
+            **({"requested_provider": agent.requested_provider}
+               if is_explicit_remote_router(agent.provider, agent.requested_provider) else {}),
         )
         # Per-model threshold overrides are part of the explicit
         # context-engine contract: assign them BEFORE the initial
@@ -2857,6 +2860,8 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
+            metadata_requested_provider=(agent.requested_provider
+                if is_explicit_remote_router(agent.provider, agent.requested_provider) else ""),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -3066,7 +3071,8 @@ def init_agent(
             agent._ollama_num_ctx = int(_ollama_num_ctx_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
+    if (agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url)
+            and not is_explicit_remote_router(agent.provider, agent.requested_provider)):
         try:
             # ``agent.api_key`` may be a callable (Entra token provider).
             # Ollama detection makes a manual HTTP request and expects a

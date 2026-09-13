@@ -773,6 +773,15 @@ def _normalize_base_url(base_url: str) -> str:
     return (base_url or "").strip().rstrip("/")
 
 
+def is_explicit_remote_router(provider: str, requested_provider: str = "") -> bool:
+    """Recognize an explicit router, without treating arbitrary loopback as one."""
+    current = str(provider or "").strip().lower()
+    requested = str(requested_provider or "").strip().lower()
+    if current in {"custom", "openai"} and requested == "custom:omniroute":
+        current = requested
+    return current == "custom:omniroute"
+
+
 def _auth_headers(api_key: str = "") -> Dict[str, str]:
     token = str(api_key or "").strip()
     if not token:
@@ -958,6 +967,7 @@ def _reconcile_local_cached_context_length(
     base_url: str,
     cached: int,
     api_key: str = "",
+    *, native_protocol_probes: bool = True,
 ) -> int:
     """Return *cached* unless a live local probe reports a different limit.
 
@@ -970,7 +980,8 @@ def _reconcile_local_cached_context_length(
     entries but are not persisted — startup should reject them, not bless a
     sub-64K window as config.
     """
-    live_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+    probe_options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    live_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
     if live_ctx and live_ctx > 0 and live_ctx != cached:
         if live_ctx < MINIMUM_CONTEXT_LENGTH:
             logger.info(
@@ -1516,6 +1527,7 @@ def fetch_endpoint_model_metadata(
     force_refresh: bool = False,
     *,
     cached_only: bool = False,
+    native_protocol_probes: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from an OpenAI-compatible ``/models`` endpoint.
 
@@ -1529,6 +1541,8 @@ def fetch_endpoint_model_metadata(
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
     key = _endpoint_metadata_cache_key(normalized, api_key)
+    if not native_protocol_probes:
+        key += "|remote-router"
     with _endpoint_model_metadata_lock:
         if not force_refresh:
             cached = _endpoint_model_metadata_cache.get(key)
@@ -1554,7 +1568,8 @@ def fetch_endpoint_model_metadata(
         return {}
 
     try:
-        result = _fetch_endpoint_model_metadata_uncached(normalized, api_key)
+        options = {} if native_protocol_probes else {"native_protocol_probes": False}
+        result = _fetch_endpoint_model_metadata_uncached(normalized, api_key, **options)
         with _endpoint_model_metadata_lock:
             flight.result = result
             _endpoint_model_metadata_cache[key] = result
@@ -1574,7 +1589,7 @@ def fetch_endpoint_model_metadata(
 
 
 def _fetch_endpoint_model_metadata_uncached(
-    normalized: str, api_key: str,
+    normalized: str, api_key: str, *, native_protocol_probes: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Existing probe ladder; invoked once for each in-flight metadata scope."""
     _ensure_requests()
@@ -1590,7 +1605,7 @@ def _fetch_endpoint_model_metadata_uncached(
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_error: Optional[Exception] = None
 
-    if is_local_endpoint(normalized):
+    if native_protocol_probes and is_local_endpoint(normalized):
         try:
             if detect_local_server_type(normalized, api_key=api_key, lmstudio_only=True) == "lm-studio":
                 server_url = _lmstudio_server_root(normalized)
@@ -1695,7 +1710,7 @@ def _fetch_endpoint_model_metadata_uncached(
                 m.get("owned_by") == "llamacpp"
                 for m in payload.get("data", []) if isinstance(m, dict)
             )
-            if is_llamacpp:
+            if native_protocol_probes and is_llamacpp:
                 try:
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
                     base = request_candidate.rstrip("/").replace("/v1", "")
@@ -1731,9 +1746,11 @@ def _resolve_endpoint_context_length(
     model: str,
     base_url: str,
     api_key: str = "",
+    *, native_protocol_probes: bool = True,
 ) -> Optional[int]:
     """Resolve context length from an endpoint's live ``/models`` metadata."""
-    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+    options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key, **options)
     matched = endpoint_metadata.get(model)
     if not matched:
         if len(endpoint_metadata) == 1:
@@ -2475,7 +2492,7 @@ def _model_name_suggests_stale_32k_underreport(model: str) -> bool:
     return _model_name_suggests_kimi(model) or _model_name_suggests_minimax(model)
 
 
-def _query_local_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+def _query_local_context_length(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True) -> Optional[int]:
     """Query a local server for the model's context length (short-TTL cached).
 
     The live-probe paths added for local endpoints (reconcile-on-hit and the
@@ -2492,12 +2509,15 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     import time as _time
 
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
+    if not native_protocol_probes:
+        cache_key += ("remote-router",)
     now = _time.monotonic()
     cached = _LOCAL_CTX_PROBE_CACHE.get(cache_key)
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
         return cached[0]
 
-    result = _query_local_context_length_uncached(model, base_url, api_key=api_key)
+    options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    result = _query_local_context_length_uncached(model, base_url, api_key=api_key, **options)
     # Cache only positive results. A None/failure (server not up yet,
     # connection refused, timeout) must NOT be memoized — otherwise a probe
     # that fails during a startup race would suppress a legit retry seconds
@@ -2509,7 +2529,7 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     return result
 
 
-def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True) -> Optional[int]:
     """Query a local server for the model's context length."""
     import httpx
 
@@ -2529,7 +2549,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
     headers = _auth_headers(api_key)
 
     try:
-        server_type = detect_local_server_type(base_url, api_key=api_key)
+        server_type = detect_local_server_type(base_url, api_key=api_key) if native_protocol_probes else None
     except Exception:
         server_type = None
 
@@ -3148,6 +3168,7 @@ def get_model_context_length(
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,
+    *, requested_provider: str = "",
 ) -> int:
     """Get the context length for a model.
 
@@ -3247,6 +3268,9 @@ def get_model_context_length(
                 return cp_ctx
         except Exception:
             pass  # fall through to probing
+
+    native_protocol_probes = not is_explicit_remote_router(provider, requested_provider)
+    probe_options = {} if native_protocol_probes else {"native_protocol_probes": False}
 
     # Malformed user-provided URLs (for example an unmatched IPv6 bracket)
     # make urllib.parse raise. Context resolution should treat those as an
@@ -3372,7 +3396,7 @@ def get_model_context_length(
             else:
                 if is_local_endpoint(base_url):
                     return _reconcile_local_cached_context_length(
-                        model, base_url, cached, api_key=api_key,
+                        model, base_url, cached, api_key=api_key, **probe_options,
                     )
                 return cached
 
@@ -3437,7 +3461,7 @@ def get_model_context_length(
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key, **probe_options)
         if context_length is not None:
             return context_length
         if not _is_known_provider_base_url(base_url):
@@ -3448,7 +3472,7 @@ def get_model_context_length(
             # would create a false-safe window for compression (#63122).
             # Non-local endpoints preserve the existing GGUF-first behavior.
             if is_local_endpoint(base_url):
-                local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+                local_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
                 if local_ctx and local_ctx > 0:
                     if not _skip_persistent_context_cache(base_url, provider):
                         _maybe_cache_local_context_length(model, base_url, local_ctx)
@@ -3456,7 +3480,7 @@ def get_model_context_length(
             # 2b. Ollama native /api/show — non-local endpoints preserve
             # the existing generic /api/show GGUF-first behavior.
             # Non-Ollama servers return 404/405 quickly.
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            ctx = _query_ollama_api_show(model, base_url, api_key=api_key) if native_protocol_probes else None
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):
                     save_context_length(model, base_url, ctx)
@@ -3559,7 +3583,7 @@ def get_model_context_length(
     if effective_provider == "gmi" and base_url:
         # GMI exposes authoritative context_length via /models, but it is not
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
-        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key, **probe_options)
         if ctx is not None:
             return ctx
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
@@ -3580,7 +3604,7 @@ def get_model_context_length(
             and "ollama" not in _inferred_for_probe
         )
         if not _skip_ollama_probe:
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            ctx = _query_ollama_api_show(model, base_url, api_key=api_key) if native_protocol_probes else None
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):
                     save_context_length(model, base_url, ctx)
@@ -3647,7 +3671,7 @@ def get_model_context_length(
     # ``Hermes-3-Llama-3.1-70B`` substring-match ``llama`` (131072) even when
     # vLLM is running at a lower ``--max-model-len`` (e.g. 32768 on limited VRAM).
     if base_url and is_local_endpoint(base_url):
-        local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+        local_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
         if local_ctx and local_ctx > 0:
             if not _skip_persistent_context_cache(base_url, provider):
                 _maybe_cache_local_context_length(model, base_url, local_ctx)
