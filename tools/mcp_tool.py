@@ -7887,6 +7887,31 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 
+    # The cross-process lock serializes connection creation, not reads of an
+    # already-live local registry. Reuse only exact configs with healthy live
+    # sessions; missing, changed or reconnecting servers retain the guarded
+    # registration path below. This never creates a connection outside it.
+    reuse_safe = _filter_suspicious_mcp_servers(servers) == servers
+    with _lock:
+        reuse_connected = reuse_safe and all(
+            name in _servers
+            and name not in _server_connecting
+            and name not in _server_connect_errors
+            and getattr(_servers[name], "session", None) is not None
+            and getattr(_servers[name], "_error", None) is None
+            and getattr(_servers[name], "_config", None) == cfg
+            for name, cfg in servers.items()
+        )
+        if reuse_connected:
+            # Preserve register_mcp_servers' per-config parallel-call flags.
+            for name, cfg in servers.items():
+                if _parse_boolish(cfg.get("supports_parallel_tool_calls", False), default=False):
+                    _parallel_safe_servers.add(name)
+                else:
+                    _parallel_safe_servers.discard(name)
+    if reuse_connected:
+        return _existing_tool_names()
+
     # Cross-process discovery guard (#62771). A lock loser waits for
     # the holder, then performs its own process-local discovery. If locking is
     # unavailable or the bounded wait expires, preserve the previous
