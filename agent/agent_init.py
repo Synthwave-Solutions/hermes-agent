@@ -19,6 +19,9 @@ preserved.
 
 from __future__ import annotations
 
+import contextvars
+import functools
+import json
 import logging
 import os
 import re
@@ -555,6 +558,64 @@ def _enforce_dashboard_governance_model_policy(agent) -> None:
         raise PermissionError(f"dashboard governance denied model: {decision.reason}")
 
 
+_CONSTRUCTOR_PHASES = frozenset({
+    "provider_setup", "plugin_discovery", "tool_definitions", "session_setup",
+    "profile_setup", "context_setup", "context_hooks", "finalize",
+})
+_constructor_trace = contextvars.ContextVar("hermes_constructor_trace", default=None)
+
+
+def _constructor_phase(stage: str) -> None:
+    """Advance content-free diagnostics without sharing state between workers."""
+    trace = _constructor_trace.get()
+    if trace is None or stage not in _CONSTRUCTOR_PHASES:
+        return
+    now = time.perf_counter()
+    trace["phases"].append({
+        "stage": trace["stage"], "outcome": "completed",
+        "duration_ms": round(max(0.0, now - trace["started"]) * 1000, 3),
+    })
+    trace.update(stage=stage, started=now)
+
+
+def _trace_constructor(function):
+    """Record only fixed phases for an identified WebUI construction.
+
+    This is diagnostic, not a cache or scheduling change. The validated session
+    id lets an operator select one own QA construction without reading prompts,
+    credentials, model metadata, paths or other users' log content. Nested
+    constructors restore their parent's trace; exceptions remain unchanged.
+    """
+    @functools.wraps(function)
+    def wrapped(agent, *args, **kwargs):
+        sid = kwargs.get("session_id")
+        enabled = kwargs.get("platform") == "webui" and isinstance(sid, str) and bool(
+            re.fullmatch(r"[0-9a-f]{12}|[0-9a-f]{32}", sid)
+        )
+        trace = {"stage": "provider_setup", "started": time.perf_counter(), "phases": []} if enabled else None
+        token = _constructor_trace.set(trace)
+        outcome = "raised"
+        try:
+            result = function(agent, *args, **kwargs)
+            outcome = "completed"
+            return result
+        finally:
+            _constructor_trace.reset(token)
+            if trace is not None:
+                try:
+                    trace["phases"].append({
+                        "stage": trace["stage"], "outcome": outcome,
+                        "duration_ms": round(max(0.0, time.perf_counter() - trace["started"]) * 1000, 3),
+                    })
+                    logger.info("agent_init_timing %s", json.dumps({
+                        "session_id": sid, "outcome": outcome, "phases": trace["phases"],
+                    }, separators=(",", ":"), allow_nan=False))
+                except Exception:
+                    pass  # Optional observation must never mask construction/cancellation.
+    return wrapped
+
+
+@_trace_constructor
 def init_agent(
     agent,
     base_url: str = None,
@@ -1617,6 +1678,8 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    _constructor_phase("plugin_discovery")
+
     # A multiplexed gateway may enter a different HERMES_HOME after
     # ``model_tools`` was first imported. Ensure that profile's keyed plugin
     # manager has discovered its registrations before taking the tool snapshot.
@@ -1635,12 +1698,15 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    _constructor_phase("tool_definitions")
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
     
+    _constructor_phase("session_setup")
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
@@ -1824,6 +1890,8 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
+    _constructor_phase("profile_setup")
+
     # Load config once for memory, skills, and compression sections
     try:
         from hermes_cli.config import load_config_readonly as _load_agent_config
@@ -2695,6 +2763,7 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
+    _constructor_phase("context_setup")
     _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
         _config_context_length
     )
@@ -3008,6 +3077,8 @@ def init_agent(
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 
+    _constructor_phase("context_hooks")
+
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         try:
@@ -3028,6 +3099,8 @@ def init_agent(
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).
     agent._is_user_initiated_turn = False
+
+    _constructor_phase("finalize")
 
     # Usage-anchored context accounting (agent/model_metadata.py): the last
     # main-loop provider response's exact usage + transcript snapshot. None
