@@ -1176,6 +1176,30 @@ def detect_local_server_type(
     result: Optional[str] = None
     try:
         with httpx.Client(timeout=2.0, headers=headers) as client:
+            def probe(protocol):
+                # Workers return observations only. Apply failure/blackhole
+                # state below in protocol priority order, never arrival order.
+                try:
+                    if protocol == "ollama":
+                        r = client.get(f"{server_url}/api/tags")
+                        # LM Studio can return200/error for unknown endpoints.
+                        if r.status_code == 200 and "models" in r.json():
+                            return protocol, None
+                    elif protocol == "llamacpp":
+                        r = client.get(f"{server_url}/v1/props")
+                        if r.status_code != 200:
+                            r = client.get(f"{server_url}/props")
+                        if r.status_code == 200 and "default_generation_settings" in r.text:
+                            return protocol, None
+                    else:
+                        r = client.get(f"{server_url}/version")
+                        if r.status_code == 200 and "version" in r.json():
+                            return protocol, None
+                except Exception as exc:
+                    return None, exc
+                return None, None
+
+            first_read_timeout = False
             # LM Studio exposes /api/v1/models — check first (most specific)
             if not ollama_only:
                 try:
@@ -1184,41 +1208,26 @@ def detect_local_server_type(
                         result = "lm-studio"
                 except Exception as exc:
                     _probe_failed(exc)
+                    first_read_timeout = isinstance(exc, httpx.ReadTimeout)
             if result is None and not lmstudio_only:
-                # Ollama exposes /api/tags and responds with {"models": [...]}
-                # LM Studio returns {"error": "Unexpected endpoint"} with status 200
-                # on this path, so we must verify the response contains "models".
-                try:
-                    r = client.get(f"{server_url}/api/tags")
-                    if r.status_code == 200:
-                        try:
-                            data = r.json()
-                            if "models" in data:
-                                result = "ollama"
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    _probe_failed(exc)
-            if result is None and not (ollama_only or lmstudio_only):
-                # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
-                try:
-                    r = client.get(f"{server_url}/v1/props")
-                    if r.status_code != 200:
-                        r = client.get(f"{server_url}/props")  # fallback for older builds
-                    if r.status_code == 200 and "default_generation_settings" in r.text:
-                        result = "llamacpp"
-                except Exception as exc:
-                    _probe_failed(exc)
-            if result is None and not (ollama_only or lmstudio_only):
-                # vLLM: /version
-                try:
-                    r = client.get(f"{server_url}/version")
-                    if r.status_code == 200:
-                        data = r.json()
-                        if "version" in data:
-                            result = "vllm"
-                except Exception as exc:
-                    _probe_failed(exc)
+                protocols = ("ollama",) if ollama_only else ("ollama", "llamacpp", "vllm")
+                if first_read_timeout and not ollama_only:
+                    # A slow non-native gateway can time out every optional
+                    # protocol endpoint. Overlap the remaining reads, keeping
+                    # the same timeout, endpoints and result precedence. Join
+                    # all workers before closing their shared HTTPX client.
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="hermes-local-probe") as pool:
+                        outcomes = list(pool.map(probe, protocols))
+                else:
+                    # Responsive native endpoints and targeted probes retain
+                    # their original early exit without speculative requests.
+                    outcomes = map(probe, protocols)
+                for result, error in outcomes:
+                    if error is not None:
+                        _probe_failed(error)
+                    if result is not None:
+                        break
     except Exception:
         pass
 
