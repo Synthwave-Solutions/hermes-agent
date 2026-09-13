@@ -133,3 +133,20 @@ def test_external_cancellation_propagates_without_positive_cache(endpoint):
     with pytest.raises(KeyboardInterrupt, match="fixture cancellation"):
         resolve()
     assert not metadata._LOCAL_CTX_PROBE_CACHE
+
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_callable_credential_never_invoked_or_cached_and_keeps_probe_fallback(endpoint, status):
+    calls = []
+    def credential():
+        calls.append(True)
+        raise AssertionError("Metadata must not execute a credential provider")
+    endpoint["status"] = status
+    expected = 98304 if status == 200 else 65536
+    assert resolve(credential) == expected
+    assert calls == [] and not metadata._LOCAL_CTX_PROBE_CACHE
+    if status == 200:
+        endpoint["window"] = 196608
+        assert resolve(credential) == 196608
+        assert len(endpoint["paths"]) == 2
+        assert calls == [] and not metadata._LOCAL_CTX_PROBE_CACHE

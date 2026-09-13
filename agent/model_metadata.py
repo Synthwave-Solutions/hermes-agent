@@ -2510,6 +2510,13 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
 
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
     if not native_protocol_probes:
+        # Runtime credential providers may be callables. Do not execute them
+        # for metadata or invent a stable identity for their changing tokens;
+        # preserve the existing probe/fallback behavior without memoization.
+        if api_key is not None and not isinstance(api_key, str):
+            return _query_local_context_length_uncached(
+                model, base_url, api_key=api_key, native_protocol_probes=False,
+            )
         # A router can advertise different windows for different users. Do
         # not let the short-lived probe result escape its profile/credential
         # scope, even when two callers use the same loopback gateway URL.

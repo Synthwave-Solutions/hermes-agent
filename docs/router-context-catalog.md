@@ -18,15 +18,20 @@ The existing positive-only, 30-second probe snapshot now includes the active
 profile and credential fingerprint for this router mode. No new cache, disk
 snapshot, authorization decision, background worker or longer TTL is added.
 Metadata is not an access grant; request authorization continues independently.
+Non-string credentials, including token-provider callables, retain the original
+probe/fallback behavior without using the snapshot. Metadata never invokes
+those callables or assumes a stable identity for the credentials they provide.
 
 Validation uses a real AIAgent constructor and hermetic HTTP transports. The
 unsupported detail request consumes an injected three-second transport budget;
 the catalog returns a changed context window. The original source produces six
-failures and two passes; the corrected source passes all eight cases, covering
+failures and two passes; the initial correction passes all eight cases, covering
 profile/credential separation, the existing TTL, failed-probe recovery, explicit
 overrides, subminimum limits and external cancellation. Neighbor fixtures still
 exercise native protocol detection and update the router's expected request to
-the supported catalog. Injected transport time is not a production benchmark.
+the supported catalog. Review added two callable-credential regressions; the
+unamended candidate fails both before the non-string cache guard. The final
+candidate passes all ten cases. Injected transport time is not a production benchmark.
 
 The source fix needs an independent review and a real post-release own-chat
 measurement before claiming a user-visible latency improvement.
