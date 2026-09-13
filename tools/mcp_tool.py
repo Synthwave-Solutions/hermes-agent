@@ -3480,7 +3480,10 @@ class MCPServerTask:
                 # implement it (405 Method Not Allowed / 501 Not Implemented).
                 resp = await client.head(url, headers=probe_headers)
                 if resp.status_code in (405, 501):
-                    resp = await client.get(url, headers=probe_headers)
+                    # Diagnose only headers: an MCP GET may be a valid SSE
+                    # stream that intentionally never finishes its body.
+                    async with client.stream("GET", url, headers=probe_headers) as resp:
+                        pass
 
                 # Some MCP servers (e.g. DocuSeal) serve their web UI on
                 # HEAD/GET but speak Streamable HTTP only via POST.  Before
@@ -3497,8 +3500,8 @@ class MCPServerTask:
                     and ct not in self._MCP_CONTENT_TYPES
                     and 200 <= resp.status_code < 300
                 ):
-                    post_resp = await client.post(
-                        url,
+                    async with client.stream(
+                        "POST", url,
                         headers={
                             **probe_headers,
                             "Content-Type": "application/json",
@@ -3512,7 +3515,10 @@ class MCPServerTask:
                             '"clientInfo":{"name":"hermes-probe",'
                             '"version":"0.1"}}}'
                         ),
-                    )
+                    ) as post_resp:
+                        # initialize may also return an open SSE stream. Close
+                        # this optional probe before the real SDK handshake.
+                        pass
                     if 200 <= post_resp.status_code < 300:
                         post_ct = (
                             post_resp.headers.get("content-type", "")
