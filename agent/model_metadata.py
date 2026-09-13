@@ -2510,7 +2510,10 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
 
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
     if not native_protocol_probes:
-        cache_key += ("remote-router",)
+        # A router can advertise different windows for different users. Do
+        # not let the short-lived probe result escape its profile/credential
+        # scope, even when two callers use the same loopback gateway URL.
+        cache_key += ("remote-router", _endpoint_metadata_cache_key(base_url, api_key))
     now = _time.monotonic()
     cached = _LOCAL_CTX_PROBE_CACHE.get(cache_key)
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
@@ -2601,24 +2604,27 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                                     return int(ctx)
                             break
 
-            # LM Studio / vLLM / llama.cpp / Anthropic-compat proxies:
-            # try /v1/models/{model}
-            resp = client.get(f"{server_url}/v1/models/{model}")
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    # Context-WINDOW keys only (canonical _CONTEXT_LENGTH_KEYS
-                    # vocabulary). `max_tokens` is the max *output* tokens on
-                    # OpenAI-compatible passthroughs (LiteLLM, Anthropic-compat
-                    # shims, cloud proxies) — e.g. 393216 for a 1M-context
-                    # model — so reading it ahead of real window keys collapses
-                    # the window to the output cap and poisons the context
-                    # cache. It is consulted only as an explicit last resort
-                    # inside _context_length_from_model_payload, for servers
-                    # that report nothing else.
-                    ctx = _context_length_from_model_payload(data)
-                    if ctx is not None:
-                        return ctx
+            # Native servers may expose a more precise per-model runtime
+            # window. Explicit OmniRoute routes expose the standard catalog,
+            # not this detail route; probing it spends the read deadline and
+            # can prevent the authoritative catalog fallback below entirely.
+            if native_protocol_probes:
+                resp = client.get(f"{server_url}/v1/models/{model}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        # Context-WINDOW keys only (canonical _CONTEXT_LENGTH_KEYS
+                        # vocabulary). `max_tokens` is the max *output* tokens on
+                        # OpenAI-compatible passthroughs (LiteLLM, Anthropic-compat
+                        # shims, cloud proxies) — e.g. 393216 for a 1M-context
+                        # model — so reading it ahead of real window keys collapses
+                        # the window to the output cap and poisons the context
+                        # cache. It is consulted only as an explicit last resort
+                        # inside _context_length_from_model_payload, for servers
+                        # that report nothing else.
+                        ctx = _context_length_from_model_payload(data)
+                        if ctx is not None:
+                            return ctx
 
             # Try /v1/models and find the model in the list.
             # Use _model_id_matches to handle "publisher/slug" vs bare "slug".

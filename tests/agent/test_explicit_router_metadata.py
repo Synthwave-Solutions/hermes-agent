@@ -57,7 +57,7 @@ def test_native_constructor_router_keeps_live_window_without_hardware_probes(end
         skip_memory=True,reasoning_config={'enabled':True,'effort':'high'},platform='webui')
     try:
         assert agent.context_compressor.context_length==98304
-        assert '/v1/models/'+MODEL in endpoint['paths']
+        assert endpoint['paths'] == ['/v1/models']
         assert not NATIVE.intersection(endpoint['paths'])
         assert agent._ollama_num_ctx is None
         assert agent.model==MODEL and agent.reasoning_config['effort']=='high'
@@ -74,10 +74,10 @@ def test_router_reconciles_changed_and_subminimum_model_windows(endpoint,window)
     value=metadata.get_model_context_length(MODEL,URL,'fixture-only',provider='custom',requested_provider='custom:omniroute')
     assert value==window and not NATIVE.intersection(endpoint['paths'])
 
-def test_router_detail_miss_preserves_models_list_fallback(endpoint):
+def test_router_does_not_require_a_detail_route(endpoint):
     endpoint['detail_status']=404
     value=metadata.get_model_context_length(MODEL,URL,'fixture-only',provider='custom',requested_provider='custom:omniroute')
-    assert value==98304 and endpoint['paths']==['/v1/models/'+MODEL,'/v1/models']
+    assert value==98304 and endpoint['paths']==['/v1/models']
 
 def test_explicit_context_still_wins_without_endpoint_read(endpoint):
     value=metadata.get_model_context_length(MODEL,URL,'fixture-only',config_context_length=196608,provider='custom',requested_provider='custom:omniroute')

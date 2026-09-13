@@ -38,12 +38,12 @@ def native(monkeypatch, tmp_path, caplog):
 
     def response(request):
         state["paths"].append(request.url.path)
-        if request.url.path != "/v1/models/" + MODEL:
+        if request.url.path != "/v1/models":
             state["unexpected"].append("httpx")
             raise AssertionError("Unexpected hermetic HTTP path")
         assert request.headers["Authorization"] == "Bearer fixture-private-key"
         state["clock"] += 3.0
-        return httpx.Response(200, json={"id": MODEL, "context_length": 98304})
+        return httpx.Response(200, json={"data": [{"id": MODEL, "context_length": 98304}]})
 
     sync, async_ = httpx.Client, httpx.AsyncClient
     class Sync(sync):
@@ -86,7 +86,7 @@ def test_native_constructor_reports_actual_phase_cost_without_route_change(nativ
         assert agent.model == MODEL and agent.requested_provider == "custom:omniroute"
         assert agent.reasoning_config["effort"] == "high"
         assert agent.context_compressor.context_length == 98304
-        assert native["paths"] == ["/v1/models/" + MODEL]
+        assert native["paths"] == ["/v1/models"]
         rows = observations(caplog)
         assert len(rows) == 1
         row = rows[0]
