@@ -784,11 +784,28 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
+    _review_skill_counter = getattr(agent, "_iters_since_skill", None)
     if (agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
+
+    from agent.background_review import trace_background_review
+    trace_background_review(
+        agent, "gate",
+        skill_available="skill_manage" in (getattr(agent, "valid_tool_names", ()) or ()),
+        skill_counter=_review_skill_counter,
+        skill_interval=agent._skill_nudge_interval,
+        review_skills=_should_review_skills,
+        review_memory=bool(_should_review_memory),
+        final_response_present=bool(final_response),
+        interrupted=bool(interrupted),
+        skip_background_review=bool(getattr(agent, "skip_background_review", False)),
+        eligible=bool(final_response and not interrupted
+                      and not getattr(agent, "skip_background_review", False)
+                      and (_should_review_memory or _should_review_skills)),
+    )
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(

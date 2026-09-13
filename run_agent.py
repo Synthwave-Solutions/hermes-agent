@@ -1933,7 +1933,9 @@ class AIAgent:
         # model and replays the whole conversation at premium rates, silently
         # inflating token cost (#85859). An explicit ``/refine`` (``focus`` set)
         # is a deliberate user request and still runs.
+        from agent.background_review import trace_background_review
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
+            trace_background_review(self, "skipped", reason="delegated")
             return
         # Explicit off-switch for automatic post-turn forks
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
@@ -1945,6 +1947,7 @@ class AIAgent:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
+                trace_background_review(self, "skipped", reason="disabled")
                 return
         from agent.background_review import (
             finish_background_review_run,
@@ -1955,6 +1958,7 @@ class AIAgent:
 
         review_run = prepare_background_review_run(self)
         if review_run is None:
+            trace_background_review(self, "skipped", reason="reservation_unavailable")
             return
         try:
             target, _prompt = spawn_background_review_thread(
@@ -1973,8 +1977,11 @@ class AIAgent:
                 daemon=True,
                 name="bg-review",
             )
+            trace_background_review(self, "scheduled", review_run=review_run,
+                                    review_memory=bool(review_memory), review_skills=bool(review_skills))
             t.start()
         except Exception:
+            trace_background_review(self, "failed", review_run=review_run, reason="startup_exception")
             finish_background_review_run(self, review_run)
             raise
 
