@@ -318,6 +318,19 @@ def is_background_review_enabled(
 
 
 
+def _review_requested_provider(provider: str, requested: Optional[str]) -> str:
+    """Keep a named custom route only on its current compatible transport.
+
+    A fallback to another provider must not inherit the old router label. The
+    runtime's current identity (parent or explicit auxiliary) is authoritative.
+    """
+    if provider in {"custom", "openai"} and isinstance(requested, str):
+        requested = requested.strip().lower()
+        if requested.startswith("custom:"):
+            return requested
+    return provider
+
+
 def _resolve_review_runtime(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -336,6 +349,9 @@ def _resolve_review_runtime(
         parent_api_mode = "codex_responses"
     parent = {
         "provider": agent.provider,
+        "requested_provider": _review_requested_provider(
+            agent.provider, getattr(agent, "requested_provider", None)
+        ),
         "model": agent.model,
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
@@ -366,6 +382,10 @@ def _resolve_review_runtime(
         )
         return {
             "provider": rp.get("provider") or task_provider,
+            "requested_provider": _review_requested_provider(
+                rp.get("provider") or task_provider,
+                rp.get("requested_provider") or task_provider,
+            ),
             "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
@@ -1223,6 +1243,7 @@ def build_cache_parity_fork(
         quiet_mode=True,
         platform=agent.platform,
         provider=_rt.get("provider") or agent.provider,
+        requested_provider=_rt.get("requested_provider"),
         api_mode=_rt.get("api_mode"),
         base_url=_rt.get("base_url") or None,
         api_key=_rt.get("api_key") or None,
