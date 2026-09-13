@@ -27,7 +27,12 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    uses_local_inference_patience,
+    resolve_agent_provider_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason,
@@ -888,7 +893,7 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = resolve_agent_provider_timeout(agent, get_provider_stale_timeout)
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -4105,7 +4110,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = resolve_agent_provider_timeout(agent, get_provider_request_timeout)
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
@@ -4121,7 +4126,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
             # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
+            if _stream_read_timeout == 120.0 and uses_local_inference_patience(agent):
                 _stream_read_timeout = _base_timeout
                 logger.debug(
                     "Local provider detected (%s) — stream read timeout raised to %.0fs",
@@ -5299,7 +5304,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = resolve_agent_provider_timeout(agent, get_provider_stale_timeout)
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
@@ -5313,7 +5318,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # unless the user explicitly set HERMES_STREAM_STALE_TIMEOUT; override the
     # local ceiling with HERMES_LOCAL_STREAM_STALE_TIMEOUT (documented in
     # website/docs/reference/environment-variables.md).
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
+    if _stream_stale_timeout_base == 180.0 and uses_local_inference_patience(agent):
         # Read config.yaml ``agent.local_stream_stale_timeout`` (default 900),
         # env var ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch.
         _local_default = 900.0

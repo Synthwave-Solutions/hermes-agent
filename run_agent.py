@@ -122,6 +122,8 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
+    uses_local_inference_patience,
+    resolve_agent_provider_timeout,
 )
 
 _hermes_home = get_hermes_home()
@@ -1467,7 +1469,7 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = resolve_agent_provider_timeout(self, get_provider_request_timeout)
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -1490,7 +1492,7 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = resolve_agent_provider_timeout(self, get_provider_stale_timeout)
         if cfg is not None:
             return cfg, False
 
@@ -1523,7 +1525,7 @@ class AIAgent:
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
-        if uses_implicit_default and base_url and is_local_endpoint(base_url):
+        if uses_implicit_default and uses_local_inference_patience(self, base_url):
             return float("inf")
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
@@ -1560,7 +1562,7 @@ class AIAgent:
         and the 90s default are implicit — they yield to the wall-clock run
         budget cap; explicit user configuration never does.
         """
-        if get_provider_stale_timeout(self.provider, self.model) is not None:
+        if resolve_agent_provider_timeout(self, get_provider_stale_timeout) is not None:
             return True
         return os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
 
@@ -5622,7 +5624,7 @@ class AIAgent:
             "direct",
             self._anthropic_api_key,
             getattr(self, "_anthropic_base_url", None),
-            get_provider_request_timeout(self.provider, self.model),
+            resolve_agent_provider_timeout(self, get_provider_request_timeout),
             bool(getattr(self, "_oauth_1m_beta_disabled", False)),
         )
 
@@ -5687,7 +5689,7 @@ class AIAgent:
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=resolve_agent_provider_timeout(self, get_provider_request_timeout),
                 drop_context_1m_beta=key[4],
             )
         logger.debug(
@@ -6356,7 +6358,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=resolve_agent_provider_timeout(self, get_provider_request_timeout),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6498,7 +6500,7 @@ class AIAgent:
             self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=resolve_agent_provider_timeout(self, get_provider_request_timeout),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -6609,7 +6611,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=resolve_agent_provider_timeout(self, get_provider_request_timeout),
                 drop_context_1m_beta=_drop_1m,
             )
 

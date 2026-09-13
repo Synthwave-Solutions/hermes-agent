@@ -1456,6 +1456,7 @@ def init_agent(
                             continue
                         if _fb_client is not None:
                             agent.provider = _fb["provider"]
+                            agent.requested_provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
                             client_kwargs = {
