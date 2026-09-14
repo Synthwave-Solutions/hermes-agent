@@ -86,19 +86,33 @@ def _check_dwd_identity(segments: list[list[str]], identity: str) -> AccessDecis
 # session check). Such an account is closed by its EXPLICIT blacklist only, so
 # the lenient gate keeps exactly those checks, made robust against structure:
 #   * a denied path anywhere in the line (regex over the raw string);
-#   * a denied command name as ANY token, not just a segment's argv0, so
-#     `python3 ~/x/bunq_cli.py`, `xargs productive`, `do sudo ...` all bite;
-#   * the DWD identity binding wherever a DWD CLI appears, even behind `do`
-#     or inside a substitution the strict parser would have refused;
+#   * a denied command name at every position where a word can be EXECUTED:
+#     each segment's command word after assignments, redirects, control heads
+#     and exec-forwarders (sudo, env, xargs, nohup, time, ...), the forwarders
+#     themselves, the word after find -exec, interpreter targets, and the text
+#     handed to sh -c, eval, $( ), backticks and process substitution. A word a
+#     command merely mentions (a commit message, a grep pattern, a package
+#     name, VAR=value) is not a command and does not refuse (sweep 14-09);
+#   * the DWD identity binding wherever a DWD CLI is such a command word;
 #   * the HERMES_DWD_IDENTITY tamper guard.
 # Whitelist and legacy accounts keep the strict parser unchanged.
 _TOKEN_SHELL_PUNCT = "`'\"()$;|&{}<>\n"
+_EXEC_FORWARDERS = frozenset({
+    "sudo", "doas", "nohup", "setsid", "stdbuf", "nice", "ionice", "time", "timeout",
+    "watch", "chroot", "strace", "ltrace", "xargs", "parallel", "exec", "command",
+    "builtin", "env",
+})
+# forwarder options that consume the next word, so it is not mistaken for the
+# command: sudo -u USER, xargs -n N, nice -n N, timeout -k D, env -u NAME ...
+_FORWARDER_OPTS_WITH_ARG = frozenset({"-u", "-g", "-n", "-P", "-L", "-s", "-d", "-a", "-E", "-k", "-C", "-o", "-f", "-c", "-p"})
+_FORWARDER_POSITIONALS = {"timeout": 1, "chroot": 1}
+_SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+_FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 
 
 def _lenient_tokens(command_s: str) -> list[str]:
-    """Best-effort tokens of the WHOLE command, heredoc bodies and
-    substitutions included. shlex first; when shell structure defeats it,
-    whitespace-split so a denied name still surfaces."""
+    """Best-effort tokens of a command string. shlex first; when shell
+    structure defeats it, whitespace-split so a command word still surfaces."""
     try:
         raw = shlex.split(command_s, posix=True)
     except ValueError:
@@ -119,39 +133,120 @@ def _lenient_segments(command_s: str) -> list[list[str]]:
         return [_lenient_tokens(command_s)]
 
 
-def _check_dwd_identity_anywhere(segments: list[list[str]], identity: str) -> AccessDecision:
-    """Like _check_dwd_identity, but a DWD CLI is recognised at ANY token
-    position of a segment (`do gmail list`, `time gchat send`), and each
-    occurrence is checked with the tokens that follow it."""
-    for tokens in segments:
-        for index, tok in enumerate(tokens):
-            if os.path.basename(tok) not in _DWD_CLIS:
+def _lenient_fragments(command_s: str) -> list[str]:
+    """Nested shell text the shell would run as commands: backticks, $( ) and
+    process substitution."""
+    frags = re.findall(r"`([^`]*)`", command_s)
+    try:
+        _, inners = _extract_cmd_substitutions(command_s.replace("`", " "))
+        frags += inners
+    except ValueError:
+        frags += re.findall(r"\$\(([^()]*)\)", command_s)
+    frags += re.findall(r"[<>]\(([^()]*)\)", command_s)
+    return [frag for frag in frags if frag.strip()]
+
+
+def _lenient_heredocs(command: str) -> tuple[str, list[str]]:
+    """Like _strip_heredocs, but hands back EVERY body, quoted delimiter or
+    not: for the lenient gate a body fed to a shell (`bash <<'SH'`) is a list
+    of commands whichever way its delimiter is quoted."""
+    if "<<" not in command:
+        return command, []
+    lines = command.split("\n")
+    kept: list[str] = []
+    bodies: list[str] = []
+    index = 0
+    quote = ""
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        matches, quote = _heredoc_openers(line, quote)
+        openers = [(match.group(3) or match.group(4), match.group(1) == "-") for match in matches]
+        for match in reversed(matches):
+            line = line[:match.start()] + " " + line[match.end():]
+        kept.append(line)
+        for delimiter, strip_tabs in openers:
+            body: list[str] = []
+            while index < len(lines):
+                current = lines[index]
+                if current.strip() == delimiter or (strip_tabs and current.lstrip("\t") == delimiter):
+                    index += 1
+                    break
+                body.append(current)
+                index += 1
+            bodies.append("\n".join(body))
+    return "\n".join(kept), bodies
+
+
+def _lenient_command_words(command_s: str, depth: int = 0) -> list[tuple[str, list[str]]]:
+    """(word, following tokens) for every word this command can EXECUTE."""
+    if depth > 4:
+        return []
+    words: list[tuple[str, list[str]]] = []
+    head, bodies = _lenient_heredocs(command_s)
+    for segment in _lenient_segments(head):
+        skip = 0
+        argv0_found = False
+        for index, tok in enumerate(segment):
+            if skip:
+                skip -= 1
                 continue
-            decision = _check_dwd_identity([tokens[index:]], identity)
-            if not decision.allowed:
-                return decision
-    return AccessDecision(True, "arguments_allowed")
+            if _REDIRECT_TOKEN_RE.match(tok):
+                skip = 1
+                continue
+            tail = segment[index + 1:]
+            if not argv0_found:
+                if _ENV_ASSIGNMENT_RE.match(tok) or tok in _SHELL_CONTROL_HEADS:
+                    continue
+                base = os.path.basename(tok)
+                if base in _EXEC_FORWARDERS:
+                    words.append((tok, tail))
+                    skip = _FORWARDER_POSITIONALS.get(base, 0)
+                    continue
+                if tok.startswith("-"):
+                    if tok in _FORWARDER_OPTS_WITH_ARG:
+                        skip = 1
+                    continue
+                argv0_found = True
+                words.append((tok, tail))
+                if base in _SHELL_NAMES and "-c" in tail:
+                    code = tail[tail.index("-c") + 1:]
+                    if code:
+                        words += _lenient_command_words(code[0], depth + 1)
+                elif base == "eval":
+                    words += _lenient_command_words(" ".join(tail), depth + 1)
+                continue
+            if tok in _FIND_EXEC_FLAGS and tail:
+                words.append((tail[0], tail[1:]))
+        words += [(target, []) for target in _interpreter_targets(segment)]
+    for frag in _lenient_fragments(head):
+        words += _lenient_command_words(frag, depth + 1)
+    if bodies and any(os.path.basename(word) in _SHELL_NAMES for word, _ in words):
+        for body in bodies:
+            words += _lenient_command_words(body, depth + 1)
+    return words
 
 
 def _check_cli_command_lenient(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, inbox: str = "") -> AccessDecision:
     denied_path = _check_denied_paths(command_s, grants, inbox)
     if not denied_path.allowed:
         return denied_path
-    tokens = _lenient_tokens(command_s)
+    words = _lenient_command_words(command_s)
     if grants.cli_denied_commands:
         from .models import grant_matches
-        for tok in tokens:
-            base = os.path.basename(tok)
-            if grant_matches(grants.cli_denied_commands, tok) or (base and grant_matches(grants.cli_denied_commands, base)):
-                return AccessDecision(False, "cli_command_denied", detail=tok)
+        for word, _tail in words:
+            base = os.path.basename(word)
+            if grant_matches(grants.cli_denied_commands, word) or (base and grant_matches(grants.cli_denied_commands, base)):
+                return AccessDecision(False, "cli_command_denied", detail=word)
     if dwd_identity is not _DWD_UNRESTRICTED:
         tamper = _check_identity_env_tamper(command_s)
         if not tamper.allowed:
             return tamper
-        if any(os.path.basename(tok) in _DWD_CLIS for tok in tokens):
-            dwd_decision = _check_dwd_identity_anywhere(_lenient_segments(command_s), dwd_identity)
-            if not dwd_decision.allowed:
-                return dwd_decision
+        for word, tail in words:
+            if os.path.basename(word) in _DWD_CLIS:
+                dwd_decision = _check_dwd_identity([[word, *tail]], dwd_identity)
+                if not dwd_decision.allowed:
+                    return dwd_decision
     return AccessDecision(True, "arguments_allowed")
 
 

@@ -1175,19 +1175,45 @@ class TestBlacklistTerminalIsStructureAgnostic:
         ("for i in 1; do sudo ls; done", "cli_command_denied"),
         ("cd /workspace && python3 ~/bunq-agentic/bunq_cli.py", "file_denied_glob"),
         ("echo x | productive list", "cli_command_denied"),
-        ("python3 - <<'PY'\nimport bunq_client\nPY", "cli_command_denied"),
+        ("bash <<'SH'\nbunq balance\nSH", "cli_command_denied"),
         ("cat ~/.config/bunq/token.json", "file_denied_glob"),
         ("echo `productive`", "cli_command_denied"),
+        ("bash -c \"bunq balance\"", "cli_command_denied"),
+        ("eval \"bunq list\"", "cli_command_denied"),
+        ("x=$(bunq balance); echo $x", "cli_command_denied"),
+        ("ls | xargs -n 1 productive", "cli_command_denied"),
+        ("sudo -u alice bunq balance", "cli_command_denied"),
+        (r"find . -name '*.py' -exec productive {} \;", "cli_command_denied"),
+        ("nohup productive sync &", "cli_command_denied"),
     ])
     def test_the_explicit_blacklist_still_bites_anywhere(self, command, reason):
         d = self._decide(command)
         assert not d.allowed and d.reason == reason, (command, d.reason, d.detail)
+
+    @pytest.mark.parametrize("command", [
+        'git commit -m "sync productive hours to sheet"',
+        "git commit -m 'remove bunq link from readme'",
+        "grep -rn productive src/",
+        "grep -rn sudo README.md",
+        "echo do not use sudo here",
+        "pip install trading212-api",
+        "PROJECT=productive-sync npm run build",
+        "npm run build -- --productive",
+        "grep -rn gmail src/",
+        "pip install gmail-api",
+        "cat notes.txt | grep -i su",
+    ])
+    def test_a_word_that_is_merely_mentioned_is_not_a_command(self, command):
+        d = self._decide(command)
+        assert d.allowed, (command, d.reason, d.detail)
 
     @pytest.mark.parametrize("command,reason", [
         ("gmail list", "dwd_identity_required"),
         ("cd /workspace && gmail list", "dwd_identity_required"),
         ("for i in 1; do gmail list; done", "dwd_identity_required"),
         ("echo `gmail list`", "dwd_identity_required"),
+        ("timeout 30 gmail list", "dwd_identity_required"),
+        ("bash -c 'gmail list'", "dwd_identity_required"),
         ("gmail --as michael@synthwave.solutions list", "dwd_identity_mismatch"),
         ("HERMES_DWD_IDENTITY=x gmail --as iflair@synthwave.solutions list", "dwd_identity_tamper"),
     ])
