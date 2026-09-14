@@ -56,7 +56,9 @@ def test_levels_and_explicit_denials_remain_independent(level):
 
 def test_default_allow_preserves_constraints_and_explicit_secret_forwarding():
     a = access(policy())
-    assert a.grants.file_denied_globs == frozenset({"*/bank/*", "*/private/*"})
+    # 14-09-2026: the role's */bank/* no longer reaches a blacklist account;
+    # its own denied_globs are its whole file blacklist (Michael's decision).
+    assert a.grants.file_denied_globs == frozenset({"*/private/*"})
     assert a.grants.file_allow_globs == frozenset({"*/private/example.md"})
     assert a.grants.cli_approval_commands == frozenset({"deploy-prod"})
     assert a.grants.usage_caps == {"tool_calls": 12}
@@ -139,3 +141,48 @@ def test_actual_file_argument_check_resolves_and_rejects_symlink_denial(tmp_path
     for tool in ('read_file', 'write_file'):
         decision = decide_tool_argument_access(rights, tool, {'path': str(alias)})
         assert not decision.allowed and decision.reason == 'file_denied_glob'
+
+
+class TestBlacklistCarriesOnlyItsOwnFileBlacklist:
+    """14-09-2026 (Michael: "blacklisted users kunnen overal bij"): the generic
+    secret rules of a role or group (every .env, **/.hermes/**, key files) are
+    written for whitelist colleagues. Merged into a default-allow account they
+    blocked most of what the person was otherwise allowed to reach. A
+    blacklist account is closed by its own denied_globs only; whitelist and
+    legacy accounts keep the role rules."""
+
+    RAW = {
+        "mode": "enforce",
+        "roles": {"member": {"grants": {
+            "permissions": ["chat:use", "files:read", "terminal:use"],
+            "routes": ["*"], "profiles": ["me"], "tools": {"builtins": ["*"]},
+            "files": {"read_roots": ["/home/synthwavehq"],
+                      "denied_globs": ["**/.env", "**/.hermes/**", "**/*.pem"]},
+        }}},
+        "users": {"me@example.test": {"roles": ["member"], "grants": {"files": {"denied_globs": ["**/bunq*"]}}}},
+    }
+
+    def _access(self, **entry):
+        from copy import deepcopy
+        from hermes_cli.dashboard_governance.loader import parse_governance_policy
+        from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        raw = deepcopy(self.RAW)
+        raw["users"]["me@example.test"].update(entry)
+        return resolve_effective_access(parse_governance_policy(raw), GovernanceSubject(email="me@example.test"))
+
+    def test_a_blacklist_account_keeps_only_its_own_denies(self):
+        a = self._access(access_mode="blacklist", access_level="elevated")
+        assert a.grants.file_denied_globs == frozenset({"**/bunq*"})
+
+    def test_its_own_blacklist_still_closes(self):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        a = self._access(access_mode="blacklist", access_level="elevated")
+        assert decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/clients/x/.env"}).allowed
+        assert decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/.hermes/skills/x/SKILL.md"}).allowed
+        assert not decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/bunq-agentic/bunq_cli.py"}).allowed
+
+    def test_whitelist_and_legacy_accounts_keep_the_role_rules(self):
+        for entry in ({"access_mode": "whitelist", "access_level": "elevated"}, {}):
+            a = self._access(**entry)
+            assert "**/.env" in a.grants.file_denied_globs and "**/.hermes/**" in a.grants.file_denied_globs

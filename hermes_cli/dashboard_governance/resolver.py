@@ -132,6 +132,12 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
             grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
             direct_grants_applied = True
             grants = _merge_grant(grants, _wildcard_grants(), "access_mode:blacklist", sources, permission_sources)
+            # 14-09-2026 (Michael): a blacklist account carries exactly ONE
+            # file blacklist, its own. Role and group denied_globs are the
+            # generic secret rules written for whitelist colleagues; merged
+            # into a default-allow account they closed ~/.hermes, every .env
+            # and every key file the person was otherwise allowed to reach.
+            grants = replace(grants, file_denied_globs=frozenset(user.grants.file_denied_globs))
         else:
             # Whitelist and level-only legacy entries retain their configured
             # resource ceiling. Bootstrap ownership is handled separately.
