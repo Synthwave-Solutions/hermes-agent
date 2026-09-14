@@ -1012,3 +1012,111 @@ class TestDeliveryLeadActsForColleagues:
         from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
         assert dwd_identity_for(self._access(roles=("admin_delivery",))) is None
         assert dwd_identity_for(self._access(roles=("operator",))) == self.ME
+
+
+class TestOwnSessionAttachmentsAreReadable:
+    """14-09-2026: the WebUI writes uploads and large composer pastes to
+    <hermes home>/webui/attachments/<session>/, under the `**/.hermes/**`
+    secret boundary, so a governed user could not read the .md the WebUI had
+    just made from their own paste (Hrishikesh), and every paste raised an
+    access request. The inbox of the session a turn runs under is that
+    person's own message: readable without a grant. Every other session's
+    inbox, and anything a link or `..` inside it points at, stays governed."""
+
+    SID = "995b40e6ef40"
+    OTHER = "0123456789ab"
+    ME = "hrishikesh@synthwave.solutions"
+
+    @pytest.fixture(autouse=True)
+    def _inbox(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes" / "webui" / "attachments"
+        monkeypatch.setenv("HERMES_WEBUI_ATTACHMENT_DIR", str(root))
+        self.inbox = root / self.SID
+        self.inbox.mkdir(parents=True)
+        self.paste = self.inbox / "pasted-text-2026-09-14_05-23-49-141.md"
+        self.paste.write_text("gehaald uit google chat")
+        self.other = root / self.OTHER / "pasted-text-x.md"
+        self.other.parent.mkdir()
+        self.other.write_text("someone else's paste")
+        self.secret = tmp_path / ".hermes" / "gmail-dwd-sa.json"
+        self.secret.write_text("{}")
+
+    def _access(self, **extra):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset({"cat", "head"}),
+                file_read_roots=frozenset({"/home/synthwavehq/clients"}),
+                file_denied_globs=frozenset({"**/.hermes/**", "**/*-sa.json"}),
+            ),
+            **extra,
+        )
+
+    def _decide(self, tool, args, session_id=SID, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), tool, args, session_id=session_id)
+
+    def test_the_paste_of_the_running_session_is_readable(self):
+        d = self._decide("read_file", {"path": str(self.paste)})
+        assert d.allowed and d.reason == "session_attachment_allowed"
+
+    def test_searching_the_own_inbox_is_allowed(self):
+        assert self._decide("search_files", {"path": str(self.inbox)}).allowed
+
+    def test_the_terminal_may_read_it_too(self):
+        assert self._decide("terminal", {"command": f"head -50 {self.paste}"}).allowed
+
+    def test_another_sessions_inbox_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.other)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}).allowed
+
+    def test_without_a_session_nothing_changes(self):
+        d = self._decide("read_file", {"path": str(self.paste)}, session_id="")
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_a_malformed_session_id_opens_nothing(self):
+        assert not self._decide("read_file", {"path": str(self.paste)}, session_id="../..").allowed
+
+    def test_a_traversal_out_of_the_inbox_is_still_refused(self):
+        sneaky = self.inbox / ".." / ".." / "gmail-dwd-sa.json"
+        assert not self._decide("read_file", {"path": str(sneaky)}).allowed
+        assert not self._decide("terminal", {"command": f"cat {sneaky}"}).allowed
+
+    def test_a_symlink_inside_the_inbox_resolves_to_its_target(self):
+        link = self.inbox / "innocent.md"
+        link.symlink_to(self.secret)
+        assert not self._decide("read_file", {"path": str(link)}).allowed
+        assert not self._decide("terminal", {"command": f"cat {link}"}).allowed
+
+    def test_writing_into_the_inbox_is_not_widened(self):
+        d = self._decide("write_file", {"path": str(self.inbox / "note.md")})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_a_blacklist_user_gets_the_same_exception(self):
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email="iflair@synthwave.solutions"),
+            mode="enforce",
+            permissions=frozenset({"terminal:use"}),
+            access_mode="blacklist",
+            access_level="elevated",
+            grants=GrantSet(
+                cli_commands=frozenset({"*"}),
+                cli_workdir_roots=frozenset({"*"}),
+                file_read_roots=frozenset({"*"}),
+                file_denied_globs=frozenset({"**/.hermes/**", "**/*-sa.json"}),
+            ),
+        )
+        assert self._decide("read_file", {"path": str(self.paste)}, access=access).allowed
+        assert self._decide("terminal", {"command": f"cat {self.paste}"}, access=access).allowed
+        assert not self._decide("read_file", {"path": str(self.other)}, access=access).allowed
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}, access=access).allowed
+
+    def test_the_bound_context_carries_the_session(self):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        mine = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID)
+        theirs = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.OTHER)
+        assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
+        assert not tool_arguments_allowed_for_context(theirs, "read_file", {"path": str(self.paste)}).allowed

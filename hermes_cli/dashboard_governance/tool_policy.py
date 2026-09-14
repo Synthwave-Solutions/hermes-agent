@@ -599,6 +599,45 @@ def _matches_denied_glob(path: str, globs: frozenset[str]) -> bool:
     return any(fnmatch.fnmatch(candidate, pattern) or fnmatch.fnmatch(raw, pattern) for pattern in globs)
 
 
+# WebUI uploads and large composer pastes land in
+# <hermes home>/webui/attachments/<session id>/ (upstream #2319: outside the
+# workspace by design). That directory sits under the generic `**/.hermes/**`
+# secret boundary, so a governed user who pasted a long text saw
+# "file_denied_glob" on the .md the WebUI had just written from their own
+# paste, and an access request was raised per paste (Hrishikesh, 14-09-2026).
+# The inbox of the session a turn runs under IS that person's message, not a
+# secret: reading it needs no grant. Every other session's inbox stays governed,
+# and a symlink or `..` inside the inbox resolves to its real target first.
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
+
+
+def _attachment_inbox_root() -> str:
+    override = os.getenv("HERMES_WEBUI_ATTACHMENT_DIR", "").strip()
+    if override:
+        return _resolve_candidate_path(override)
+    try:
+        from hermes_cli.config import get_hermes_home
+        return _resolve_candidate_path(str(Path(get_hermes_home()) / "webui" / "attachments"))
+    except Exception:
+        return ""
+
+
+def session_attachment_inbox(session_id: Any) -> str:
+    """Resolved inbox directory of one WebUI session, or "" when unknown."""
+    sid = str(session_id or "").strip()
+    if not _SESSION_ID_RE.fullmatch(sid):
+        return ""
+    root = _attachment_inbox_root()
+    return os.path.join(root, sid) if root else ""
+
+
+def _in_session_inbox(path: Any, inbox: str) -> bool:
+    if not inbox or not path:
+        return False
+    candidate = _resolve_candidate_path(path)
+    return candidate == inbox or candidate.startswith(inbox.rstrip(os.sep) + os.sep)
+
+
 def _command_id(command: Any) -> tuple[str, str]:
     raw = str(command or "").strip()
     if not raw:
@@ -695,7 +734,7 @@ def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
 _PATHLIKE_RE = re.compile(r"(?:~|\.{0,2}/)[A-Za-z0-9._~/@+-]*")
 
 
-def _check_denied_paths(command_s: str, grants) -> AccessDecision:
+def _check_denied_paths(command_s: str, grants, inbox: str = "") -> AccessDecision:
     """Apply the file denied-globs to shell commands too.
 
     The read_file/write_file tools honoured denied_globs, the terminal did
@@ -707,7 +746,7 @@ def _check_denied_paths(command_s: str, grants) -> AccessDecision:
     if not grants.file_denied_globs:
         return AccessDecision(True, "arguments_allowed")
     for candidate in _PATHLIKE_RE.findall(command_s):
-        if len(candidate) < 2:
+        if len(candidate) < 2 or _in_session_inbox(candidate, inbox):
             continue
         if _matches_denied_glob(candidate, grants.file_denied_globs) \
                 and not _matches_denied_glob(candidate, grants.file_allow_globs):
@@ -727,7 +766,7 @@ def _check_identity_env_tamper(command_s: str) -> AccessDecision:
     return AccessDecision(True, "arguments_allowed")
 
 
-def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICTED) -> AccessDecision:
+def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICTED, inbox: str = "") -> AccessDecision:
     """A bare-delimiter heredoc is still expanded by the shell, so anything the
     shell would RUN inside it stays gated: backticks and process substitution
     are refused, and each $(...) is checked as a command. The literal text
@@ -739,19 +778,19 @@ def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICT
     except ValueError:
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     for inner in inners:
-        inner_decision = _check_cli_command(inner, grants, dwd_identity)
+        inner_decision = _check_cli_command(inner, grants, dwd_identity, inbox)
         if not inner_decision.allowed:
             return inner_decision
     return AccessDecision(True, "arguments_allowed")
 
 
-def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -> AccessDecision:
+def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, inbox: str = "") -> AccessDecision:
     """Validate one shell command string against the CLI grants: hard-block
     backticks/process substitution, recursively validate $(...) contents, and
     check every segment's argv0 against the allowlist."""
     command_s, heredoc_bodies = _strip_heredocs(command_s)
     for body in heredoc_bodies:
-        body_decision = _check_expanded_heredoc_body(body, grants, dwd_identity)
+        body_decision = _check_expanded_heredoc_body(body, grants, dwd_identity, inbox)
         if not body_decision.allowed:
             return body_decision
     try:
@@ -759,10 +798,10 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED) -
     except ValueError:
         return AccessDecision(False, "cli_shell_operator_not_allowed")
     for inner in inners:
-        inner_decision = _check_cli_command(inner, grants, dwd_identity)
+        inner_decision = _check_cli_command(inner, grants, dwd_identity, inbox)
         if not inner_decision.allowed:
             return inner_decision
-    denied_path = _check_denied_paths(command_s, grants)
+    denied_path = _check_denied_paths(command_s, grants, inbox)
     if not denied_path.allowed:
         return denied_path
     if grants.cli_denied_commands or (grants.cli_commands and "*" not in grants.cli_commands):
@@ -847,10 +886,13 @@ def cli_command_requires_manual_approval(access: EffectiveAccess, command: str) 
     return not _check_cli_command(command, review_selectors).allowed
 
 
-def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
+def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any], *, session_id: str = "") -> AccessDecision:
     if access is None or access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
     grants = access.grants
+    inbox = session_attachment_inbox(session_id)
+    if tool_name in {"read_file", "search_files"} and _in_session_inbox(args.get("path") or ".", inbox):
+        return AccessDecision(True, "session_attachment_allowed")
     from .models import grant_matches
     if tool_name in {"skill_view", "skill_manage"}:
         dim = "skills_view" if tool_name == "skill_view" else "skills_manage"
@@ -883,6 +925,8 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         if not access.has_permission("terminal:use"):
             return AccessDecision(False, "terminal_not_allowed")
         for candidate in _PATHLIKE_RE.findall(str(args.get("command") or "")):
+            if _in_session_inbox(candidate, inbox):
+                continue
             canonical = _resolve_candidate_path(candidate)
             if access.access_mode == "blacklist" and access.configuration_denies_file(candidate, canonical):
                 return AccessDecision(False, "file_denied_glob", detail=candidate)
@@ -914,7 +958,7 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
     elif tool_name == "terminal":
         command = args.get("command")
         command_s = str(command or "")
-        decision = _check_cli_command(command_s, grants, dwd_identity_for(access))
+        decision = _check_cli_command(command_s, grants, dwd_identity_for(access), inbox=inbox)
         if not decision.allowed:
             return decision
         workdir = args.get("workdir")
@@ -962,10 +1006,11 @@ def _tool_arguments_for_single_context(ctx, tool_name, args):
             name = str(args.get("name") or "")
             if "*" not in ceiling.grants.skills_load and name not in ceiling.grants.skills_load:
                 return AccessDecision(False, "bot_skill_not_selected", detail=name)
-        bounded = decide_tool_argument_access(ceiling, tool_name, args)
+        bounded = decide_tool_argument_access(ceiling, tool_name, args, session_id=getattr(ctx, "session_id", ""))
         if not bounded.allowed:
             return bounded
-    decision = decide_tool_argument_access(ctx.access if ctx is not None else None, tool_name, args)
+    decision = decide_tool_argument_access(ctx.access if ctx is not None else None, tool_name, args,
+                                          session_id=getattr(ctx, "session_id", ""))
     root = getattr(ctx, "project_workspace", "") if ctx is not None else ""
     if not root or tool_name not in {"read_file", "search_files", "write_file", "patch"}:
         return decision
