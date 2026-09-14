@@ -1120,3 +1120,90 @@ class TestOwnSessionAttachmentsAreReadable:
         theirs = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.OTHER)
         assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
         assert not tool_arguments_allowed_for_context(theirs, "read_file", {"path": str(self.paste)}).allowed
+
+
+class TestBlacklistTerminalIsStructureAgnostic:
+    """14-09-2026 (Michael: "mijn tech team kan helemaal niks met de super
+    agent zo"): a `for` loop, a brace group, backticks or an odd heredoc came
+    back as cli_compound_command_not_allowed / cli_shell_operator_not_allowed
+    for the blacklist accounts. Shell structure is never a reason to refuse
+    such an account; its explicit blacklist, the DWD identity binding and the
+    approval selectors still bite wherever they appear in the line. Whitelist
+    accounts keep the strict parser."""
+
+    ME = "iflair@synthwave.solutions"
+
+    def _access(self, *, mode="blacklist", approval=()):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            permissions=frozenset({"terminal:use"}),
+            access_mode=mode,
+            access_level="elevated",
+            grants=GrantSet(
+                cli_commands=frozenset({"*"}),
+                cli_workdir_roots=frozenset({"*"}),
+                cli_denied_commands=frozenset({"bunq", "bunq_cli.py", "*bunq*", "*productive*", "sudo", "su"}),
+                cli_approval_commands=frozenset(approval),
+                file_read_roots=frozenset({"*"}),
+                file_denied_globs=frozenset({"**/bunq*", "**/.config/bunq/**"}),
+            ),
+        )
+
+    def _decide(self, command, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), "terminal", {"command": command})
+
+    @pytest.mark.parametrize("command", [
+        'for p in /workspace/*peterson*; do [ -e "$p" ] && printf "%s\\n" "$p"; done',
+        "python3 - <<'PY'\nimport json\nprint(json.load(open('/workspace/makro/metro-state.json'))['cookies'][:1])\nPY\ncommand -v node",
+        "echo `date`",
+        "{ ls /workspace; pwd; }",
+        "( cd /workspace && npm test )",
+        "while read -r l; do echo \"$l\"; done < /workspace/list.txt",
+        "cat /workspace/x.json | jq '.a' > /tmp/out.txt 2>&1",
+        "if [ -d /workspace/x ]; then ls /workspace/x; fi",
+        "python3 -c \"print('it''s')\"",
+    ])
+    def test_shell_structure_never_refuses_a_blacklist_account(self, command):
+        d = self._decide(command)
+        assert d.allowed, (command, d.reason)
+
+    @pytest.mark.parametrize("command,reason", [
+        ("sudo ls", "cli_command_denied"),
+        ("for i in 1; do sudo ls; done", "cli_command_denied"),
+        ("cd /workspace && python3 ~/bunq-agentic/bunq_cli.py", "file_denied_glob"),
+        ("echo x | productive list", "cli_command_denied"),
+        ("python3 - <<'PY'\nimport bunq_client\nPY", "cli_command_denied"),
+        ("cat ~/.config/bunq/token.json", "file_denied_glob"),
+        ("echo `productive`", "cli_command_denied"),
+    ])
+    def test_the_explicit_blacklist_still_bites_anywhere(self, command, reason):
+        d = self._decide(command)
+        assert not d.allowed and d.reason == reason, (command, d.reason, d.detail)
+
+    @pytest.mark.parametrize("command,reason", [
+        ("gmail list", "dwd_identity_required"),
+        ("cd /workspace && gmail list", "dwd_identity_required"),
+        ("for i in 1; do gmail list; done", "dwd_identity_required"),
+        ("echo `gmail list`", "dwd_identity_required"),
+        ("gmail --as michael@synthwave.solutions list", "dwd_identity_mismatch"),
+        ("HERMES_DWD_IDENTITY=x gmail --as iflair@synthwave.solutions list", "dwd_identity_tamper"),
+    ])
+    def test_the_identity_binding_survives_any_structure(self, command, reason):
+        d = self._decide(command)
+        assert not d.allowed and d.reason == reason, (command, d.reason)
+
+    def test_own_identity_passes_inside_a_loop(self):
+        assert self._decide("for i in 1; do gmail --as iflair@synthwave.solutions list; done").allowed
+
+    def test_a_whitelist_account_keeps_the_strict_parser(self):
+        d = self._decide("for i in 1; do ls; done", access=self._access(mode="whitelist"))
+        assert not d.allowed and d.reason == "cli_compound_command_not_allowed"
+
+    def test_approval_selectors_match_by_token_not_by_structure(self):
+        from hermes_cli.dashboard_governance.tool_policy import cli_command_requires_manual_approval
+        access = self._access(approval={"deploy-prod"})
+        assert cli_command_requires_manual_approval(access, "for e in a; do deploy-prod $e; done")
+        assert not cli_command_requires_manual_approval(access, "for e in a; do ls $e; done")

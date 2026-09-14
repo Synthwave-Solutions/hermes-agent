@@ -77,6 +77,84 @@ def _check_dwd_identity(segments: list[list[str]], identity: str) -> AccessDecis
     return AccessDecision(True, "arguments_allowed")
 
 
+# ── Blacklist accounts: structure is never a reason to refuse ───────────────
+# 14-09-2026 (Michael: "blacklisted users kunnen overal bij, mijn tech team
+# kan helemaal niks met de super agent zo"). For a default-allow account the
+# strict parser above was the blocker: a `for` loop, a `{ }` group, backticks
+# or an unparseable heredoc all came back as cli_compound_command_not_allowed
+# or cli_shell_operator_not_allowed (Stephen's asset scan, Vansh's Power BI
+# session check). Such an account is closed by its EXPLICIT blacklist only, so
+# the lenient gate keeps exactly those checks, made robust against structure:
+#   * a denied path anywhere in the line (regex over the raw string);
+#   * a denied command name as ANY token, not just a segment's argv0, so
+#     `python3 ~/x/bunq_cli.py`, `xargs productive`, `do sudo ...` all bite;
+#   * the DWD identity binding wherever a DWD CLI appears, even behind `do`
+#     or inside a substitution the strict parser would have refused;
+#   * the HERMES_DWD_IDENTITY tamper guard.
+# Whitelist and legacy accounts keep the strict parser unchanged.
+_TOKEN_SHELL_PUNCT = "`'\"()$;|&{}<>\n"
+
+
+def _lenient_tokens(command_s: str) -> list[str]:
+    """Best-effort tokens of the WHOLE command, heredoc bodies and
+    substitutions included. shlex first; when shell structure defeats it,
+    whitespace-split so a denied name still surfaces."""
+    try:
+        raw = shlex.split(command_s, posix=True)
+    except ValueError:
+        raw = command_s.replace("\n", " ").split()
+    tokens = []
+    for tok in raw:
+        tok = tok.strip(_TOKEN_SHELL_PUNCT)
+        if tok:
+            tokens.append(tok)
+    return tokens
+
+
+def _lenient_segments(command_s: str) -> list[list[str]]:
+    try:
+        return [[t.strip(_TOKEN_SHELL_PUNCT) for t in seg if t.strip(_TOKEN_SHELL_PUNCT)]
+                for seg in _split_shell_segments(command_s)]
+    except ValueError:
+        return [_lenient_tokens(command_s)]
+
+
+def _check_dwd_identity_anywhere(segments: list[list[str]], identity: str) -> AccessDecision:
+    """Like _check_dwd_identity, but a DWD CLI is recognised at ANY token
+    position of a segment (`do gmail list`, `time gchat send`), and each
+    occurrence is checked with the tokens that follow it."""
+    for tokens in segments:
+        for index, tok in enumerate(tokens):
+            if os.path.basename(tok) not in _DWD_CLIS:
+                continue
+            decision = _check_dwd_identity([tokens[index:]], identity)
+            if not decision.allowed:
+                return decision
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _check_cli_command_lenient(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, inbox: str = "") -> AccessDecision:
+    denied_path = _check_denied_paths(command_s, grants, inbox)
+    if not denied_path.allowed:
+        return denied_path
+    tokens = _lenient_tokens(command_s)
+    if grants.cli_denied_commands:
+        from .models import grant_matches
+        for tok in tokens:
+            base = os.path.basename(tok)
+            if grant_matches(grants.cli_denied_commands, tok) or (base and grant_matches(grants.cli_denied_commands, base)):
+                return AccessDecision(False, "cli_command_denied", detail=tok)
+    if dwd_identity is not _DWD_UNRESTRICTED:
+        tamper = _check_identity_env_tamper(command_s)
+        if not tamper.allowed:
+            return tamper
+        if any(os.path.basename(tok) in _DWD_CLIS for tok in tokens):
+            dwd_decision = _check_dwd_identity_anywhere(_lenient_segments(command_s), dwd_identity)
+            if not dwd_decision.allowed:
+                return dwd_decision
+    return AccessDecision(True, "arguments_allowed")
+
+
 def _command_substitution_end(command: str, start: int) -> int:
     """Find the closing shell parenthesis, respecting each nested quote scope."""
     index, depth, quote, word_start = start, 1, "", True
@@ -784,10 +862,14 @@ def _check_expanded_heredoc_body(body: str, grants, dwd_identity=_DWD_UNRESTRICT
     return AccessDecision(True, "arguments_allowed")
 
 
-def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, inbox: str = "") -> AccessDecision:
+def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, inbox: str = "", *, lenient: bool = False) -> AccessDecision:
     """Validate one shell command string against the CLI grants: hard-block
     backticks/process substitution, recursively validate $(...) contents, and
-    check every segment's argv0 against the allowlist."""
+    check every segment's argv0 against the allowlist. With ``lenient`` (a
+    blacklist account) only the explicit blacklist, the DWD identity binding
+    and the tamper guard apply; see _check_cli_command_lenient."""
+    if lenient:
+        return _check_cli_command_lenient(command_s, grants, dwd_identity, inbox)
     command_s, heredoc_bodies = _strip_heredocs(command_s)
     for body in heredoc_bodies:
         body_decision = _check_expanded_heredoc_body(body, grants, dwd_identity, inbox)
@@ -883,7 +965,7 @@ def cli_command_requires_manual_approval(access: EffectiveAccess, command: str) 
     if not required or "bootstrap_admin" in access.grant_sources:
         return False
     review_selectors = GrantSet(cli_denied_commands=required)
-    return not _check_cli_command(command, review_selectors).allowed
+    return not _check_cli_command(command, review_selectors, lenient=access.access_mode == "blacklist").allowed
 
 
 def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any], *, session_id: str = "") -> AccessDecision:
@@ -958,7 +1040,8 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
     elif tool_name == "terminal":
         command = args.get("command")
         command_s = str(command or "")
-        decision = _check_cli_command(command_s, grants, dwd_identity_for(access), inbox=inbox)
+        decision = _check_cli_command(command_s, grants, dwd_identity_for(access), inbox=inbox,
+                                      lenient=access.access_mode == "blacklist")
         if not decision.allowed:
             return decision
         workdir = args.get("workdir")
