@@ -50,6 +50,9 @@ from agent.message_sanitization import (
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_diag import (
+    stream_diag_start_timing, stream_diag_mark_timing, log_stream_attempt_timing,
+)
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -4170,6 +4173,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         _diag = agent._stream_diag_init()
+        stream_diag_start_timing(agent, _diag)
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
@@ -4198,11 +4202,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            stream_diag_mark_timing(_diag, "sdk_dispatch")
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
             attempt_stream_response["value"] = response
+            if response is not None:
+                stream_diag_mark_timing(_diag, "response_headers")
             agent._capture_rate_limits(response)
             agent._capture_credits(response)
             agent._stream_diag_capture_response(_diag, response)
@@ -4302,12 +4309,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not tool_calls_acc:
                 for text in pending_parts:
                     _fire_first_delta()
+                    stream_diag_mark_timing(_diag, "first_text_dispatch")
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
                 return
             if agent.stream_delta_callback:
                 for text in pending_parts:
                     try:
+                        stream_diag_mark_timing(_diag, "first_text_dispatch")
                         agent.stream_delta_callback(text)
                         agent._record_streamed_assistant_text(text)
                     except Exception:
@@ -4327,6 +4336,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
+                    stream_diag_mark_timing(_diag, "first_chunk")
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -4413,6 +4423,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     reasoning_parts[-1] if reasoning_parts else "",
                     reasoning_text,
                 )
+                stream_diag_mark_timing(_diag, "first_reasoning_chunk")
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
@@ -4433,6 +4444,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
+                    stream_diag_mark_timing(_diag, "first_text_dispatch")
                     agent._fire_stream_delta(delta_content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
@@ -4448,6 +4460,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
+                        stream_diag_mark_timing(_diag, "first_text_dispatch")
                         agent.stream_delta_callback(delta_content)
                         agent._record_streamed_assistant_text(delta_content)
                     except Exception:
@@ -4582,6 +4595,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 content = getattr(message, "content", None)
                 if isinstance(content, str) and content:
                     _fire_first_delta()
+                    stream_diag_mark_timing(_diag, "first_text_dispatch")
                     agent._fire_stream_delta(content)
             return final_response
 
@@ -4996,6 +5010,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
+                        log_stream_attempt_timing(
+                            request_client_holder.get("diag"),
+                            attempt=_stream_attempt + 1,
+                            outcome="cancelled" if agent._interrupt_requested else "success",
+                        )
                     _emit_stream_end(
                         final_text=_stream_final_text(result["response"]),
                         finished=True,
@@ -5003,6 +5022,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     return  # success
                 except Exception as e:
+                    if agent.api_mode != "anthropic_messages":
+                        log_stream_attempt_timing(
+                            request_client_holder.get("diag"),
+                            attempt=_stream_attempt + 1,
+                            outcome="cancelled" if (agent._interrupt_requested or _request_cancelled["value"]
+                                                     or isinstance(e, InterruptedError)) else "error",
+                        )
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
                     # If the main poll loop force-closed this request because
