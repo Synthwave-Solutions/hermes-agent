@@ -140,7 +140,13 @@ def authorize_tool_action(ctx, tool_name, args, registry):
         from .tool_policy import cli_command_requires_manual_approval
         command_review = tool_name == "terminal" and cli_command_requires_manual_approval(
             access, str(args.get("command") or ""))
-        if not access.approval_configured and not command_review:
+        # 14-09-2026 (Michael): a person's approval: section (mode/prompt) is
+        # for GOVERNANCE REQUESTS in the WebUI queue, never for reviewing every
+        # tool call. With it wired here every read_file, todo, memory and MCP
+        # call of Stephen and Vansh went through a model roundtrip and parked
+        # on a human card when the model doubted. The only per-call review
+        # left is the mandatory human CLI review of cli.approval_commands.
+        if not command_review:
             bind_governance_context(fresh)
             return None
         from agent.redact import redact_sensitive_text

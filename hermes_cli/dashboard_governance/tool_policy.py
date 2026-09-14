@@ -108,6 +108,7 @@ _FORWARDER_OPTS_WITH_ARG = frozenset({"-u", "-g", "-n", "-P", "-L", "-s", "-d", 
 _FORWARDER_POSITIONALS = {"timeout": 1, "chroot": 1}
 _SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_FUNCTION_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 
 
 def _lenient_tokens(command_s: str) -> list[str]:
@@ -126,11 +127,15 @@ def _lenient_tokens(command_s: str) -> list[str]:
 
 
 def _lenient_segments(command_s: str) -> list[list[str]]:
+    """Raw tokens per segment (punctuation kept so `name()` is still visible);
+    callers strip _TOKEN_SHELL_PUNCT per token."""
     try:
-        return [[t.strip(_TOKEN_SHELL_PUNCT) for t in seg if t.strip(_TOKEN_SHELL_PUNCT)]
-                for seg in _split_shell_segments(command_s)]
+        return [list(seg) for seg in _split_shell_segments(command_s)]
     except ValueError:
-        return [_lenient_tokens(command_s)]
+        try:
+            return [shlex.split(command_s, posix=True)]
+        except ValueError:
+            return [command_s.replace("\n", " ").split()]
 
 
 def _lenient_fragments(command_s: str) -> list[str]:
@@ -184,19 +189,25 @@ def _lenient_command_words(command_s: str, depth: int = 0) -> list[tuple[str, li
         return []
     words: list[tuple[str, list[str]]] = []
     head, bodies = _lenient_heredocs(command_s)
-    for segment in _lenient_segments(head):
+    for raw_segment in _lenient_segments(head):
+        segment = [t.strip(_TOKEN_SHELL_PUNCT) for t in raw_segment]
         skip = 0
         argv0_found = False
-        for index, tok in enumerate(segment):
+        for index, raw_tok in enumerate(raw_segment):
+            tok = segment[index]
             if skip:
                 skip -= 1
                 continue
-            if _REDIRECT_TOKEN_RE.match(tok):
+            if not tok:
+                continue
+            if _REDIRECT_TOKEN_RE.match(raw_tok):
                 skip = 1
                 continue
-            tail = segment[index + 1:]
+            tail = [t for t in segment[index + 1:] if t]
             if not argv0_found:
-                if _ENV_ASSIGNMENT_RE.match(tok) or tok in _SHELL_CONTROL_HEADS:
+                # `name()` opens a function body: the words inside are the
+                # commands, the name is not.
+                if _ENV_ASSIGNMENT_RE.match(tok) or tok in _SHELL_CONTROL_HEADS or _FUNCTION_DEF_RE.match(raw_tok):
                     continue
                 base = os.path.basename(tok)
                 if base in _EXEC_FORWARDERS:
@@ -218,7 +229,7 @@ def _lenient_command_words(command_s: str, depth: int = 0) -> list[tuple[str, li
                 continue
             if tok in _FIND_EXEC_FLAGS and tail:
                 words.append((tail[0], tail[1:]))
-        words += [(target, []) for target in _interpreter_targets(segment)]
+        words += [(target, []) for target in _interpreter_targets([t for t in segment if t])]
     for frag in _lenient_fragments(head):
         words += _lenient_command_words(frag, depth + 1)
     if bodies and any(os.path.basename(word) in _SHELL_NAMES for word, _ in words):
