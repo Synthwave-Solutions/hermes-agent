@@ -981,6 +981,11 @@ def _reconcile_local_cached_context_length(
     sub-64K window as config.
     """
     probe_options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    if not native_protocol_probes and cached > 0:
+        # The router's already-known window remains the existing fallback.
+        # Optional revalidation must not spend the cold-discovery read budget
+        # every time this otherwise-ready agent is constructed.
+        probe_options["cached_recheck"] = True
     live_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
     if live_ctx and live_ctx > 0 and live_ctx != cached:
         if live_ctx < MINIMUM_CONTEXT_LENGTH:
@@ -2492,7 +2497,7 @@ def _model_name_suggests_stale_32k_underreport(model: str) -> bool:
     return _model_name_suggests_kimi(model) or _model_name_suggests_minimax(model)
 
 
-def _query_local_context_length(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True) -> Optional[int]:
+def _query_local_context_length(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True, cached_recheck: bool = False) -> Optional[int]:
     """Query a local server for the model's context length (short-TTL cached).
 
     The live-probe paths added for local endpoints (reconcile-on-hit and the
@@ -2508,6 +2513,9 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
     """
     import time as _time
 
+    options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    if cached_recheck and not native_protocol_probes:
+        options["cached_recheck"] = True
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
     if not native_protocol_probes:
         # Runtime credential providers may be callables. Do not execute them
@@ -2515,7 +2523,7 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
         # preserve the existing probe/fallback behavior without memoization.
         if api_key is not None and not isinstance(api_key, str):
             return _query_local_context_length_uncached(
-                model, base_url, api_key=api_key, native_protocol_probes=False,
+                model, base_url, api_key=api_key, **options,
             )
         # A router can advertise different windows for different users. Do
         # not let the short-lived probe result escape its profile/credential
@@ -2526,7 +2534,6 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
         return cached[0]
 
-    options = {} if native_protocol_probes else {"native_protocol_probes": False}
     result = _query_local_context_length_uncached(model, base_url, api_key=api_key, **options)
     # Cache only positive results. A None/failure (server not up yet,
     # connection refused, timeout) must NOT be memoized — otherwise a probe
@@ -2539,7 +2546,7 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
     return result
 
 
-def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True) -> Optional[int]:
+def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True, cached_recheck: bool = False) -> Optional[int]:
     """Query a local server for the model's context length."""
     import httpx
 
@@ -2557,6 +2564,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         return None
 
     headers = _auth_headers(api_key)
+    bounded_recheck = cached_recheck and not native_protocol_probes
 
     try:
         server_type = detect_local_server_type(base_url, api_key=api_key) if native_protocol_probes else None
@@ -2564,7 +2572,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         server_type = None
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(timeout=0.5 if bounded_recheck else 3.0, headers=headers) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
                 resp = client.post(f"{server_url}/api/show", json={"name": model})
@@ -2676,7 +2684,9 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                         if ctx is not None:
                             return ctx
     except Exception as exc:
-        if _is_connect_timeout(exc):
+        # A short optional check cannot mark the endpoint unavailable for a
+        # subsequent cold lookup with the normal connection/read budget.
+        if _is_connect_timeout(exc) and not bounded_recheck:
             _note_endpoint_blackholed(server_url)
 
     return None
