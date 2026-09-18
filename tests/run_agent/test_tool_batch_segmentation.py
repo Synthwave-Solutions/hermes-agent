@@ -23,6 +23,7 @@ import pytest
 
 from run_agent import AIAgent
 from agent.tool_dispatch_helpers import (
+    _is_read_only_command,
     _plan_tool_batch_segments,
     _should_parallelize_tool_batch,
 )
@@ -64,7 +65,7 @@ class TestPlanToolBatchSegments:
             _tc("web_search", call_id="r1"),
             _tc("web_search", call_id="r2"),
             _tc("read_file", '{"path":"a.py"}', call_id="r3"),
-            _tc("terminal", '{"command":"echo hi"}', call_id="b1"),
+            _tc("terminal", '{"command":"npm run build"}', call_id="b1"),
         ]
         segments = _plan_tool_batch_segments(calls)
         assert _kinds(segments) == ["parallel", "sequential"]
@@ -393,7 +394,7 @@ class TestSegmentedDispatchIntegration:
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
-            _tc("terminal", '{"command":"echo done"}', call_id="t1"),
+            _tc("terminal", '{"command":"npm run build"}', call_id="t1"),
         ]
         msg = SimpleNamespace(content="", tool_calls=calls)
         messages = []
@@ -509,7 +510,7 @@ class TestSegmentedDispatchIntegration:
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
-            _tc("terminal", '{"command":"echo hi"}', call_id="t1"),
+            _tc("terminal", '{"command":"npm run build"}', call_id="t1"),
         ]
         msg = SimpleNamespace(content="", tool_calls=calls)
         messages = []
@@ -725,3 +726,320 @@ class TestPathCanonicalization:
         assert _paths_overlap(upper, lower), (
             "Case-insensitive aliases must overlap on Windows"
         )
+
+
+# ---------------------------------------------------------------------------
+# Read-only terminal + per-session browser admission
+# ---------------------------------------------------------------------------
+
+
+class TestReadOnlyCommandDetection:
+    """`terminal` is the most-used tool, so an allowlist decides admission.
+
+    The inverse test — "not obviously destructive" — is far too weak: `npm
+    test` trips no destructive pattern yet writes build output.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls -la",
+            "cat README.md",
+            "grep -rn needle src | head -20",
+            "git status --short",
+            "git log --oneline -5",
+            "git diff && git status",
+            "sed -n '1,40p' run_agent.py",
+            "find . -name '*.py'",
+            "wc -l *.py",
+        ],
+    )
+    def test_read_only_commands_are_admitted(self, command):
+        assert _is_read_only_command(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "npm test",                  # writes build output, trips no pattern
+            "python3 script.py",         # arbitrary code
+            "rm -rf build",
+            "git push origin main",
+            "git commit -m x",
+            "cat a.txt > b.txt",         # redirect writes
+            "cat a.txt >> b.txt",
+            "echo $(rm -rf /tmp/x)",     # substitution hides anything
+            "echo `whoami`",
+            "sed -i s/a/b/ f.py",        # in-place edit
+            "find . -delete",
+            "find . -exec rm {} ;",
+            "node server.js &",          # background operator
+            "",
+        ],
+    )
+    def test_writes_and_unknown_commands_are_rejected(self, command):
+        assert not _is_read_only_command(command)
+
+
+class TestTerminalBatchAdmission:
+    def test_read_only_terminals_form_one_parallel_run(self):
+        calls = [
+            _tc("terminal", '{"command":"ls -la"}', call_id="t1"),
+            _tc("terminal", '{"command":"git status"}', call_id="t2"),
+            _tc("terminal", '{"command":"cat README.md"}', call_id="t3"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel"]
+        assert _flatten_ids(segments) == ["t1", "t2", "t3"]
+
+    def test_mutating_terminal_is_still_a_barrier(self):
+        calls = [
+            _tc("terminal", '{"command":"ls"}', call_id="t1"),
+            _tc("terminal", '{"command":"npm run build"}', call_id="t2"),
+            _tc("terminal", '{"command":"git log"}', call_id="t3"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        # t1 alone is demoted (a parallel run of one buys nothing) and merges
+        # with the barrier; the ordering guarantee is what matters here.
+        assert _flatten_ids(segments) == ["t1", "t2", "t3"]
+        assert all(
+            kind == "sequential" or len(calls_) > 1 for kind, calls_ in segments
+        )
+
+    def test_background_spawns_run_concurrently(self):
+        """The 'kick off four suites at once' case."""
+        calls = [
+            _tc("terminal", '{"command":"node run.mjs a","background":true}', call_id="b1"),
+            _tc("terminal", '{"command":"node run.mjs b","background":true}', call_id="b2"),
+            _tc("terminal", '{"command":"node run.mjs c","background":true}', call_id="b3"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel"]
+
+    def test_destructive_background_spawn_stays_sequential(self):
+        """Destructive commands take the checkpoint path, which is not
+        written to be driven from several worker threads at once."""
+        calls = [
+            _tc("terminal", '{"command":"rm -rf dist","background":true}', call_id="b1"),
+            _tc("terminal", '{"command":"rm -rf build","background":true}', call_id="b2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["sequential"]
+
+    def test_read_only_terminal_does_not_observe_a_staged_write(self):
+        """A read-only command reads paths we cannot enumerate, so it must
+        not share a run with a writer — in either emission order."""
+        write_then_read = _plan_tool_batch_segments([
+            _tc("write_file", '{"path":"/tmp/seg-a.py","content":"x"}', call_id="w1"),
+            _tc("terminal", '{"command":"cat /tmp/seg-a.py"}', call_id="t1"),
+        ])
+        assert _flatten_ids(write_then_read) == ["w1", "t1"]
+        assert not any(
+            kind == "parallel" and len(calls_) > 1
+            for kind, calls_ in write_then_read
+        )
+
+        read_then_write = _plan_tool_batch_segments([
+            _tc("terminal", '{"command":"cat /tmp/seg-b.py"}', call_id="t1"),
+            _tc("write_file", '{"path":"/tmp/seg-b.py","content":"x"}', call_id="w1"),
+        ])
+        assert _flatten_ids(read_then_write) == ["t1", "w1"]
+        assert not any(
+            kind == "parallel" and len(calls_) > 1
+            for kind, calls_ in read_then_write
+        )
+
+    def test_read_only_terminal_joins_other_reads(self):
+        calls = [
+            _tc("read_file", '{"path":"a.py"}', call_id="r1"),
+            _tc("terminal", '{"command":"git diff"}', call_id="t1"),
+            _tc("web_search", '{"query":"x"}', call_id="s1"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel"]
+
+
+class TestBrowserSessionAdmission:
+    def test_distinct_sessions_run_concurrently(self):
+        calls = [
+            _tc("browser_exec", '{"code":"a","session":"one"}', call_id="b1"),
+            _tc("browser_exec", '{"code":"b","session":"two"}', call_id="b2"),
+            _tc("browser_exec", '{"code":"c","session":"three"}', call_id="b3"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel"]
+
+    def test_same_session_twice_is_serialised(self):
+        calls = [
+            _tc("browser_exec", '{"code":"a","session":"one"}', call_id="b1"),
+            _tc("browser_exec", '{"code":"b","session":"one"}', call_id="b2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _flatten_ids(segments) == ["b1", "b2"]
+        assert not any(
+            kind == "parallel" and len(calls_) > 1 for kind, calls_ in segments
+        )
+
+    def test_unnamed_sessions_share_the_default_and_serialise(self):
+        calls = [
+            _tc("browser_exec", '{"code":"a"}', call_id="b1"),
+            _tc("browser_exec", '{"code":"b"}', call_id="b2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert not any(
+            kind == "parallel" and len(calls_) > 1 for kind, calls_ in segments
+        )
+
+    def test_named_session_runs_alongside_reads(self):
+        calls = [
+            _tc("read_file", '{"path":"a.py"}', call_id="r1"),
+            _tc("browser_exec", '{"code":"a","session":"one"}', call_id="b1"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel"]
+
+
+class TestReadOnlyTerminalConcurrencyIntegration:
+    def test_three_read_only_commands_are_actually_in_flight_together(self, agent):
+        """Planner admission is only half of it — prove the dispatcher really
+        overlaps them, which is the whole point of the change."""
+        calls = [
+            _tc("terminal", '{"command":"ls -la"}', call_id="t1"),
+            _tc("terminal", '{"command":"git status"}', call_id="t2"),
+            _tc("terminal", '{"command":"cat README.md"}', call_id="t3"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+
+        rendezvous = threading.Barrier(3, timeout=10)
+
+        def fake_handle(name, args, task_id, **kwargs):
+            # All three must arrive before any may leave — only possible if
+            # they run concurrently.
+            rendezvous.wait()
+            return json.dumps({"ok": args.get("command")})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert [m["tool_call_id"] for m in messages] == ["t1", "t2", "t3"]
+
+
+class TestWritingFlagsOnReadOnlyHeads:
+    """A read-only head plus one flag becomes a writer."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sed -i s/a/b/ f.py",
+            "sed -i.bak s/a/b/ f.py",
+            "sort -o sorted.txt in.txt",
+            "yq -i .version=2 config.yaml",
+            "find . -name '*.log' -delete",
+            "find . -fprintf out.txt %p",
+        ],
+    )
+    def test_writing_flag_disqualifies_the_command(self, command):
+        assert not _is_read_only_command(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        ["sed -n '1,5p' f.py", "sort in.txt", "yq .version config.yaml", "grep -o needle f"],
+    )
+    def test_the_same_head_without_that_flag_still_reads(self, command):
+        assert _is_read_only_command(command)
+
+
+class TestProcessPollingAdmission:
+    def test_polling_several_background_jobs_runs_concurrently(self):
+        calls = [
+            _tc("process", '{"action":"poll","session_id":"proc_a"}', call_id="p1"),
+            _tc("process", '{"action":"log","session_id":"proc_b"}', call_id="p2"),
+            _tc("process", '{"action":"wait","session_id":"proc_c"}', call_id="p3"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel"]
+
+    @pytest.mark.parametrize("action", ["kill", "write", "submit", "close"])
+    def test_mutating_process_actions_stay_barriers(self, action):
+        calls = [
+            _tc("process", '{"action":"poll","session_id":"proc_a"}', call_id="p1"),
+            _tc("process", '{"action":"%s","session_id":"proc_b"}' % action, call_id="p2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _flatten_ids(segments) == ["p1", "p2"]
+        assert not any(
+            kind == "parallel" and len(calls_) > 1 for kind, calls_ in segments
+        )
+
+
+class TestAllowByDefaultAdmission:
+    """Admission is allow-by-default: only tools with a known reason to
+    serialise are barriers. Anything else, including every MCP tool and any
+    tool added later, joins the parallel run."""
+
+    def test_unknown_tool_is_admitted(self):
+        calls = [
+            _tc("some_tool_added_next_quarter", '{"x":1}', call_id="n1"),
+            _tc("another_new_tool", '{"y":2}', call_id="n2"),
+        ]
+        assert _kinds(_plan_tool_batch_segments(calls)) == ["parallel"]
+
+    def test_mcp_tools_run_concurrently_by_default(self):
+        calls = [
+            _tc("mcp__notion__notion-search", '{"query":"a"}', call_id="m1"),
+            _tc("mcp__attio__search-records", '{"query":"b"}', call_id="m2"),
+            _tc("mcp__fireflies__fireflies_search", '{"query":"c"}', call_id="m3"),
+        ]
+        assert _kinds(_plan_tool_batch_segments(calls)) == ["parallel"]
+
+    def test_server_pinned_to_serial_is_a_barrier(self):
+        """`supports_parallel_tool_calls: false` is the operator's handle for
+        a stateful server."""
+        calls = [
+            _tc("mcp__playwright__browser_click", '{"ref":"a"}', call_id="m1"),
+            _tc("mcp__playwright__browser_click", '{"ref":"b"}', call_id="m2"),
+        ]
+        with patch(
+            "agent.tool_dispatch_helpers._is_mcp_tool_parallel_blocked",
+            return_value=True,
+        ):
+            segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["sequential"]
+
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "browser_click",      # one shared browser
+            "browser_navigate",
+            "computer_use",       # one shared desktop
+            "project_switch",     # changes what later calls resolve against
+            "kanban_create",      # the next call reads the board this changed
+        ],
+    )
+    def test_stateful_tools_stay_barriers(self, tool):
+        calls = [
+            _tc(tool, "{}", call_id="s1"),
+            _tc(tool, "{}", call_id="s2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["sequential"]
+        assert _flatten_ids(segments) == ["s1", "s2"]
+
+    def test_a_barrier_does_not_sink_the_reads_around_it(self):
+        calls = [
+            _tc("read_file", '{"path":"a.py"}', call_id="r1"),
+            _tc("mcp__notion__notion-search", '{"query":"x"}', call_id="m1"),
+            _tc("computer_use", '{"action":"screenshot"}', call_id="b1"),
+            _tc("web_search", '{"query":"y"}', call_id="r2"),
+            _tc("terminal", '{"command":"git status"}', call_id="t1"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["parallel", "sequential", "parallel"]
+        assert _flatten_ids(segments) == ["r1", "m1", "b1", "r2", "t1"]
+
+    @pytest.mark.parametrize("tool", ["memory", "todo", "execute_code"])
+    def test_memory_todo_and_code_run_concurrently(self, tool):
+        """Explicitly opted in: these carry their own state, and the speed of
+        a batch matters more here than ordering between two of them."""
+        calls = [_tc(tool, "{}", call_id="a1"), _tc(tool, "{}", call_id="a2")]
+        assert _kinds(_plan_tool_batch_segments(calls)) == ["parallel"]

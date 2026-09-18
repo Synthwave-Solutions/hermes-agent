@@ -425,9 +425,17 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "commands should be batched into the same assistant turn — the runtime "
     "executes independent calls concurrently, and batching avoids resending "
     "the whole conversation on every extra round-trip.\n"
+    "This pays off for more than reads: several read-only shell commands run "
+    "at the same time, several background starts "
+    "(terminal(background=true)) are dispatched at once, MCP calls to "
+    "different services run together, and browser_exec calls run side by "
+    "side as long as each one passes its own `session` name.\n"
     "Only serialize calls when a later call genuinely depends on an earlier "
-    "call's result (e.g. you must read a file before you can patch it). When "
-    "in doubt and the calls are independent, batch them."
+    "call's result (e.g. you must read a file before you can patch it), or "
+    "when they drive one shared surface: the browser tools, the desktop, the "
+    "code interpreter and the task/memory store all act on state the next "
+    "call reads back. When in doubt and the calls are independent, batch "
+    "them."
 )
 
 # Where work goes when it is delegated.  Without this the model reaches for a
