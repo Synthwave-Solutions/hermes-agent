@@ -5252,6 +5252,11 @@ def _handle_session_expired_and_retry(
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
 _parallel_safe_servers: set = set()
+# Servers whose config sets ``supports_parallel_tool_calls: false`` EXPLICITLY.
+# Admission is allow-by-default (see tool_dispatch_helpers), so this is how an
+# operator pins a stateful server — one whose next call depends on the state
+# the previous one left behind — back to serial execution.
+_parallel_blocked_servers: set = set()
 
 # Exact MCP tool-name provenance. The generated registry name is lossy because
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
@@ -7711,8 +7716,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(srv_name)
+                _parallel_blocked_servers.discard(srv_name)
             else:
                 _parallel_safe_servers.discard(srv_name)
+                if "supports_parallel_tool_calls" in (srv_cfg or {}):
+                    _parallel_blocked_servers.add(srv_name)
+                else:
+                    _parallel_blocked_servers.discard(srv_name)
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -7907,8 +7917,13 @@ def discover_mcp_tools() -> List[str]:
             for name, cfg in servers.items():
                 if _parse_boolish(cfg.get("supports_parallel_tool_calls", False), default=False):
                     _parallel_safe_servers.add(name)
+                    _parallel_blocked_servers.discard(name)
                 else:
                     _parallel_safe_servers.discard(name)
+                    if "supports_parallel_tool_calls" in (cfg or {}):
+                        _parallel_blocked_servers.add(name)
+                    else:
+                        _parallel_blocked_servers.discard(name)
     if reuse_connected:
         return _existing_tool_names()
 
@@ -7991,6 +8006,22 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
         return bool(server_name and server_name in _parallel_safe_servers)
+
+
+def is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
+    """Check whether an MCP tool's server is pinned to serial execution.
+
+    True only when the server's config carries an explicit
+    ``supports_parallel_tool_calls: false``. Under allow-by-default admission
+    that flag is the operator's handle for a stateful server (a browser, a
+    build session, a viewer) where the next call depends on the state the
+    previous one left behind.
+    """
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+        return bool(server_name and server_name in _parallel_blocked_servers)
 
 
 def get_mcp_status() -> List[dict]:
