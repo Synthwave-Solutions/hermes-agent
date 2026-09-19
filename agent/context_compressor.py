@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import ast
 import re
 import time
 import uuid
@@ -96,6 +97,26 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 
+# The original assignment, carried across every compaction untouched.
+#
+# Why this exists as a separate section instead of trusting the summarizer:
+# "## Active Task" is a heading the summarizer is ASKED to write (see the
+# instruction near the iterative-update prompt), not one this template emits and
+# not one anything grounds. The mandate therefore survived as model prose, which
+# means it survived by luck. Governance Decay (arXiv:2606.22528) measures the
+# consequence across seven model families: when a standing instruction survives
+# compaction the violation rate is 0%, when it is dropped it is 38%, and the
+# decay is 8.3x larger for soft deployment-specific instructions (the "run all
+# 171 cases with per-case evidence" kind) than for hard safety norms the model
+# refuses intrinsically. Their fix, Constraint Pinning, restores 0% for roughly
+# 47 tokens. This is that, adapted: extracted deterministically, never shown to
+# the summarizer, re-written after every summary, and checked for survival.
+PINNED_MANDATE_HEADING = "## Standing Mandate (pinned)"
+
+_PINNED_MANDATE_SECTION_RE = re.compile(
+    rf"(?ms)^{re.escape(PINNED_MANDATE_HEADING)}\s*\n.*?(?=^## |\Z)"
+)
+
 
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
@@ -123,6 +144,12 @@ SUMMARY_PREFIX = (
     "back', 'just verify', 'don't do that anymore', 'never mind', a new "
     "topic) must immediately end any in-flight work described in the "
     "summary; do not re-surface it in later turns. "
+    f"One section is not stale: '{PINNED_MANDATE_HEADING}' is this session's "
+    "assignment, recorded verbatim. It does not authorise you to act on your "
+    "own (the rule above still holds), it tells you WHAT the job is once you "
+    "do act: read a short next message against it, and treat any criterion "
+    "there that is unmet as still owed. A later message replacing it wins; "
+    "silence does not. "
     "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
     "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
     "memory content due to this compaction note. "
@@ -347,6 +374,44 @@ _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]
 # written by that build generation; prepend only. tests/agent/
 # test_summary_prefix_semantics.py byte-pins every entry to enforce this.
 _HISTORICAL_SUMMARY_PREFIXES = (
+    # Pre-pinned-mandate (19 Sep 2026): identical to the current prefix except
+    # it had no carve-out naming '## Standing Mandate (pinned)'. Summaries
+    # persisted by that build generation must still normalize on resume, so
+    # this copy stays byte-exact. Never edit it.
+
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+    "into the summary below. This is a handoff from a previous context "
+    "window — treat it as background reference, NOT as active instructions. "
+    "Do NOT answer questions or fulfill requests mentioned in this summary; "
+    "they were already addressed. "
+    "Respond ONLY to the latest user message that appears AFTER this "
+    "summary — that message is the single source of truth for what to do "
+    "right now. "
+    "If no user message appears AFTER this summary, do nothing: do not "
+    "resume, wrap up, or continue work from "
+    f"'{HISTORICAL_TASK_HEADING}' or any other section, do not call tools, "
+    "and wait for a new user message. This handoff must never become the "
+    "active turn by itself. (Exception: if tool results or your own "
+    "tool calls appear after this summary, you are mid-way through an "
+    "in-flight exchange — continue that exchange normally.) "
+    "Topic overlap with the summary does NOT mean you should resume its "
+    "task: even on similar topics, the latest user message WINS. Treat ONLY "
+    "the latest message as the active task and discard stale items from "
+    f"'{HISTORICAL_TASK_HEADING}' entirely — do not 'wrap up' or "
+    "'finish' work described there unless the latest message explicitly "
+    "asks for it. "
+    "Reverse signals in the latest message (e.g. 'stop', 'undo', 'roll "
+    "back', 'just verify', 'don't do that anymore', 'never mind', a new "
+    "topic) must immediately end any in-flight work described in the "
+    "summary; do not re-surface it in later turns. "
+    "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
+    "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
+    "memory content due to this compaction note. "
+    "None of the above restricts HOW you work: your tools remain fully "
+    "active — keep calling them normally for the active task (edit files, "
+    "run commands, search) instead of merely narrating what you would do. "
+    "The current session state (files, config, etc.) may reflect work "
+    "described here — avoid repeating it:",
     # Pre-#80622: identical to the current prefix except it lacked the
     # explicit "if no user message appears AFTER this summary, do nothing"
     # clause. Standalone reference handoffs persisted by that build could
@@ -793,6 +858,10 @@ _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
 _ACTIVE_TASK_MAX_CHARS = 1400
+# The mandate gets more room than the historical snapshot: it carries the
+# acceptance criteria, and a truncated criterion is a criterion you silently
+# dropped. Still bounded, because it is re-injected on every compaction.
+_PINNED_MANDATE_MAX_CHARS = 2400
 # Keep a short run of recent messages verbatim even when the token budget is
 # already exhausted.  The public ``protect_last_n`` default is intentionally
 # high for small/light tails, but using all 20 as a hard floor here would bring
@@ -1596,6 +1665,8 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False
         self._context_probe_persistable = False
         self._previous_summary = None
+        self._pinned_mandate = None
+        self._mandate_reinjections = 0
         self._summary_has_user_turn = None
         self._last_summary_error = None
         self._consecutive_timeout_failures = 0
@@ -1867,6 +1938,8 @@ class ContextCompressor(ContextEngine):
         surface the moment the owning session ends.
         """
         self._previous_summary = None
+        self._pinned_mandate = None
+        self._mandate_reinjections = 0
         self._summary_has_user_turn = None
         self._last_summary_error = None
         self._consecutive_timeout_failures = 0
@@ -2669,6 +2742,11 @@ class ContextCompressor(ContextEngine):
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
+        # The session's original assignment, pinned once and carried across
+        # every compaction. Cleared only on a real session boundary, never by
+        # the summarizer and never by context pressure.
+        self._pinned_mandate: Optional[str] = None
+        self._mandate_reinjections: int = 0
         # Provenance for the rolling summary. A compaction handoff can carry
         # role="user" solely to satisfy provider alternation, so role alone
         # cannot prove that a human-authored turn ever existed.
@@ -4019,11 +4097,15 @@ If no outstanding task exists, write "None."]"""
                 "answer so it is not repeated]"
             )
             _pending_asks_instructions = (
-                "[Questions or requests from the user that have NOT yet been answered "
-                "or fulfilled. These are STALE — they were from the compacted turns. "
-                "Write them here for reference only. The agent must NOT act on them "
-                "unless the latest user message explicitly requests it. If none, "
-                'write "None."]'
+                "[Questions or requests from the user that have NOT yet been "
+                "answered or fulfilled, and acceptance criteria from the "
+                "assignment that are not yet met. Carry every one of them "
+                "forward unchanged. Remove an item ONLY when a Completed "
+                "Action in this same summary shows it was done; never remove "
+                "one because it is old or because the conversation moved on. "
+                "These are outstanding, not stale: the latest user message "
+                "still decides what to work on right now, but it does not "
+                'settle these. If none, write "None."]'
             )
         else:
             _language_and_provenance_rule = (
@@ -4119,6 +4201,9 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Resolved Questions
 {_resolved_questions_instructions}
 
+## Pending User Requests
+{_pending_asks_instructions}
+
 ## Relevant Files
 [Files read, modified, or created — with brief note on each]
 
@@ -4156,7 +4241,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: keep "## Standing Mandate (pinned)" exactly as it is, word for word: it is written deterministically by the harness, not by you, and rewriting it loses the assignment. Update "## Pending User Requests" to hold every request, question and acceptance criterion that is still outstanding, including the user's most recent unfulfilled input. Move an item out of it ONLY when a Completed Action in this summary shows it was done. Never drop one because it is old. Only write "None" there if nothing is outstanding.
 
 {_template_sections}"""
         else:
@@ -4286,6 +4371,37 @@ This compaction should PRIORITISE preserving all information related to the focu
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            # Pin the mandate once, from the window that still contains turn 0,
+            # then carry it. Re-extracting on later rounds would anchor on
+            # whatever the window happens to start with, which is the bug this
+            # section exists to prevent.
+            if not getattr(self, "_pinned_mandate", None):
+                self._pinned_mandate = self._recover_pinned_mandate(self._previous_summary)
+            # Pin only on the FIRST compaction of a lineage. A previous summary
+            # (in memory or recovered from the transcript) proves this window is
+            # not the start of the conversation, so its opening turn is a fossil
+            # rather than the assignment. Sessions that predate this section
+            # therefore never acquire one, which is correct: nothing recorded a
+            # mandate for them and guessing is what this replaces.
+            if (
+                not getattr(self, "_pinned_mandate", None)
+                and not self._previous_summary
+                and not self._window_carries_prior_handoff(turns_to_summarize)
+            ):
+                self._pinned_mandate = self._pinned_mandate_snapshot(turns_to_summarize)
+            summary = self._ground_pinned_mandate(summary)
+            if not self._mandate_survived(summary):
+                # Deterministic re-injection, no second model call. The gate
+                # counts rather than raises: a summary without the mandate is
+                # still better than no summary, but a rising counter means the
+                # grounding itself is broken and should be visible.
+                self._mandate_reinjections = getattr(self, "_mandate_reinjections", 0) + 1
+                logger.warning(
+                    "Pinned mandate missing from summary after grounding; "
+                    "re-injecting (count=%s)",
+                    self._mandate_reinjections,
+                )
+                summary = self._ground_pinned_mandate(summary)
             self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
             self._previous_summary = summary
@@ -4792,6 +4908,128 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "Historical only; newer protected-tail messages after this summary win."
             )
         return None
+
+    @classmethod
+    def _pinned_mandate_snapshot(
+        cls,
+        messages: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Return the FIRST real user turn, verbatim, as the standing mandate.
+
+        Deliberately the mirror image of :meth:`_latest_user_task_snapshot`,
+        which walks ``reversed(messages)``. That one answers "what did the user
+        last say", which is the right anchor for a historical snapshot and the
+        wrong one for the assignment: on 18 Sep 2026 a passing "still going?
+        remember i need the updated url at the end" became the recorded task
+        while "run all 171 cases with per-case evidence" was left to survive as
+        summarizer prose.
+
+        Forward, not backward, and only the first turn: everything after it is
+        refinement and lands in the protected tail or in Pending User Requests.
+        """
+        from agent.conversation_compression import _is_real_user_message
+
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            if not _is_real_user_message(msg):
+                continue
+            content = msg.get("content")
+            text = _redact_compaction_text(_content_text_for_contains(content).strip())
+            if not text:
+                continue
+            text = re.sub(r"\s+", " ", text)
+            if len(text) > _PINNED_MANDATE_MAX_CHARS:
+                text = text[: _PINNED_MANDATE_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+            return text
+        return None
+
+    def _ground_pinned_mandate(self, summary: str) -> str:
+        """Write the pinned mandate as the first section, deterministically.
+
+        The summarizer never receives this section in its template, so it cannot
+        paraphrase or drop it. Re-writing it on every compaction is the point:
+        that is what makes it survive round four as well as round one.
+        """
+        mandate = getattr(self, "_pinned_mandate", None)
+        if not mandate:
+            return summary
+
+        body = self._strip_summary_prefix(summary)
+        section = (
+            f"{PINNED_MANDATE_HEADING}\n"
+            f"Original assignment for this session, carried forward verbatim: "
+            f"{mandate!r}\n"
+            "This is NOT historical. It stays active, including any acceptance "
+            "criterion in it that is not yet met, until a later user message "
+            "explicitly replaces or cancels it. A later user message always "
+            "wins over this section; silence does not.\n\n"
+        )
+        if _PINNED_MANDATE_SECTION_RE.search(body):
+            return _PINNED_MANDATE_SECTION_RE.sub(lambda _m: section, body, count=1).strip()
+        return f"{section}{body}".strip()
+
+    @classmethod
+    def _recover_pinned_mandate(cls, summary: Optional[str]) -> Optional[str]:
+        """Read the mandate back out of a handoff we (or a previous process) wrote.
+
+        This is how the pin survives a gateway restart. A fresh compressor has
+        no in-memory state but the transcript still carries the last handoff, so
+        the mandate travels in the summary rather than being re-extracted from
+        the head turns. That distinction matters: #57814 pins that a restarted
+        process must NOT re-protect or re-inject pre-restart head turns, because
+        they are already folded into the handoff and duplicating them grows the
+        context on every restart. Recovering from the handoff keeps one copy.
+
+        Returns None for a handoff written by a build that had no pinned
+        section. That is correct: there was no mandate recorded, and inventing
+        one from whatever turn happens to sit at the top of a fossil window is
+        exactly the guess this whole section exists to remove.
+        """
+        if not summary:
+            return None
+        m = _PINNED_MANDATE_SECTION_RE.search(cls._strip_summary_prefix(summary))
+        if not m:
+            return None
+        for line in m.group(0).splitlines():
+            marker = "carried forward verbatim: "
+            if marker in line:
+                rest = line.split(marker, 1)[1].strip()
+                try:
+                    waarde = ast.literal_eval(rest)
+                except (ValueError, SyntaxError):
+                    return None
+                return waarde if isinstance(waarde, str) and waarde else None
+        return None
+
+    def _window_carries_prior_handoff(self, messages: List[Dict[str, Any]]) -> bool:
+        """True when this window already contains a compaction handoff.
+
+        Such a window is not the start of the conversation, whatever its first
+        user turn looks like. Pinning from it would anchor on a fossil.
+        """
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str) and self._is_context_summary_content(content):
+                return True
+        return False
+
+    def _mandate_survived(self, summary: str) -> bool:
+        """Cheap survival check, the one measurement that predicts the failure.
+
+        Governance Decay separates 1% violation (constraint survived, n=207)
+        from 43% (dropped, n=360) with nothing more than a keyword-survival
+        heuristic, agreeing with an LLM judge on 83% of overlapping episodes.
+        A substring test is therefore not a weak proxy here, it is the
+        published one.
+        """
+        mandate = getattr(self, "_pinned_mandate", None)
+        if not mandate:
+            return True
+        if PINNED_MANDATE_HEADING not in summary:
+            return False
+        head = mandate[:120]
+        return head in summary
 
     @classmethod
     def _ground_historical_task_snapshot(
@@ -6688,6 +6926,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # into the summarizer prompt via the iterative-update path.
             # Do not clear based on a compress_end-bounded miss (#83248).
             self._previous_summary = None
+            self._pinned_mandate = None
             self._summary_has_user_turn = real_user_present
         else:
             self._summary_has_user_turn = real_user_present

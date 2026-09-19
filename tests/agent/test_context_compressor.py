@@ -707,7 +707,15 @@ class TestNonStringContent:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             summary = c._generate_summary(messages)
 
-        assert summary.startswith(f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n")
+        # Section order changed when the pinned mandate landed: when a session
+        # has a real user turn, its assignment is written above the historical
+        # snapshot, because that is the section a model must not read past.
+        # The snapshot itself still follows, and the model's prose still ends
+        # the summary.
+        from agent.context_compressor import PINNED_MANDATE_HEADING
+
+        assert summary.startswith(f"{SUMMARY_PREFIX}\n{PINNED_MANDATE_HEADING}\n")
+        assert HISTORICAL_TASK_HEADING in summary
         assert "do something" in summary
         assert summary.endswith("plain summary text")
 
