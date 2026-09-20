@@ -2579,6 +2579,42 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+
+_ROOT_CREDENTIAL_VARS = (
+    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+    "MATTERMOST_TOKEN", "MATRIX_ACCESS_TOKEN", "WHATSAPP_CLOUD_ACCESS_TOKEN",
+)
+_ROOT_CREDENTIAL_CACHE: dict = {"mtime": None, "values": set()}
+
+
+def _synthpulse_root_shared_credential(adapter: Any) -> bool:
+    """True when the adapter's credential equals one in the root profile's .env
+    while this process is NOT the root profile's gateway (multiplexer next to
+    the main gateway). Fail-open: any error means "not shared"."""
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        root = Path(get_default_hermes_root())
+        if Path(get_hermes_home()).resolve() == root.resolve():
+            return False
+        env_path = root / ".env"
+        st = env_path.stat()
+        if _ROOT_CREDENTIAL_CACHE["mtime"] != st.st_mtime_ns:
+            from agent.secret_scope import load_env_file
+            values = load_env_file(env_path)
+            _ROOT_CREDENTIAL_CACHE["values"] = {
+                str(values.get(k) or "").strip() for k in _ROOT_CREDENTIAL_VARS if str(values.get(k) or "").strip()
+            }
+            _ROOT_CREDENTIAL_CACHE["mtime"] = st.st_mtime_ns
+        token = None
+        for attr in ("token", "bot_token", "_token", "api_token", "_bot_token", "_project_secret"):
+            val = getattr(adapter, attr, None)
+            if isinstance(val, str) and val.strip():
+                token = val.strip()
+                break
+        return bool(token) and token in _ROOT_CREDENTIAL_CACHE["values"]
+    except Exception:
+        return False
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -16714,6 +16750,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "[MULTIPLEX] Profile '%s': skipping platform '%s' - adapter creation returned None",
                     profile_name,
                     platform.value,
+                )
+                continue
+
+            # SynthPulse: a person or department profile whose credential is a
+            # copy of the root profile's (another gateway process polls that
+            # bot) must not start a second poller: Telegram answers 409 to the
+            # main gateway and it misses updates. Skip it quietly.
+            if _synthpulse_root_shared_credential(adapter):
+                logger.info(
+                    "[MULTIPLEX] Profile '%s': %s credential is the root profile's "
+                    "(served by the main gateway); not starting a duplicate poller",
+                    profile_name, platform.value,
                 )
                 continue
 
