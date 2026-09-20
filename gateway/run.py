@@ -18032,6 +18032,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """SynthPulse: run the turn as the person mapped to this platform user.
+
+        Governance context plus, when the mapping names an existing profile,
+        that profile's runtime scope (config, skills, memory, sessions) for
+        the whole turn: session lookup, transcript, agent run and persistence
+        all happen inside it. Unmapped senders run exactly as before. See
+        gateway/synthpulse_identity.py; this wrapper only binds and resets.
+        """
+        _sp_handle = None
+        try:
+            from gateway import synthpulse_identity as _sp_identity
+            _sp_handle = _sp_identity.bind_for_source(getattr(event, "source", None),
+                                                      str(getattr(getattr(event, "source", None), "chat_id", "") or ""))
+        except Exception:
+            _sp_handle = None
+        try:
+            return await self._handle_message_unbound(event)
+        finally:
+            if _sp_handle is not None:
+                try:
+                    _sp_identity.reset(_sp_handle)
+                except Exception:
+                    pass
+
+    async def _handle_message_unbound(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
