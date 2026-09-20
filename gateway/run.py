@@ -16671,20 +16671,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and _platform_binds_port(platform.value, platform_config.extra)
         )
         if port_binding_platforms:
-            joined = ", ".join(port_binding_platforms)
-            raise SecondaryPortBindingConfigError(
-                f"Profile '{profile_name}' enables port-binding platform(s) "
-                f"{joined}, but gateway.multiplex_profiles is on. The default "
-                f"profile owns the single shared HTTP listener and serves every "
-                f"profile through the /p/{profile_name}/ URL prefix. Remove "
-                f"these platform entries from profile '{profile_name}'s config.yaml "
-                f"or configure them only on the default profile."
+            # SynthPulse: a person profile inherits API_SERVER_* from the shared
+            # secrets, which used to make the whole profile unservable here.
+            # The default profile's listener already serves /p/<profile>/, so
+            # skip only the port-binding platforms and still start the
+            # profile's own bots (Telegram, Discord, Slack socket mode).
+            logger.info(
+                "Profile '%s': not starting port-binding platform(s) %s under "
+                "multiplex; the default listener serves /p/%s/",
+                profile_name, ", ".join(port_binding_platforms), profile_name,
             )
 
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
+                continue
+            if platform.value in port_binding_platforms:
                 continue
             # Relay is shared process-level ingress in multiplex mode. The
             # active profile owns the one connection; connector-stamped
