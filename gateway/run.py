@@ -2592,7 +2592,9 @@ def _synthpulse_root_shared_credential(adapter: Any, profile_home: Any = None) -
     while this process is NOT the root profile's gateway (multiplexer next to
     the main gateway). The root is derived from the REAL profile directory
     (<root>/profiles/<name>, symlinks resolved), because a multiplexer runs
-    under its own HERMES_HOME. Fail-open: any error means "not shared"."""
+    under its own HERMES_HOME. Compared by the same fingerprint the duplicate
+    detection uses, so plugin adapters that keep the token elsewhere are
+    covered. Fail-open: any error means "not shared"."""
     try:
         from hermes_constants import get_hermes_home
         real = Path(profile_home).resolve() if profile_home else None
@@ -2605,19 +2607,19 @@ def _synthpulse_root_shared_credential(adapter: Any, profile_home: Any = None) -
         st = env_path.stat()
         if _ROOT_CREDENTIAL_CACHE["mtime"] != st.st_mtime_ns:
             from agent.secret_scope import load_env_file
+            import hashlib
             values = load_env_file(env_path)
             _ROOT_CREDENTIAL_CACHE["values"] = {
-                str(values.get(k) or "").strip() for k in _ROOT_CREDENTIAL_VARS if str(values.get(k) or "").strip()
+                hashlib.sha256(("hermes-mux:" + str(values.get(k) or "").strip()).encode("utf-8")).hexdigest()[:16]
+                for k in _ROOT_CREDENTIAL_VARS if str(values.get(k) or "").strip()
             }
             _ROOT_CREDENTIAL_CACHE["mtime"] = st.st_mtime_ns
-        token = None
-        for attr in ("token", "bot_token", "_token", "api_token", "_bot_token", "_project_secret"):
-            val = getattr(adapter, attr, None)
-            if isinstance(val, str) and val.strip():
-                token = val.strip()
-                break
-        return bool(token) and token in _ROOT_CREDENTIAL_CACHE["values"]
+        fingerprint = GatewayRunner._adapter_credential_fingerprint(adapter)
+        shared = bool(fingerprint) and fingerprint in _ROOT_CREDENTIAL_CACHE["values"]
+        logger.info("[MULTIPLEX] root-credential guard: profile_home=%s root=%s shared=%s", profile_home, root, shared)
+        return shared
     except Exception:
+        logger.warning("[MULTIPLEX] root-credential guard failed open", exc_info=True)
         return False
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
