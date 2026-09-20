@@ -2587,13 +2587,18 @@ _ROOT_CREDENTIAL_VARS = (
 _ROOT_CREDENTIAL_CACHE: dict = {"mtime": None, "values": set()}
 
 
-def _synthpulse_root_shared_credential(adapter: Any) -> bool:
+def _synthpulse_root_shared_credential(adapter: Any, profile_home: Any = None) -> bool:
     """True when the adapter's credential equals one in the root profile's .env
     while this process is NOT the root profile's gateway (multiplexer next to
-    the main gateway). Fail-open: any error means "not shared"."""
+    the main gateway). The root is derived from the REAL profile directory
+    (<root>/profiles/<name>, symlinks resolved), because a multiplexer runs
+    under its own HERMES_HOME. Fail-open: any error means "not shared"."""
     try:
-        from hermes_constants import get_default_hermes_root, get_hermes_home
-        root = Path(get_default_hermes_root())
+        from hermes_constants import get_hermes_home
+        real = Path(profile_home).resolve() if profile_home else None
+        if real is None or real.parent.name != "profiles":
+            return False
+        root = real.parent.parent
         if Path(get_hermes_home()).resolve() == root.resolve():
             return False
         env_path = root / ".env"
@@ -16757,7 +16762,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # copy of the root profile's (another gateway process polls that
             # bot) must not start a second poller: Telegram answers 409 to the
             # main gateway and it misses updates. Skip it quietly.
-            if _synthpulse_root_shared_credential(adapter):
+            if _synthpulse_root_shared_credential(adapter, profile_home):
                 logger.info(
                     "[MULTIPLEX] Profile '%s': %s credential is the root profile's "
                     "(served by the main gateway); not starting a duplicate poller",
