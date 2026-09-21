@@ -1177,6 +1177,15 @@ def _tool_arguments_for_single_context(ctx, tool_name, args):
     candidate = ""
     if tool_name in {"read_file", "search_files", "write_file", "patch"}:
         candidate = _resolve_candidate_path(args.get("path") or ".")
+        # The running session's own attachment inbox is that person's own
+        # message, not a workspace: it lives under the state directory and is
+        # already carved out below (session_attachment_allowed). A registered
+        # workspace whose root happens to contain the state directory (a stray
+        # entry at /home, 20-09-2026) must not turn every upload into
+        # workspace_access_revoked. The selected workspace root is still checked.
+        if tool_name in {"read_file", "search_files"} and _in_session_inbox(
+                candidate, session_attachment_inbox(getattr(ctx, "session_id", ""))):
+            candidate = ""
     elif tool_name == "terminal":
         candidate = _resolve_candidate_path(args.get("workdir") or getattr(ctx, "workspace_path", "") or ".")
     if not workspace_allowed_for_context(ctx, candidate):
