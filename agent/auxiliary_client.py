@@ -7459,6 +7459,9 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     Returns True when capability lookup is unknown — preserves the historical
     behaviour of attempting the call, so providers we haven't catalogued yet
     don't silently regress to text-only.
+
+    Availability probes use only configuration and cached capabilities. Actual
+    image resolution, outside probe mode, retains live capability discovery.
     """
     try:
         from agent.image_routing import _lookup_supports_vision
@@ -7466,7 +7469,10 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config_readonly())
+        supports = _lookup_supports_vision(
+            provider, model, load_config_readonly(),
+            allow_network=not _aux_probe_active(),
+        )
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:

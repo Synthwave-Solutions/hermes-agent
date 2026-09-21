@@ -1,0 +1,188 @@
+"""Blacklists allow operational resources by default, without changing identities."""
+from copy import deepcopy
+import pytest
+from hermes_cli.dashboard_governance.loader import parse_governance_policy
+from hermes_cli.dashboard_governance.models import GovernanceSubject
+from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+
+EMAIL = "technical@example.test"
+
+def policy(mode="blacklist", level="elevated"):
+    user = {"roles": ["narrow"], "access_mode": mode, "access_level": level,
+            "grants": {"profiles": ["historical"], "env": {"vars": ["TECH_KEY"]},
+                       "files": {"denied_globs": ["*/private/*"], "allow_globs": ["*/private/example.md"]},
+                       "cli": {"approval_commands": ["deploy-prod"]}, "usage_caps": {"tool_calls": 12}},
+            "approval": {"mode": "automatic", "prompt": "Approve ordinary engineering; deny banking."}}
+    if not mode: user.pop("access_mode")
+    if not level: user.pop("access_level")
+    return {"mode": "enforce", "roles": {"narrow": {"grants": {
+        "permissions": ["chat:use"], "profiles": ["old"], "routes": ["/api/chat"],
+        "tools": {"builtins": ["web_search"]}, "files": {"denied_globs": ["*/bank/*"]},
+    }}}, "users": {EMAIL: user}}
+
+def access(raw):
+    return resolve_effective_access(parse_governance_policy(raw), GovernanceSubject(email=EMAIL))
+
+@pytest.mark.parametrize("dimension,value", [
+    ("permissions", "future_technical_feature:write"), ("profiles", "default"),
+    ("profiles", "historical"), ("profiles", "new-technical-profile"),
+    ("routes", "/api/new-technical-tool"), ("settings_write", "theme"),
+    ("tools", "read_file"), ("toolsets", "new-tools"), ("skills_manage", "new-skill"),
+    ("skills_load", "new-skill"), ("mcp_servers", "github"),
+    ("models", "new-model"), ("model_providers", "new-provider"),
+    ("file_read_roots", "/new/project/readme.md"), ("file_write_roots", "/new/project/code.py"),
+    ("cli_commands", "git"), ("cli_workdir_roots", "/new/project"), ("workspaces", "Aligned"),
+])
+def test_blacklist_allows_resources_absent_from_role_and_direct_grants(dimension, value):
+    a = access(policy())
+    assert a.allows(dimension, value)
+    assert a.role_ceiling is None
+
+@pytest.mark.parametrize("level", ["", "user", "elevated", "admin"])
+def test_levels_and_explicit_denials_remain_independent(level):
+    raw = policy(level=level)
+    raw["users"][EMAIL]["deny"] = {"tools": {"builtins": ["*bank*"]}, "profiles": ["private-*"],
+        "permissions": ["dangerous:write"], "routes": ["/api/private/*"]}
+    a = access(raw)
+    assert not a.is_tool_allowed("bank_transfer")
+    assert not a.is_profile_allowed("private-person")
+    assert not a.has_permission("dangerous:write")
+    assert not a.is_route_allowed("/api/private/accounts")
+    assert a.has_permission("governance:write") == (level == "admin")
+    assert a.has_permission("terminal:use") == (level in {"admin", "elevated"})
+    assert a.has_permission("profiles:admin") == (level in {"admin", "elevated"})
+    assert bool(a.roles & {"owner", "admin"}) == (level == "admin")
+
+
+def test_default_allow_preserves_constraints_and_explicit_secret_forwarding():
+    a = access(policy())
+    # 14-09-2026: the role's */bank/* no longer reaches a blacklist account;
+    # its own denied_globs are its whole file blacklist (Michael's decision).
+    assert a.grants.file_denied_globs == frozenset({"*/private/*"})
+    assert a.grants.file_allow_globs == frozenset({"*/private/example.md"})
+    assert a.grants.cli_approval_commands == frozenset({"deploy-prod"})
+    assert a.grants.usage_caps == {"tool_calls": 12}
+    assert a.allows("env_vars", "TECH_KEY")
+    assert not a.allows("env_vars", "OTHER_SECRET")
+    assert a.approval_mode == "automatic" and a.approval_configured
+    assert a.approval_prompt == policy()["users"][EMAIL]["approval"]["prompt"]
+
+@pytest.mark.parametrize("mode,level", [("whitelist", "elevated"), ("", "elevated"), ("", "")])
+def test_legacy_and_whitelist_do_not_gain_unconfigured_resources(mode, level):
+    a = access(policy(mode, level))
+    assert not a.is_tool_allowed("unlisted_tool")
+    assert not a.is_profile_allowed("new-technical-profile")
+    assert not a.has_permission("future_technical_feature:write")
+    assert a.is_profile_allowed("historical") == (mode != "whitelist")
+
+
+def test_bootstrap_admin_exemption_is_preserved():
+    raw = policy(level="user")
+    raw["bootstrap_admins"] = [EMAIL]
+    raw["users"][EMAIL]["deny"] = {"permissions": ["*"], "profiles": ["*"]}
+    a = access(raw)
+    assert a.has_permission("governance:write")
+    assert a.has_permission("terminal:use")
+    assert a.is_profile_allowed("default")
+
+
+def test_resolver_does_not_rewrite_other_users_or_the_input_policy():
+    raw = policy()
+    raw["users"]["other@example.test"] = {"roles": ["narrow"]}
+    before = deepcopy(raw)
+    access(raw)
+    assert raw == before
+    other = resolve_effective_access(parse_governance_policy(raw), GovernanceSubject(email="other@example.test"))
+    assert not other.is_tool_allowed("unlisted_tool")
+
+@pytest.mark.parametrize("mode", ["blacklist", "whitelist", ""])
+def test_technical_storage_exception_cannot_override_specific_blacklist_denial(mode):
+    raw = policy(mode, "elevated")
+    files = {"denied_globs": ["**/.hermes/**", "**/.env", "*bunq*", "*/credentials/*"],
+             "allow_globs": ["/home/test/.hermes/profiles/technical/workspace/**"]}
+    raw["roles"]["narrow"]["grants"]["files"] = files
+    raw["users"][EMAIL]["grants"]["files"] = files
+    a = access(raw)
+    root = "/home/test/.hermes/profiles/technical/workspace/"
+    assert not a.configuration_denies_file(root + "source.py")
+    for suffix in (".env", "bunq.json", "credentials/token.json"):
+        assert a.configuration_denies_file(root + suffix) == (mode == "blacklist")
+    assert a.configuration_denies_file("/home/test/.hermes/unassigned/source.py")
+
+@pytest.mark.parametrize("raw,canonical", [
+    ("/home/test/.hermes/profiles/technical/workspace/alias.txt", "/home/test/.hermes/profiles/private/notes.txt"),
+    ("/home/test/.hermes/profiles/technical/workspace/bunq.json", "/home/test/.hermes/profiles/technical/workspace/source.py"),
+])
+def test_raw_alias_and_canonical_target_require_independent_file_exceptions(raw, canonical):
+    data = policy()
+    data["users"][EMAIL]["grants"]["files"] = {
+        "denied_globs": ["**/.hermes/**", "*bunq*"],
+        "allow_globs": ["/home/test/.hermes/profiles/technical/workspace/**"],
+    }
+    rights = access(data)
+    assert rights.configuration_denies_file(raw, canonical)
+    assert rights.configuration_denies_file(canonical, raw)
+
+@pytest.mark.parametrize('sensitive_alias', [False, True])
+def test_actual_file_argument_check_resolves_and_rejects_symlink_denial(tmp_path, sensitive_alias):
+    from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+    own = tmp_path/'.hermes/profiles/technical/workspace'
+    private = tmp_path/'.hermes/profiles/private'
+    own.mkdir(parents=True); private.mkdir(parents=True)
+    target = own/'source.py' if sensitive_alias else private/'notes.txt'
+    target.write_text('synthetic')
+    alias = own/('bunq.json' if sensitive_alias else 'alias.txt')
+    alias.symlink_to(target)
+    data = policy()
+    data['users'][EMAIL]['grants']['files'] = {
+        'denied_globs': ['**/.hermes/**', '*bunq*'], 'allow_globs': [str(own)+'/**'],
+    }
+    rights = access(data)
+    for tool in ('read_file', 'write_file'):
+        decision = decide_tool_argument_access(rights, tool, {'path': str(alias)})
+        assert not decision.allowed and decision.reason == 'file_denied_glob'
+
+
+class TestBlacklistCarriesOnlyItsOwnFileBlacklist:
+    """14-09-2026 (Michael: "blacklisted users kunnen overal bij"): the generic
+    secret rules of a role or group (every .env, **/.hermes/**, key files) are
+    written for whitelist colleagues. Merged into a default-allow account they
+    blocked most of what the person was otherwise allowed to reach. A
+    blacklist account is closed by its own denied_globs only; whitelist and
+    legacy accounts keep the role rules."""
+
+    RAW = {
+        "mode": "enforce",
+        "roles": {"member": {"grants": {
+            "permissions": ["chat:use", "files:read", "terminal:use"],
+            "routes": ["*"], "profiles": ["me"], "tools": {"builtins": ["*"]},
+            "files": {"read_roots": ["/home/synthwavehq"],
+                      "denied_globs": ["**/.env", "**/.hermes/**", "**/*.pem"]},
+        }}},
+        "users": {"me@example.test": {"roles": ["member"], "grants": {"files": {"denied_globs": ["**/bunq*"]}}}},
+    }
+
+    def _access(self, **entry):
+        from copy import deepcopy
+        from hermes_cli.dashboard_governance.loader import parse_governance_policy
+        from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        raw = deepcopy(self.RAW)
+        raw["users"]["me@example.test"].update(entry)
+        return resolve_effective_access(parse_governance_policy(raw), GovernanceSubject(email="me@example.test"))
+
+    def test_a_blacklist_account_keeps_only_its_own_denies(self):
+        a = self._access(access_mode="blacklist", access_level="elevated")
+        assert a.grants.file_denied_globs == frozenset({"**/bunq*"})
+
+    def test_its_own_blacklist_still_closes(self):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        a = self._access(access_mode="blacklist", access_level="elevated")
+        assert decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/clients/x/.env"}).allowed
+        assert decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/.hermes/skills/x/SKILL.md"}).allowed
+        assert not decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/bunq-agentic/bunq_cli.py"}).allowed
+
+    def test_whitelist_and_legacy_accounts_keep_the_role_rules(self):
+        for entry in ({"access_mode": "whitelist", "access_level": "elevated"}, {}):
+            a = self._access(**entry)
+            assert "**/.env" in a.grants.file_denied_globs and "**/.hermes/**" in a.grants.file_denied_globs

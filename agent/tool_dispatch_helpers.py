@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,18 +47,53 @@ _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
+    "feishu_doc_read",
+    "feishu_drive_list_comment_replies",
+    "feishu_drive_list_comments",
     "ha_get_state",
     "ha_list_entities",
     "ha_list_services",
     "image_generate",
+    "kanban_attachments",
+    "kanban_list",
+    "kanban_show",
+    "project_list",
     "read_file",
+    "read_preview",
+    "read_terminal",
     "search_files",
     "session_search",
     "skill_view",
     "skills_list",
+    "video_analyze",
     "vision_analyze",
     "web_extract",
     "web_search",
+    "x_search",
+})
+
+# Admission is ALLOW-BY-DEFAULT: an unrecognised tool is assumed independent
+# and joins the parallel run. These are the exceptions — tools that own one
+# shared surface (a single browser, desktop, interpreter or pane) or whose
+# result a later call in the same batch reads back, so running two of them at
+# once changes the answer. Everything genuinely stateful belongs here; when in
+# doubt about a NEW tool, add it and measure before removing it.
+_SEQUENTIAL_TOOLS = frozenset({
+    # One browser / one desktop / one pane.
+    "browser_back", "browser_cdp", "browser_click", "browser_console",
+    "browser_dialog", "browser_get_images", "browser_navigate",
+    "browser_press", "browser_scroll", "browser_snapshot", "browser_type",
+    "browser_vision", "close_terminal", "computer_use", "focus_pane",
+    "open_preview", "read_window_below",
+    # Changes what later calls in the turn resolve against.
+    "cronjob", "project_create", "project_switch", "setup_mcp", "skill_manage",
+    # Ordering is visible to a human on the other end.
+    "discord", "discord_admin", "react_to_message", "text_to_speech",
+    "yb_send_dm", "yb_send_sticker",
+    # Board writes: the next call reads the board this one just changed.
+    "kanban_attach", "kanban_attach_url", "kanban_block", "kanban_comment",
+    "kanban_complete", "kanban_create", "kanban_heartbeat", "kanban_link",
+    "kanban_request_changes", "kanban_request_review", "kanban_unblock",
 })
 
 # Filesystem tools whose parallel admission is decided by path overlap.
@@ -99,6 +135,20 @@ def _is_destructive_command(cmd: str) -> bool:
     if _REDIRECT_OVERWRITE.search(cmd):
         return True
     return False
+
+
+def _is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
+    """Check if an MCP tool's server is pinned to serial execution.
+
+    True only for a server whose config carries an explicit
+    ``supports_parallel_tool_calls: false``. Returns False when the MCP module
+    is unavailable, matching the allow-by-default posture.
+    """
+    try:
+        from tools.mcp_tool import is_mcp_tool_parallel_blocked
+        return is_mcp_tool_parallel_blocked(tool_name)
+    except Exception:
+        return False
 
 
 def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
@@ -146,6 +196,145 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
         return tool_name, function_args
 
 
+# Command heads that only read. Deliberately an allowlist, not the inverse of
+# _DESTRUCTIVE_PATTERNS: `npm test` trips no destructive pattern yet writes
+# build output, so "not obviously destructive" is far too weak a gate for
+# concurrent admission. Anything not named here stays a sequential barrier.
+_READ_ONLY_COMMAND_HEADS = frozenset({
+    "awk", "base64", "basename", "cat", "cksum", "cmp", "column", "cut",
+    "date", "df", "diff", "dirname", "du", "echo", "egrep", "env", "false",
+    "fgrep", "file", "find", "grep", "head", "hostname", "id", "jq",
+    "ls", "md5sum", "nl", "od", "printenv", "printf", "ps", "pwd", "readlink",
+    "realpath", "rg", "sed", "seq", "sha1sum", "sha256sum", "sort", "stat",
+    "strings", "tac", "tail", "tr", "tree", "true", "type", "uname", "uniq",
+    "uptime", "wc", "which", "whoami", "xxd", "yq",
+})
+
+# `git` is only admitted for subcommands that cannot write. Deliberately
+# excludes the ambiguous ones (`branch`, `remote`, `config`, `tag`) whose
+# read/write behaviour depends on whether an argument follows.
+_READ_ONLY_GIT_SUBCOMMANDS = frozenset({
+    "blame", "cat-file", "count-objects", "describe", "diff", "log",
+    "ls-files", "ls-remote", "ls-tree", "name-rev", "rev-parse", "shortlog",
+    "show", "status", "whatchanged",
+})
+
+# Shell constructs that hide arbitrary behaviour behind a read-only-looking
+# head, or that write: any redirect, command substitution, process
+# substitution, or a trailing `&`. One match disqualifies the whole line.
+_UNSAFE_SHELL_CONSTRUCTS = re.compile(r"\$\(|`|<\(|>|(?<!&)&(?!&)")
+
+# Segment separators inside one command line. Every segment must independently
+# pass the allowlist, so `grep -r x . | head -20` is admitted and
+# `cat a.txt | tee b.txt` is not.
+_COMMAND_SPLIT_RE = re.compile(r"\|\||&&|[|;\n]")
+
+
+# Heads that are read-only until one flag turns them into writers: `sed -i`
+# edits in place, `sort -o` writes its output file, `find -exec` runs anything.
+_WRITING_FLAGS_BY_HEAD = {
+    "awk": ("-i",),
+    "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"),
+    "sed": ("-i",),
+    "sort": ("-o",),
+    "yq": ("-i", "--inplace"),
+}
+
+
+def _is_read_only_command(cmd: str) -> bool:
+    """Return True when *cmd* provably only reads.
+
+    Conservative by construction: every segment of the command line must start
+    with an allowlisted head, and the line may contain no redirect, command
+    substitution or background operator. False for anything it cannot parse.
+    """
+    if not cmd or not cmd.strip():
+        return False
+    if _UNSAFE_SHELL_CONSTRUCTS.search(cmd):
+        return False
+
+    for segment in _COMMAND_SPLIT_RE.split(cmd):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        head = os.path.basename(tokens[0])
+        if head == "git":
+            subcommand = next(
+                (t for t in tokens[1:] if not t.startswith("-")), ""
+            )
+            if subcommand not in _READ_ONLY_GIT_SUBCOMMANDS:
+                return False
+            continue
+        if head not in _READ_ONLY_COMMAND_HEADS:
+            return False
+        # Read-only heads that grow a writing mode from one flag.
+        deny = _WRITING_FLAGS_BY_HEAD.get(head)
+        if deny and any(
+            token == flag or token.startswith(flag)
+            for token in tokens[1:]
+            for flag in deny
+        ):
+            return False
+    return True
+
+
+def _terminal_is_parallel_safe(function_args: Dict[str, Any]) -> bool:
+    """Return True when a ``terminal`` call may join a parallel run.
+
+    Two admissions, both narrow:
+
+    * a provably read-only command line (see ``_is_read_only_command``), and
+    * a background spawn of a non-destructive command — the call returns a
+      handle immediately and the command's effects were already unordered
+      with respect to the rest of the turn, so serialising the *spawn* buys
+      no guarantee. Destructive commands stay sequential: they trip the
+      checkpoint path in ``tool_executor``, which is not written to be
+      driven from several worker threads at once.
+    """
+    command = function_args.get("command") or ""
+    if _is_read_only_command(command):
+        return True
+    if function_args.get("background") and not _is_destructive_command(command):
+        return True
+    return False
+
+
+# ``process`` actions that only observe a background job. `kill`, `write`,
+# `submit` and `close` change it, so they stay sequential barriers. `wait`
+# only blocks, and the concurrent and sequential executors share one call
+# deadline, so waiting on four jobs at once costs no timeout budget.
+_READ_ONLY_PROCESS_ACTIONS = frozenset({"list", "log", "poll", "wait"})
+
+
+def _process_is_parallel_safe(function_args: Dict[str, Any]) -> bool:
+    """Return True when a ``process`` call only observes a background job."""
+    action = function_args.get("action")
+    return isinstance(action, str) and action in _READ_ONLY_PROCESS_ACTIONS
+
+
+# Sentinel for the shared default browser session (``session`` omitted).
+_DEFAULT_BROWSER_SESSION = "\x00default"
+
+
+def _browser_session_key(function_args: Dict[str, Any]) -> str:
+    """Return the isolation key for a ``browser_exec`` call.
+
+    Each named session gets its own harness daemon and its own browser, so
+    two calls with different names never touch shared state. Calls without a
+    name share one default session and must be serialised against each other.
+    """
+    session = function_args.get("session")
+    if isinstance(session, str) and session.strip():
+        return session.strip()
+    return _DEFAULT_BROWSER_SESSION
+
+
 def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
@@ -183,13 +372,21 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     current: list = []
     # (canonical_path, is_writer) reservations for the current parallel run.
     reserved_paths: list[tuple[Path, bool]] = []
+    # Browser sessions already claimed by this run: one call per session.
+    reserved_sessions: set[str] = set()
+    # A read-only terminal command reads paths we cannot enumerate, so it has
+    # to be treated as reading everything: no path-scoped writer may join the
+    # same run, in either order.
+    has_unscoped_reader = False
 
     def _close_parallel() -> None:
-        nonlocal current, reserved_paths
+        nonlocal current, reserved_paths, reserved_sessions, has_unscoped_reader
         if current:
             segments.append(["parallel", current])
             current = []
             reserved_paths = []
+            reserved_sessions = set()
+            has_unscoped_reader = False
 
     def _add_sequential(tc) -> None:
         _close_parallel()
@@ -242,7 +439,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
                 _add_sequential(tool_call)
                 continue
             is_writer = effective_name in _PATH_SCOPED_WRITERS
-            if any(
+            if (is_writer and has_unscoped_reader) or any(
                 (is_writer or existing_is_writer)
                 and _paths_overlap(scoped_path, existing)
                 for scoped_path in scoped_paths
@@ -257,15 +454,44 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if (
-            effective_name in _PARALLEL_SAFE_TOOLS
-            or effective_name in _PARALLEL_SAFE_BRIDGE_LOOKUPS
-            or _is_mcp_tool_parallel_safe(effective_name)
-        ):
+        if effective_name == "terminal":
+            if not _terminal_is_parallel_safe(effective_args):
+                _add_sequential(tool_call)
+                continue
+            # A read-only command may observe pre-mutation state if a writer
+            # is already staged in this run; start a fresh one after it lands.
+            if any(is_writer for _, is_writer in reserved_paths):
+                _close_parallel()
+            has_unscoped_reader = True
             current.append(tool_call)
             continue
 
-        _add_sequential(tool_call)
+        if effective_name == "process":
+            if not _process_is_parallel_safe(effective_args):
+                _add_sequential(tool_call)
+                continue
+            current.append(tool_call)
+            continue
+
+        if effective_name == "browser_exec":
+            session_key = _browser_session_key(effective_args)
+            if session_key in reserved_sessions:
+                # Same session twice in one batch: the second call continues
+                # where the first left off, so it must run after it.
+                _close_parallel()
+            reserved_sessions.add(session_key)
+            current.append(tool_call)
+            continue
+
+        if effective_name in _SEQUENTIAL_TOOLS or _is_mcp_tool_parallel_blocked(
+            effective_name
+        ):
+            _add_sequential(tool_call)
+            continue
+
+        # Allow by default. Every tool with a known reason to serialise has
+        # been handled above; anything else is treated as independent.
+        current.append(tool_call)
 
     _close_parallel()
 
@@ -834,12 +1060,20 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
 __all__ = [
     "_NEVER_PARALLEL_TOOLS",
     "_PARALLEL_SAFE_TOOLS",
+    "_SEQUENTIAL_TOOLS",
+    "_is_mcp_tool_parallel_blocked",
     "_PATH_SCOPED_TOOLS",
     "_PATH_SCOPED_READERS",
     "_PATH_SCOPED_WRITERS",
     "_DESTRUCTIVE_PATTERNS",
     "_REDIRECT_OVERWRITE",
     "_is_destructive_command",
+    "_is_read_only_command",
+    "_terminal_is_parallel_safe",
+    "_browser_session_key",
+    "_process_is_parallel_safe",
+    "_READ_ONLY_COMMAND_HEADS",
+    "_READ_ONLY_GIT_SUBCOMMANDS",
     "_plan_tool_batch_segments",
     "_should_parallelize_tool_batch",
     "_canonical_path",

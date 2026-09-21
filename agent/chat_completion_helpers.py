@@ -27,7 +27,12 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    uses_local_inference_patience,
+    resolve_agent_provider_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason,
@@ -45,6 +50,9 @@ from agent.message_sanitization import (
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_diag import (
+    stream_diag_start_timing, stream_diag_mark_timing, log_stream_attempt_timing,
+)
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -888,7 +896,7 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = resolve_agent_provider_timeout(agent, get_provider_stale_timeout)
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -4105,7 +4113,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = resolve_agent_provider_timeout(agent, get_provider_request_timeout)
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
@@ -4121,7 +4129,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
             # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
+            if _stream_read_timeout == 120.0 and uses_local_inference_patience(agent):
                 _stream_read_timeout = _base_timeout
                 logger.debug(
                     "Local provider detected (%s) — stream read timeout raised to %.0fs",
@@ -4165,6 +4173,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         _diag = agent._stream_diag_init()
+        stream_diag_start_timing(agent, _diag)
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
@@ -4193,11 +4202,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            stream_diag_mark_timing(_diag, "sdk_dispatch")
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
             attempt_stream_response["value"] = response
+            if response is not None:
+                stream_diag_mark_timing(_diag, "response_headers")
             agent._capture_rate_limits(response)
             agent._capture_credits(response)
             agent._stream_diag_capture_response(_diag, response)
@@ -4297,12 +4309,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not tool_calls_acc:
                 for text in pending_parts:
                     _fire_first_delta()
+                    stream_diag_mark_timing(_diag, "first_text_dispatch")
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
                 return
             if agent.stream_delta_callback:
                 for text in pending_parts:
                     try:
+                        stream_diag_mark_timing(_diag, "first_text_dispatch")
                         agent.stream_delta_callback(text)
                         agent._record_streamed_assistant_text(text)
                     except Exception:
@@ -4322,6 +4336,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
+                    stream_diag_mark_timing(_diag, "first_chunk")
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -4408,6 +4423,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     reasoning_parts[-1] if reasoning_parts else "",
                     reasoning_text,
                 )
+                stream_diag_mark_timing(_diag, "first_reasoning_chunk")
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
@@ -4428,6 +4444,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
+                    stream_diag_mark_timing(_diag, "first_text_dispatch")
                     agent._fire_stream_delta(delta_content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
@@ -4443,6 +4460,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
+                        stream_diag_mark_timing(_diag, "first_text_dispatch")
                         agent.stream_delta_callback(delta_content)
                         agent._record_streamed_assistant_text(delta_content)
                     except Exception:
@@ -4577,6 +4595,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 content = getattr(message, "content", None)
                 if isinstance(content, str) and content:
                     _fire_first_delta()
+                    stream_diag_mark_timing(_diag, "first_text_dispatch")
                     agent._fire_stream_delta(content)
             return final_response
 
@@ -4991,6 +5010,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
+                        log_stream_attempt_timing(
+                            request_client_holder.get("diag"),
+                            attempt=_stream_attempt + 1,
+                            outcome="cancelled" if agent._interrupt_requested else "success",
+                        )
                     _emit_stream_end(
                         final_text=_stream_final_text(result["response"]),
                         finished=True,
@@ -4998,6 +5022,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     return  # success
                 except Exception as e:
+                    if agent.api_mode != "anthropic_messages":
+                        log_stream_attempt_timing(
+                            request_client_holder.get("diag"),
+                            attempt=_stream_attempt + 1,
+                            outcome="cancelled" if (agent._interrupt_requested or _request_cancelled["value"]
+                                                     or isinstance(e, InterruptedError)) else "error",
+                        )
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
                     # If the main poll loop force-closed this request because
@@ -5299,7 +5330,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = resolve_agent_provider_timeout(agent, get_provider_stale_timeout)
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
@@ -5313,7 +5344,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # unless the user explicitly set HERMES_STREAM_STALE_TIMEOUT; override the
     # local ceiling with HERMES_LOCAL_STREAM_STALE_TIMEOUT (documented in
     # website/docs/reference/environment-variables.md).
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
+    if _stream_stale_timeout_base == 180.0 and uses_local_inference_patience(agent):
         # Read config.yaml ``agent.local_stream_stale_timeout`` (default 900),
         # env var ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch.
         _local_default = 900.0

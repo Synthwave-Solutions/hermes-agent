@@ -122,25 +122,40 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
         if group:
             grants = _merge_grant(grants, group.grants, f"group:{group_name}", sources, permission_sources)
     role_ceiling = None
+    direct_grants_applied = False
     if user and (user.access_mode or user.access_level) and email not in policy.bootstrap_admins:
         level = user.access_level or "user"
-        # The assignable admin preset is powerful, but unlike bootstrap
-        # ownership remains subject to explicit per-user denies.
-        if level == "admin":
-            grants = grants.merge(_wildcard_grants())
-        if not user.access_mode:
-            grants = grants.merge(user.grants)
-        role_ceiling = _level_ceiling(grants, level)
-        grants = intersect_grants(user.grants, role_ceiling) if user.access_mode == "whitelist" else role_ceiling
-        sources.append(f"access_mode:{user.access_mode or 'legacy'}")
+        if user.access_mode == "blacklist":
+            # Blacklist is default-allow, not a role's implicit allowlist.
+            # Keep configured denies, exceptions, caps and explicit secret
+            # forwarding; the operational wildcard does not grant env vars.
+            grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
+            direct_grants_applied = True
+            grants = _merge_grant(grants, _wildcard_grants(), "access_mode:blacklist", sources, permission_sources)
+            # 14-09-2026 (Michael): a blacklist account carries exactly ONE
+            # file blacklist, its own. Role and group denied_globs are the
+            # generic secret rules written for whitelist colleagues; merged
+            # into a default-allow account they closed ~/.hermes, every .env
+            # and every key file the person was otherwise allowed to reach.
+            grants = replace(grants, file_denied_globs=frozenset(user.grants.file_denied_globs))
+        else:
+            # Whitelist and level-only legacy entries retain their configured
+            # resource ceiling. Bootstrap ownership is handled separately.
+            if level == "admin":
+                grants = grants.merge(_wildcard_grants())
+            if not user.access_mode:
+                grants = grants.merge(user.grants)
+            role_ceiling = _level_ceiling(grants, level)
+            grants = intersect_grants(user.grants, role_ceiling) if user.access_mode == "whitelist" else role_ceiling
+            sources.append(f"access_mode:{user.access_mode or 'legacy'}")
         roles.difference_update({"owner", "admin"})
     if user:
-        if role_ceiling is None:
+        if role_ceiling is None and not direct_grants_applied:
             grants = _merge_grant(grants, user.grants, f"user:{email}", sources, permission_sources)
-        else:
+        elif not direct_grants_applied:
             sources.append(f"user:{email}")
         # Approval selectors restrict existing command access; unlike grants,
-        # they must survive blacklist mode's role-only resource envelope.
+        # they must survive every access mode.
         grants = replace(grants, cli_approval_commands=grants.cli_approval_commands | user.grants.cli_approval_commands)
     if user and not user.deny.is_empty() and email not in policy.bootstrap_admins:
         # Per-user off-toggles subtract AFTER the full union so they win from
@@ -151,7 +166,7 @@ def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubjec
         for permission in user.deny.permissions:
             permission_sources.pop(permission, None)
 
-    if role_ceiling is not None and user.access_level == "admin" and grant_matches(grants.permissions, "governance:write") and not grant_matches(user.deny.permissions, "governance:write"):
+    if user and (role_ceiling is not None or user.access_mode == "blacklist") and user.access_level == "admin" and grant_matches(grants.permissions, "governance:write") and not grant_matches(user.deny.permissions, "governance:write"):
         roles.add("admin")
     return EffectiveAccess(
         subject=subject,

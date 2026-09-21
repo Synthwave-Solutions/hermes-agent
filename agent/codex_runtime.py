@@ -1009,6 +1009,57 @@ def _event_field(event: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+class _TerminalBoundedCodexStream:
+    """Let Relay finish at the Responses terminal frame without another read.
+
+    The HTTP connection can linger after response.completed/failed/incomplete.
+    Relay still needs to exhaust its provider iterator to run its finalizer;
+    expose EOF there without waiting for an already-finished network response.
+    Explicit close remains responsible for the underlying SDK resource, also
+    when interruption abandons this iterator before its first event.
+    """
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self._iterator = iter(stream)
+        self._terminal_seen = False
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed or self._terminal_seen:
+            raise StopIteration
+        event = next(self._iterator)
+        event_type = _event_field(event, "type", "")
+        self._terminal_seen = isinstance(event_type, str) and event_type in _TERMINAL_EVENT_TYPES
+        return event
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        close_error = None
+        closed_ids = set()
+        # Compatibility streams can be iterables that own a distinct generator.
+        # Close both layers, including the SDK resource if generator cleanup
+        # raises; Relay otherwise cannot reach the hidden iterator on cancel.
+        for resource in (self._iterator, self._stream):
+            if id(resource) in closed_ids:
+                continue
+            closed_ids.add(id(resource))
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+        if close_error is not None:
+            raise close_error
+
+
 def _item_field(item: Any, name: str, default: Any = None) -> Any:
     """Field access for nested Response items (attr-style SDK object or dict)."""
     value = getattr(item, name, None)
@@ -1335,6 +1386,10 @@ def _consume_codex_event_stream(
 
         if event_type in _TERMINAL_EVENT_TYPES:
             saw_terminal = True
+            # The terminal frame is authoritative. An omitted or stale nested
+            # response.status must not leave the optimistic EOF-recovery
+            # default (completed) on a failed/incomplete stream.
+            terminal_status = event_type.removeprefix("response.")
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
                 terminal_usage = getattr(resp_obj, "usage", None)
@@ -1344,11 +1399,6 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
-                rstatus = getattr(resp_obj, "status", None)
-                if rstatus is None and isinstance(resp_obj, dict):
-                    rstatus = resp_obj.get("status")
-                if isinstance(rstatus, str):
-                    terminal_status = rstatus
                 if event_type == "response.incomplete":
                     terminal_incomplete_details = getattr(resp_obj, "incomplete_details", None)
                     if terminal_incomplete_details is None and isinstance(resp_obj, dict):
@@ -1359,11 +1409,6 @@ def _consume_codex_event_stream(
                         terminal_error = resp_obj.get("error")
             if event_type == "response.completed":
                 saw_response_completed = True
-                terminal_status = terminal_status or "completed"
-            elif event_type == "response.incomplete":
-                terminal_status = terminal_status or "incomplete"
-            elif event_type == "response.failed":
-                terminal_status = terminal_status or "failed"
             # Stop on terminal event.
             break
 
@@ -1635,7 +1680,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            raw_stream = active_client.responses.create(**stream_kwargs)
+            # Compatible providers can return a completed object despite
+            # stream=True. Keep Relay's existing completed-response path.
+            if hasattr(raw_stream, "output") and not hasattr(raw_stream, "__iter__"):
+                return raw_stream
+            return _TerminalBoundedCodexStream(raw_stream)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt

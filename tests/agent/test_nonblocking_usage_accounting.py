@@ -20,7 +20,7 @@ def test_cold_custom_accounting_does_not_request_metadata(monkeypatch):
 def test_cached_endpoint_metadata_stays_available_without_network(monkeypatch):
     url = "http://127.0.0.1:20128/v1"
     payload = {"codex/gpt-6-astra": {"id": "codex/gpt-6-astra", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}}
-    key = metadata._normalize_base_url(url)
+    key = metadata._endpoint_metadata_cache_key(url)
     monkeypatch.setattr(metadata, "_endpoint_model_metadata_cache", {key: payload})
     monkeypatch.setattr(metadata, "_endpoint_model_metadata_cache_time", {key: time.time()})
     assert metadata.fetch_endpoint_model_metadata(url, cached_only=True) == payload
@@ -31,7 +31,7 @@ def test_cached_endpoint_metadata_stays_available_without_network(monkeypatch):
 
 def test_expired_endpoint_cache_is_unknown_without_refresh(monkeypatch):
     url = "http://127.0.0.1:20128/v1"
-    key = metadata._normalize_base_url(url)
+    key = metadata._endpoint_metadata_cache_key(url)
     monkeypatch.setattr(metadata, "_endpoint_model_metadata_cache", {key: {"old": {}}})
     monkeypatch.setattr(metadata, "_endpoint_model_metadata_cache_time", {key: 0})
     assert metadata.fetch_endpoint_model_metadata(url, cached_only=True) == {}
