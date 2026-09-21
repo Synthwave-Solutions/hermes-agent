@@ -1121,6 +1121,27 @@ class TestOwnSessionAttachmentsAreReadable:
         assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
         assert not tool_arguments_allowed_for_context(theirs, "read_file", {"path": str(self.paste)}).allowed
 
+    def test_a_workspace_root_that_swallows_the_state_dir_does_not_hide_the_inbox(self, tmp_path):
+        """20-09-2026 (Yaser: "mn superagent workspace ligt eruit"): a stray
+        workspace registered at /home contained the attachment inbox, so the
+        live membership check refused every upload for everyone but that
+        entry's owner. The inbox is exempt from the candidate check; the
+        selected root and other sessions' inboxes stay governed."""
+        from dataclasses import replace
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        workspace = str(tmp_path / "clients" / "_synthwave")
+        members_only = lambda path: path == workspace  # noqa: E731
+        mine = replace(DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID),
+                       workspace_path=workspace, workspace_access_check=members_only)
+        assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
+        assert tool_arguments_allowed_for_context(mine, "search_files", {"path": str(self.inbox)}).allowed
+        other = tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.other)})
+        assert not other.allowed and other.reason == "workspace_access_revoked"
+        assert not tool_arguments_allowed_for_context(mine, "write_file", {"path": str(self.paste)}).allowed
+        revoked = replace(mine, workspace_access_check=lambda _: False)
+        assert tool_arguments_allowed_for_context(revoked, "read_file", {"path": str(self.paste)}).reason == "workspace_access_revoked"
+
 
 class TestBlacklistTerminalIsStructureAgnostic:
     """14-09-2026 (Michael: "mijn tech team kan helemaal niks met de super
