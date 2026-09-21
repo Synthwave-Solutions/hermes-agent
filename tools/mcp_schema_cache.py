@@ -36,6 +36,12 @@ def config_fingerprint(config: dict) -> str:
         "args": config.get("args") or [],
         "url": config.get("url"),
         "transport": config.get("transport"),
+        # These resolved connection inputs can change the account and visible
+        # tool schema even when the endpoint/command stays the same. Persist
+        # only their fingerprint, never credential values in the cache entry.
+        "headers": config.get("headers") or {},
+        "env": config.get("env") or {},
+        "auth": config.get("auth") or {},
         "tools_include": sorted(tools_filter.get("include") or []),
         "tools_exclude": sorted(tools_filter.get("exclude") or []),
     }

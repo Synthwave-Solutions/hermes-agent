@@ -156,9 +156,16 @@ def test_compound_command_cannot_override_hard_command_constraints(runtime, cons
         runtime.user["deny"] = {"cli": {"commands": ["touch"]}}
     else:
         runtime.role["cli"]["commands"] = ["touch", "printf"]
+        runtime.user["access_mode"] = "whitelist"
+        runtime.user["grants"] = deepcopy(runtime.role)
+        runtime.user["grants"]["cli"]["approval_commands"] = ["touch"]
     runtime.write()
     shown = respond_manually(runtime)
-    assert "cli_compound_command_not_allowed" in runtime.run(command)["error"]
+    # 14-09-2026: a blacklist account is no longer refused for shell structure;
+    # its explicit deny bites at the executable position instead, so the
+    # reason is the deny itself. A whitelist account keeps the strict parser.
+    expected = "cli_command_denied" if constraint == "deny" else "cli_compound_command_not_allowed"
+    assert expected in runtime.run(command)["error"]
     assert not shown and not runtime.dispatched and not runtime.effect.exists()
 
 
@@ -172,6 +179,9 @@ def test_deny_section_cannot_turn_off_required_review(runtime):
 
 def test_approval_selector_never_grants_missing_command_permission(runtime):
     runtime.role["cli"]["commands"] = ["printf"]
+    runtime.user["access_mode"] = "whitelist"
+    runtime.user["grants"] = deepcopy(runtime.role)
+    runtime.user["grants"]["cli"]["approval_commands"] = ["touch"]
     runtime.write()
     shown = respond_manually(runtime)
     assert "cli_command_not_allowed" in runtime.run()["error"]
@@ -193,14 +203,12 @@ def test_nonmatching_command_preserves_existing_approval_behavior(runtime, monke
     model_calls = []
     monkeypatch.setattr(review, "_ask_model", lambda *args: model_calls.append(args) or {
         "decision": "approve", "reason": "Public output allowed.", "confidence": 1})
-    if general_approval == "manual":
-        shown = respond_manually(runtime)
-    else:
-        shown = []
-        monkeypatch.setattr(approval, "request_governance_action_approval", lambda *args: pytest.fail("unmatched rule cannot require manual review"))
+    # 14-09-2026 (Michael): approval: {mode, prompt} governs the access-request
+    # queue, never ordinary tool calls. A non-matching command runs without a
+    # model roundtrip and without a human card, whatever the mode.
+    monkeypatch.setattr(approval, "request_governance_action_approval", lambda *args: pytest.fail("unmatched rule cannot require manual review"))
     assert runtime.run("printf public")["output"] == "public"
-    assert len(model_calls) == (1 if general_approval == "automatic" else 0)
-    assert len(shown) == (1 if general_approval == "manual" else 0)
+    assert len(model_calls) == 0
 
 
 @pytest.mark.parametrize("when", ["before", "during"])
@@ -258,7 +266,9 @@ def test_continuation_uses_current_review_mode_without_replaying_historical_manu
     from tools import approval
     monkeypatch.setattr(approval, "request_governance_action_approval", lambda *args: pytest.fail("only current review rules apply"))
     assert runtime.run(ctx=resumed)["exit_code"] == 0
-    assert runtime.effect.exists() and len(model_calls) == 1
+    # The historical mandatory rule is not replayed, and (14-09-2026) the
+    # current approval section reviews queue requests, not this call.
+    assert runtime.effect.exists() and len(model_calls) == 0
 
 
 @pytest.mark.parametrize("command,required", [

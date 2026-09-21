@@ -1012,3 +1012,224 @@ class TestDeliveryLeadActsForColleagues:
         from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
         assert dwd_identity_for(self._access(roles=("admin_delivery",))) is None
         assert dwd_identity_for(self._access(roles=("operator",))) == self.ME
+
+
+class TestOwnSessionAttachmentsAreReadable:
+    """14-09-2026: the WebUI writes uploads and large composer pastes to
+    <hermes home>/webui/attachments/<session>/, under the `**/.hermes/**`
+    secret boundary, so a governed user could not read the .md the WebUI had
+    just made from their own paste (Hrishikesh), and every paste raised an
+    access request. The inbox of the session a turn runs under is that
+    person's own message: readable without a grant. Every other session's
+    inbox, and anything a link or `..` inside it points at, stays governed."""
+
+    SID = "995b40e6ef40"
+    OTHER = "0123456789ab"
+    ME = "hrishikesh@synthwave.solutions"
+
+    @pytest.fixture(autouse=True)
+    def _inbox(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes" / "webui" / "attachments"
+        monkeypatch.setenv("HERMES_WEBUI_ATTACHMENT_DIR", str(root))
+        self.inbox = root / self.SID
+        self.inbox.mkdir(parents=True)
+        self.paste = self.inbox / "pasted-text-2026-09-14_05-23-49-141.md"
+        self.paste.write_text("gehaald uit google chat")
+        self.other = root / self.OTHER / "pasted-text-x.md"
+        self.other.parent.mkdir()
+        self.other.write_text("someone else's paste")
+        self.secret = tmp_path / ".hermes" / "gmail-dwd-sa.json"
+        self.secret.write_text("{}")
+
+    def _access(self, **extra):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset({"cat", "head"}),
+                file_read_roots=frozenset({"/home/synthwavehq/clients"}),
+                file_denied_globs=frozenset({"**/.hermes/**", "**/*-sa.json"}),
+            ),
+            **extra,
+        )
+
+    def _decide(self, tool, args, session_id=SID, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), tool, args, session_id=session_id)
+
+    def test_the_paste_of_the_running_session_is_readable(self):
+        d = self._decide("read_file", {"path": str(self.paste)})
+        assert d.allowed and d.reason == "session_attachment_allowed"
+
+    def test_searching_the_own_inbox_is_allowed(self):
+        assert self._decide("search_files", {"path": str(self.inbox)}).allowed
+
+    def test_the_terminal_may_read_it_too(self):
+        assert self._decide("terminal", {"command": f"head -50 {self.paste}"}).allowed
+
+    def test_another_sessions_inbox_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.other)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}).allowed
+
+    def test_without_a_session_nothing_changes(self):
+        d = self._decide("read_file", {"path": str(self.paste)}, session_id="")
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_a_malformed_session_id_opens_nothing(self):
+        assert not self._decide("read_file", {"path": str(self.paste)}, session_id="../..").allowed
+
+    def test_a_traversal_out_of_the_inbox_is_still_refused(self):
+        sneaky = self.inbox / ".." / ".." / "gmail-dwd-sa.json"
+        assert not self._decide("read_file", {"path": str(sneaky)}).allowed
+        assert not self._decide("terminal", {"command": f"cat {sneaky}"}).allowed
+
+    def test_a_symlink_inside_the_inbox_resolves_to_its_target(self):
+        link = self.inbox / "innocent.md"
+        link.symlink_to(self.secret)
+        assert not self._decide("read_file", {"path": str(link)}).allowed
+        assert not self._decide("terminal", {"command": f"cat {link}"}).allowed
+
+    def test_writing_into_the_inbox_is_not_widened(self):
+        d = self._decide("write_file", {"path": str(self.inbox / "note.md")})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_a_blacklist_user_gets_the_same_exception(self):
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email="iflair@synthwave.solutions"),
+            mode="enforce",
+            permissions=frozenset({"terminal:use"}),
+            access_mode="blacklist",
+            access_level="elevated",
+            grants=GrantSet(
+                cli_commands=frozenset({"*"}),
+                cli_workdir_roots=frozenset({"*"}),
+                file_read_roots=frozenset({"*"}),
+                file_denied_globs=frozenset({"**/.hermes/**", "**/*-sa.json"}),
+            ),
+        )
+        assert self._decide("read_file", {"path": str(self.paste)}, access=access).allowed
+        assert self._decide("terminal", {"command": f"cat {self.paste}"}, access=access).allowed
+        assert not self._decide("read_file", {"path": str(self.other)}, access=access).allowed
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}, access=access).allowed
+
+    def test_the_bound_context_carries_the_session(self):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        mine = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID)
+        theirs = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.OTHER)
+        assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
+        assert not tool_arguments_allowed_for_context(theirs, "read_file", {"path": str(self.paste)}).allowed
+
+
+class TestBlacklistTerminalIsStructureAgnostic:
+    """14-09-2026 (Michael: "mijn tech team kan helemaal niks met de super
+    agent zo"): a `for` loop, a brace group, backticks or an odd heredoc came
+    back as cli_compound_command_not_allowed / cli_shell_operator_not_allowed
+    for the blacklist accounts. Shell structure is never a reason to refuse
+    such an account; its explicit blacklist, the DWD identity binding and the
+    approval selectors still bite wherever they appear in the line. Whitelist
+    accounts keep the strict parser."""
+
+    ME = "iflair@synthwave.solutions"
+
+    def _access(self, *, mode="blacklist", approval=()):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            permissions=frozenset({"terminal:use"}),
+            access_mode=mode,
+            access_level="elevated",
+            grants=GrantSet(
+                cli_commands=frozenset({"*"}),
+                cli_workdir_roots=frozenset({"*"}),
+                cli_denied_commands=frozenset({"bunq", "bunq_cli.py", "*bunq*", "*productive*", "sudo", "su"}),
+                cli_approval_commands=frozenset(approval),
+                file_read_roots=frozenset({"*"}),
+                file_denied_globs=frozenset({"**/bunq*", "**/.config/bunq/**"}),
+            ),
+        )
+
+    def _decide(self, command, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), "terminal", {"command": command})
+
+    @pytest.mark.parametrize("command", [
+        'for p in /workspace/*peterson*; do [ -e "$p" ] && printf "%s\\n" "$p"; done',
+        "python3 - <<'PY'\nimport json\nprint(json.load(open('/workspace/makro/metro-state.json'))['cookies'][:1])\nPY\ncommand -v node",
+        "echo `date`",
+        "{ ls /workspace; pwd; }",
+        "( cd /workspace && npm test )",
+        "while read -r l; do echo \"$l\"; done < /workspace/list.txt",
+        "cat /workspace/x.json | jq '.a' > /tmp/out.txt 2>&1",
+        "if [ -d /workspace/x ]; then ls /workspace/x; fi",
+        "python3 -c \"print('it''s')\"",
+    ])
+    def test_shell_structure_never_refuses_a_blacklist_account(self, command):
+        d = self._decide(command)
+        assert d.allowed, (command, d.reason)
+
+    @pytest.mark.parametrize("command,reason", [
+        ("sudo ls", "cli_command_denied"),
+        ("for i in 1; do sudo ls; done", "cli_command_denied"),
+        ("cd /workspace && python3 ~/bunq-agentic/bunq_cli.py", "file_denied_glob"),
+        ("echo x | productive list", "cli_command_denied"),
+        ("bash <<'SH'\nbunq balance\nSH", "cli_command_denied"),
+        ("cat ~/.config/bunq/token.json", "file_denied_glob"),
+        ("echo `productive`", "cli_command_denied"),
+        ("bash -c \"bunq balance\"", "cli_command_denied"),
+        ("eval \"bunq list\"", "cli_command_denied"),
+        ("x=$(bunq balance); echo $x", "cli_command_denied"),
+        ("ls | xargs -n 1 productive", "cli_command_denied"),
+        ("sudo -u alice bunq balance", "cli_command_denied"),
+        (r"find . -name '*.py' -exec productive {} \;", "cli_command_denied"),
+        ("nohup productive sync &", "cli_command_denied"),
+    ])
+    def test_the_explicit_blacklist_still_bites_anywhere(self, command, reason):
+        d = self._decide(command)
+        assert not d.allowed and d.reason == reason, (command, d.reason, d.detail)
+
+    @pytest.mark.parametrize("command", [
+        'git commit -m "sync productive hours to sheet"',
+        "git commit -m 'remove bunq link from readme'",
+        "grep -rn productive src/",
+        "grep -rn sudo README.md",
+        "echo do not use sudo here",
+        "pip install trading212-api",
+        "PROJECT=productive-sync npm run build",
+        "npm run build -- --productive",
+        "grep -rn gmail src/",
+        "pip install gmail-api",
+        "cat notes.txt | grep -i su",
+    ])
+    def test_a_word_that_is_merely_mentioned_is_not_a_command(self, command):
+        d = self._decide(command)
+        assert d.allowed, (command, d.reason, d.detail)
+
+    @pytest.mark.parametrize("command,reason", [
+        ("gmail list", "dwd_identity_required"),
+        ("cd /workspace && gmail list", "dwd_identity_required"),
+        ("for i in 1; do gmail list; done", "dwd_identity_required"),
+        ("echo `gmail list`", "dwd_identity_required"),
+        ("timeout 30 gmail list", "dwd_identity_required"),
+        ("bash -c 'gmail list'", "dwd_identity_required"),
+        ("gmail --as michael@synthwave.solutions list", "dwd_identity_mismatch"),
+        ("HERMES_DWD_IDENTITY=x gmail --as iflair@synthwave.solutions list", "dwd_identity_tamper"),
+    ])
+    def test_the_identity_binding_survives_any_structure(self, command, reason):
+        d = self._decide(command)
+        assert not d.allowed and d.reason == reason, (command, d.reason)
+
+    def test_own_identity_passes_inside_a_loop(self):
+        assert self._decide("for i in 1; do gmail --as iflair@synthwave.solutions list; done").allowed
+
+    def test_a_whitelist_account_keeps_the_strict_parser(self):
+        d = self._decide("for i in 1; do ls; done", access=self._access(mode="whitelist"))
+        assert not d.allowed and d.reason == "cli_compound_command_not_allowed"
+
+    def test_approval_selectors_match_by_token_not_by_structure(self):
+        from hermes_cli.dashboard_governance.tool_policy import cli_command_requires_manual_approval
+        access = self._access(approval={"deploy-prod"})
+        assert cli_command_requires_manual_approval(access, "for e in a; do deploy-prod $e; done")
+        assert not cli_command_requires_manual_approval(access, "for e in a; do ls $e; done")

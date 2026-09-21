@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -150,6 +151,29 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_ENDPOINT_MODEL_CACHE_MAX_SIZE = 256
+_ENDPOINT_MODEL_FETCH_WAIT_SECONDS = 60.0
+_endpoint_model_metadata_lock = threading.Lock()
+
+
+class _EndpointMetadataFetch:
+    def __init__(self):
+        self.done = threading.Event()
+        self.result: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+_endpoint_model_metadata_inflight: Dict[str, _EndpointMetadataFetch] = {}
+
+
+def _endpoint_metadata_cache_key(base_url: str, api_key: str = "") -> str:
+    """Scope authenticated catalogs to the active profile without retaining keys."""
+    from hermes_constants import get_hermes_home
+
+    return hashlib.sha256(json.dumps([
+        str(get_hermes_home()), _normalize_base_url(base_url), api_key or "",
+    ]).encode("utf-8")).hexdigest()
+
+
 # Bounded-lifetime cache: after the first successful probe we remember the
 # server type so subsequent refreshes skip the full waterfall (no more 404
 # spam every 5 minutes on non-matching endpoints like /api/v1/models on vllm).
@@ -166,7 +190,48 @@ _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
 # Short TTL keeps a transient failure (server starting up, key being fixed)
 # recoverable within minutes instead of pinning "undetected" for an hour.
 _ENDPOINT_PROBE_FAILURE_TTL_SECONDS = 300.0
+_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS = 3.0
 _endpoint_probe_path_cache: Dict[str, tuple] = {}
+
+# An Ollama-only miss says nothing about the other server protocols. Keep it
+# separate from generic detection, memory-only, bounded and scoped to the
+# profile, normalized endpoint and credentials. Keys contain only a digest.
+_OLLAMA_PROBE_MISS_MAX_SIZE = 256
+_ollama_probe_misses: Dict[str, float] = {}
+_ollama_probe_miss_lock = threading.Lock()
+
+
+def _ollama_probe_miss_seen(key: str, *, record: bool = False) -> bool:
+    now = time.monotonic()
+    with _ollama_probe_miss_lock:
+        for stale_key, seen in list(_ollama_probe_misses.items()):
+            if now - seen >= _ENDPOINT_PROBE_FAILURE_TTL_SECONDS:
+                del _ollama_probe_misses[stale_key]
+        if record:
+            _ollama_probe_misses[key] = now
+            while len(_ollama_probe_misses) > _OLLAMA_PROBE_MISS_MAX_SIZE:
+                _ollama_probe_misses.pop(next(iter(_ollama_probe_misses)))
+        return key in _ollama_probe_misses
+
+
+# LM Studio-only detection must not suppress a later Ollama/full probe (or
+# borrow a failure from another profile or credential). No HTTP under this lock.
+_LMSTUDIO_PROBE_MISS_MAX_SIZE = 256
+_lmstudio_probe_misses: Dict[str, float] = {}
+_lmstudio_probe_miss_lock = threading.Lock()
+
+
+def _lmstudio_probe_miss_seen(key: str, *, record: bool = False) -> bool:
+    now = time.monotonic()
+    with _lmstudio_probe_miss_lock:
+        for stale_key, seen in list(_lmstudio_probe_misses.items()):
+            if now - seen >= _ENDPOINT_PROBE_FAILURE_TTL_SECONDS:
+                del _lmstudio_probe_misses[stale_key]
+        if record:
+            _lmstudio_probe_misses[key] = now
+            while len(_lmstudio_probe_misses) > _LMSTUDIO_PROBE_MISS_MAX_SIZE:
+                _lmstudio_probe_misses.pop(next(iter(_lmstudio_probe_misses)))
+        return key in _lmstudio_probe_misses
 
 # A configured endpoint that is routable-but-dead — e.g. a corp LAN address
 # while off-VPN — blackholes TCP: the SYN draws no SYN-ACK, no RST and no ICMP
@@ -708,6 +773,15 @@ def _normalize_base_url(base_url: str) -> str:
     return (base_url or "").strip().rstrip("/")
 
 
+def is_explicit_remote_router(provider: str, requested_provider: str = "") -> bool:
+    """Recognize an explicit router, without treating arbitrary loopback as one."""
+    current = str(provider or "").strip().lower()
+    requested = str(requested_provider or "").strip().lower()
+    if current in {"custom", "openai"} and requested == "custom:omniroute":
+        current = requested
+    return current == "custom:omniroute"
+
+
 def _auth_headers(api_key: str = "") -> Dict[str, str]:
     token = str(api_key or "").strip()
     if not token:
@@ -893,6 +967,7 @@ def _reconcile_local_cached_context_length(
     base_url: str,
     cached: int,
     api_key: str = "",
+    *, native_protocol_probes: bool = True,
 ) -> int:
     """Return *cached* unless a live local probe reports a different limit.
 
@@ -905,7 +980,13 @@ def _reconcile_local_cached_context_length(
     entries but are not persisted — startup should reject them, not bless a
     sub-64K window as config.
     """
-    live_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+    probe_options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    if not native_protocol_probes and cached > 0:
+        # The router's already-known window remains the existing fallback.
+        # Optional revalidation must not spend the cold-discovery read budget
+        # every time this otherwise-ready agent is constructed.
+        probe_options["cached_recheck"] = True
+    live_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
     if live_ctx and live_ctx > 0 and live_ctx != cached:
         if live_ctx < MINIMUM_CONTEXT_LENGTH:
             logger.info(
@@ -1007,7 +1088,10 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
-def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
+def detect_local_server_type(
+    base_url: str, api_key: str = "", *, ollama_only: bool = False,
+    lmstudio_only: bool = False,
+) -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
     Returns one of: "ollama", "lm-studio", "vllm", "llamacpp", or None.
@@ -1015,7 +1099,19 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     The result is cached for the lifetime of the process so that repeated
     calls (e.g. every 5-minute metadata refresh) never re-run the waterfall
     and never spray 404s at endpoints the server does not expose.
+
+    ``ollama_only`` reuses known server verdicts but probes only ``/api/tags``
+    on a cache miss. It is for the Ollama num_ctx safeguard during agent init:
+    a generic local API gateway need not pay every server's discovery timeout.
+    An Ollama-only miss never populates the generic negative cache; a separate
+    bounded, profile/endpoint/credential-scoped cache preserves warm startup.
+
+    ``lmstudio_only`` asks only whether native LM Studio loaded-context metadata
+    should precede a standard /models listing. Unrelated local protocols are
+    still detected by the full context fallback if that listing lacks metadata.
     """
+    if ollama_only and lmstudio_only:
+        raise ValueError("Only one targeted local server probe may be selected")
     import httpx
 
     normalized = _normalize_base_url(base_url)
@@ -1041,7 +1137,9 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
             if cached[0] is not None
             else _ENDPOINT_PROBE_FAILURE_TTL_SECONDS
         )
-        if (time.monotonic() - cached[1]) < ttl:
+        if (time.monotonic() - cached[1]) < ttl and not (
+            lmstudio_only and cached[0] is None
+        ):
             return cached[0]
 
     # The host already blackholed a connect: skip the waterfall below, each leg
@@ -1058,6 +1156,28 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
         _endpoint_probe_path_cache[server_url] = (disk_hit, time.monotonic())
         return disk_hit
 
+    # Newer positive generic/disk verdicts above take precedence over a prior
+    # targeted miss. Never share a failed authenticated probe across profiles
+    # or key rotation, and never retain or persist the credential itself.
+    ollama_miss_key = None
+    lmstudio_miss_key = None
+    if ollama_only:
+        from hermes_constants import get_hermes_home
+
+        ollama_miss_key = hashlib.sha256(json.dumps([
+            str(get_hermes_home()), server_url, api_key,
+        ]).encode("utf-8")).hexdigest()
+        if _ollama_probe_miss_seen(ollama_miss_key):
+            return None
+    elif lmstudio_only:
+        from hermes_constants import get_hermes_home
+
+        lmstudio_miss_key = hashlib.sha256(json.dumps([
+            "lm-studio", str(get_hermes_home()), server_url, api_key,
+        ]).encode("utf-8")).hexdigest()
+        if _lmstudio_probe_miss_seen(lmstudio_miss_key):
+            return None
+
     headers = _auth_headers(api_key)
 
     def _probe_failed(exc: Exception) -> None:
@@ -1073,55 +1193,113 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     result: Optional[str] = None
     try:
         with httpx.Client(timeout=2.0, headers=headers) as client:
-            # LM Studio exposes /api/v1/models — check first (most specific)
-            try:
-                r = client.get(f"{lmstudio_url}/api/v1/models")
-                if r.status_code == 200:
-                    result = "lm-studio"
-            except Exception as exc:
-                _probe_failed(exc)
-            if result is None:
-                # Ollama exposes /api/tags and responds with {"models": [...]}
-                # LM Studio returns {"error": "Unexpected endpoint"} with status 200
-                # on this path, so we must verify the response contains "models".
+            paths = {"ollama": "/api/tags", "llamacpp": "/v1/props", "vllm": "/version"}
+
+            def recognized(protocol, response):
+                if response.status_code != 200:
+                    return None
+                if protocol == "llamacpp":
+                    return protocol if "default_generation_settings" in response.text else None
+                field = "models" if protocol == "ollama" else "version"
+                return protocol if field in response.json() else None
+
+            def probe(protocol):
+                # Workers return observations only. Apply failure/blackhole
+                # state below in protocol priority order, never arrival order.
                 try:
-                    r = client.get(f"{server_url}/api/tags")
-                    if r.status_code == 200:
+                    r = client.get(server_url + paths[protocol])
+                    if protocol == "llamacpp" and r.status_code != 200:
+                        r = client.get(f"{server_url}/props")
+                    return recognized(protocol, r), None
+                except Exception as exc:
+                    return None, exc
+
+            incomplete = object()
+
+            async def speculate(protocols):
+                import asyncio
+                async with httpx.AsyncClient(timeout=2.0, headers=headers) as async_client:
+                    async def run(protocol):
+                        deadline = asyncio.timeout(_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS)
                         try:
-                            data = r.json()
-                            if "models" in data:
-                                result = "ollama"
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    _probe_failed(exc)
-            if result is None:
-                # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
+                            # HTTPX's read timeout alone permits indefinitely
+                            # trickling headers/bodies. Speculation must end;
+                            # an incomplete needed probe falls back to serial.
+                            async with deadline:
+                                r = await async_client.get(server_url + paths[protocol])
+                                if protocol == "llamacpp" and r.status_code != 200:
+                                    r = await async_client.get(f"{server_url}/props")
+                                return recognized(protocol, r), None
+                        except TimeoutError as exc:
+                            return None, incomplete if deadline.expired() else exc
+                        except Exception as exc:
+                            return None, exc
+
+                    tasks = [asyncio.create_task(run(protocol)) for protocol in protocols]
+                    outcomes = []
+                    try:
+                        for task in tasks:
+                            outcome = await task
+                            outcomes.append(outcome)
+                            result, error = outcome
+                            if result is not None or error is incomplete or (
+                                error is not None and _is_connect_timeout(error)
+                            ):
+                                break
+                        return outcomes
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
+            first_read_timeout = False
+            # LM Studio exposes /api/v1/models — check first (most specific)
+            if not ollama_only:
                 try:
-                    r = client.get(f"{server_url}/v1/props")
-                    if r.status_code != 200:
-                        r = client.get(f"{server_url}/props")  # fallback for older builds
-                    if r.status_code == 200 and "default_generation_settings" in r.text:
-                        result = "llamacpp"
-                except Exception as exc:
-                    _probe_failed(exc)
-            if result is None:
-                # vLLM: /version
-                try:
-                    r = client.get(f"{server_url}/version")
+                    r = client.get(f"{lmstudio_url}/api/v1/models")
                     if r.status_code == 200:
-                        data = r.json()
-                        if "version" in data:
-                            result = "vllm"
+                        result = "lm-studio"
                 except Exception as exc:
                     _probe_failed(exc)
+                    first_read_timeout = isinstance(exc, httpx.ReadTimeout)
+            if result is None and not lmstudio_only:
+                protocols = ("ollama",) if ollama_only else ("ollama", "llamacpp", "vllm")
+                if first_read_timeout and not ollama_only:
+                    # A slow non-native gateway can time out every optional
+                    # protocol endpoint. Overlap the remaining reads, keeping
+                    # the same request timeout/endpoints/result precedence.
+                    # One owned loop worker permits cancellation even when
+                    # called from an existing event loop; it is always joined.
+                    import asyncio
+                    import itertools
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-local-probe") as pool:
+                        outcomes = pool.submit(lambda: asyncio.run(speculate(protocols))).result()
+                    if outcomes and outcomes[-1][1] is incomplete:
+                        # Do not classify a large/slow native response as a
+                        # negative verdict just because speculation expired.
+                        outcomes = itertools.chain(outcomes[:-1], map(probe, protocols[len(outcomes) - 1:]))
+                else:
+                    # Responsive native endpoints and targeted probes retain
+                    # their original early exit without speculative requests.
+                    outcomes = map(probe, protocols)
+                for result, error in outcomes:
+                    if error is not None:
+                        _probe_failed(error)
+                    if result is not None:
+                        break
     except Exception:
         pass
 
     if result is not None:
         _endpoint_probe_path_cache[server_url] = (result, time.monotonic())
         _local_probe_disk_put("server_type", server_url, result)
-    else:
+    elif ollama_miss_key is not None:
+        _ollama_probe_miss_seen(ollama_miss_key, record=True)
+    elif lmstudio_miss_key is not None:
+        _lmstudio_probe_miss_seen(lmstudio_miss_key, record=True)
+    elif not (ollama_only or lmstudio_only):
         # Cache the negative verdict in memory only (never on disk — a
         # failure is often transient: server starting, key being fixed)
         # so the very next turn does not re-run the whole waterfall
@@ -1354,32 +1532,72 @@ def fetch_endpoint_model_metadata(
     force_refresh: bool = False,
     *,
     cached_only: bool = False,
+    native_protocol_probes: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from an OpenAI-compatible ``/models`` endpoint.
 
     ``cached_only`` returns only a fresh in-process snapshot, never a probe.
     This is used for explicit custom endpoints where hardcoded global model-name
-    defaults are unreliable. Results are cached in memory per base URL.
+    defaults are unreliable. Snapshots and concurrent requests are scoped to
+    the active profile, normalized base URL and credentials. No HTTP or waiting
+    occurs under the cache lock; cached-only accounting never joins a probe.
     """
     normalized = _normalize_base_url(base_url)
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
+    key = _endpoint_metadata_cache_key(normalized, api_key)
+    if not native_protocol_probes:
+        key += "|remote-router"
+    with _endpoint_model_metadata_lock:
+        if not force_refresh:
+            cached = _endpoint_model_metadata_cache.get(key)
+            cached_at = _endpoint_model_metadata_cache_time.get(key, 0)
+            if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
+                return cached
+        if cached_only:
+            return {}
+        # Do not cache a host's short-lived connect timeout as a full-TTL miss.
+        if _endpoint_blackholed(normalized):
+            return {}
+        flight = _endpoint_model_metadata_inflight.get(key)
+        leader = flight is None
+        if leader:
+            flight = _EndpointMetadataFetch()
+            _endpoint_model_metadata_inflight[key] = flight
+
+    if not leader:
+        # Optional metadata must not wait indefinitely on another worker's
+        # stuck socket. A timeout does not cancel or duplicate the leader.
+        if flight.done.wait(_ENDPOINT_MODEL_FETCH_WAIT_SECONDS):
+            return flight.result if flight.result is not None else {}
+        return {}
+
+    try:
+        options = {} if native_protocol_probes else {"native_protocol_probes": False}
+        result = _fetch_endpoint_model_metadata_uncached(normalized, api_key, **options)
+        with _endpoint_model_metadata_lock:
+            flight.result = result
+            _endpoint_model_metadata_cache[key] = result
+            _endpoint_model_metadata_cache_time[key] = time.time()
+            while len(_endpoint_model_metadata_cache) > _ENDPOINT_MODEL_CACHE_MAX_SIZE:
+                oldest = min(_endpoint_model_metadata_cache,
+                             key=lambda item: _endpoint_model_metadata_cache_time.get(item, 0))
+                del _endpoint_model_metadata_cache[oldest]
+                _endpoint_model_metadata_cache_time.pop(oldest, None)
+        return result
+    finally:
+        # Also release followers after cancellation/BaseException. They get an
+        # unknown snapshot, and a later call may retry; no failure is invented.
+        with _endpoint_model_metadata_lock:
+            _endpoint_model_metadata_inflight.pop(key, None)
+            flight.done.set()
+
+
+def _fetch_endpoint_model_metadata_uncached(
+    normalized: str, api_key: str, *, native_protocol_probes: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """Existing probe ladder; invoked once for each in-flight metadata scope."""
     _ensure_requests()
-
-    if not force_refresh:
-        cached = _endpoint_model_metadata_cache.get(normalized)
-        cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
-        if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
-            return cached
-
-    if cached_only:
-        return {}
-
-    # Blackholed endpoint: every candidate below would spend its full 5s
-    # connect budget. Returned empty rather than cached, so the endpoint is
-    # retried as soon as the blackhole entry expires.
-    if _endpoint_blackholed(normalized):
-        return {}
 
     candidates = [normalized]
     if normalized.endswith("/v1"):
@@ -1392,9 +1610,9 @@ def fetch_endpoint_model_metadata(
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_error: Optional[Exception] = None
 
-    if is_local_endpoint(normalized):
+    if native_protocol_probes and is_local_endpoint(normalized):
         try:
-            if detect_local_server_type(normalized, api_key=api_key) == "lm-studio":
+            if detect_local_server_type(normalized, api_key=api_key, lmstudio_only=True) == "lm-studio":
                 server_url = _lmstudio_server_root(normalized)
                 response = requests.get(
                     server_url.rstrip("/") + "/api/v1/models",
@@ -1438,8 +1656,6 @@ def fetch_endpoint_model_metadata(
                     if isinstance(alt_id, str) and alt_id and alt_id != model_id:
                         _add_model_aliases(cache, alt_id, entry)
 
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
                 return cache
         except Exception as exc:
             last_error = exc
@@ -1499,7 +1715,7 @@ def fetch_endpoint_model_metadata(
                 m.get("owned_by") == "llamacpp"
                 for m in payload.get("data", []) if isinstance(m, dict)
             )
-            if is_llamacpp:
+            if native_protocol_probes and is_llamacpp:
                 try:
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
                     base = request_candidate.rstrip("/").replace("/v1", "")
@@ -1517,8 +1733,6 @@ def fetch_endpoint_model_metadata(
                 except Exception:
                     pass
 
-            _endpoint_model_metadata_cache[normalized] = cache
-            _endpoint_model_metadata_cache_time[normalized] = time.time()
             return cache
         except Exception as exc:
             last_error = exc
@@ -1530,8 +1744,6 @@ def fetch_endpoint_model_metadata(
 
     if last_error:
         logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
-    _endpoint_model_metadata_cache[normalized] = {}
-    _endpoint_model_metadata_cache_time[normalized] = time.time()
     return {}
 
 
@@ -1539,9 +1751,11 @@ def _resolve_endpoint_context_length(
     model: str,
     base_url: str,
     api_key: str = "",
+    *, native_protocol_probes: bool = True,
 ) -> Optional[int]:
     """Resolve context length from an endpoint's live ``/models`` metadata."""
-    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+    options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key, **options)
     matched = endpoint_metadata.get(model)
     if not matched:
         if len(endpoint_metadata) == 1:
@@ -2001,7 +2215,9 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
         server_url = server_url[:-3]
 
     try:
-        server_type = detect_local_server_type(base_url, api_key=api_key)
+        server_type = detect_local_server_type(
+            base_url, api_key=api_key, ollama_only=True
+        )
     except Exception:
         return None
     if server_type != "ollama":
@@ -2281,7 +2497,7 @@ def _model_name_suggests_stale_32k_underreport(model: str) -> bool:
     return _model_name_suggests_kimi(model) or _model_name_suggests_minimax(model)
 
 
-def _query_local_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+def _query_local_context_length(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True, cached_recheck: bool = False) -> Optional[int]:
     """Query a local server for the model's context length (short-TTL cached).
 
     The live-probe paths added for local endpoints (reconcile-on-hit and the
@@ -2297,13 +2513,28 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     """
     import time as _time
 
+    options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    if cached_recheck and not native_protocol_probes:
+        options["cached_recheck"] = True
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))
+    if not native_protocol_probes:
+        # Runtime credential providers may be callables. Do not execute them
+        # for metadata or invent a stable identity for their changing tokens;
+        # preserve the existing probe/fallback behavior without memoization.
+        if api_key is not None and not isinstance(api_key, str):
+            return _query_local_context_length_uncached(
+                model, base_url, api_key=api_key, **options,
+            )
+        # A router can advertise different windows for different users. Do
+        # not let the short-lived probe result escape its profile/credential
+        # scope, even when two callers use the same loopback gateway URL.
+        cache_key += ("remote-router", _endpoint_metadata_cache_key(base_url, api_key))
     now = _time.monotonic()
     cached = _LOCAL_CTX_PROBE_CACHE.get(cache_key)
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
         return cached[0]
 
-    result = _query_local_context_length_uncached(model, base_url, api_key=api_key)
+    result = _query_local_context_length_uncached(model, base_url, api_key=api_key, **options)
     # Cache only positive results. A None/failure (server not up yet,
     # connection refused, timeout) must NOT be memoized — otherwise a probe
     # that fails during a startup race would suppress a legit retry seconds
@@ -2315,7 +2546,7 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     return result
 
 
-def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
+def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True, cached_recheck: bool = False) -> Optional[int]:
     """Query a local server for the model's context length."""
     import httpx
 
@@ -2333,14 +2564,15 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         return None
 
     headers = _auth_headers(api_key)
+    bounded_recheck = cached_recheck and not native_protocol_probes
 
     try:
-        server_type = detect_local_server_type(base_url, api_key=api_key)
+        server_type = detect_local_server_type(base_url, api_key=api_key) if native_protocol_probes else None
     except Exception:
         server_type = None
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(timeout=0.5 if bounded_recheck else 3.0, headers=headers) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
                 resp = client.post(f"{server_url}/api/show", json={"name": model})
@@ -2387,24 +2619,27 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                                     return int(ctx)
                             break
 
-            # LM Studio / vLLM / llama.cpp / Anthropic-compat proxies:
-            # try /v1/models/{model}
-            resp = client.get(f"{server_url}/v1/models/{model}")
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    # Context-WINDOW keys only (canonical _CONTEXT_LENGTH_KEYS
-                    # vocabulary). `max_tokens` is the max *output* tokens on
-                    # OpenAI-compatible passthroughs (LiteLLM, Anthropic-compat
-                    # shims, cloud proxies) — e.g. 393216 for a 1M-context
-                    # model — so reading it ahead of real window keys collapses
-                    # the window to the output cap and poisons the context
-                    # cache. It is consulted only as an explicit last resort
-                    # inside _context_length_from_model_payload, for servers
-                    # that report nothing else.
-                    ctx = _context_length_from_model_payload(data)
-                    if ctx is not None:
-                        return ctx
+            # Native servers may expose a more precise per-model runtime
+            # window. Explicit OmniRoute routes expose the standard catalog,
+            # not this detail route; probing it spends the read deadline and
+            # can prevent the authoritative catalog fallback below entirely.
+            if native_protocol_probes:
+                resp = client.get(f"{server_url}/v1/models/{model}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        # Context-WINDOW keys only (canonical _CONTEXT_LENGTH_KEYS
+                        # vocabulary). `max_tokens` is the max *output* tokens on
+                        # OpenAI-compatible passthroughs (LiteLLM, Anthropic-compat
+                        # shims, cloud proxies) — e.g. 393216 for a 1M-context
+                        # model — so reading it ahead of real window keys collapses
+                        # the window to the output cap and poisons the context
+                        # cache. It is consulted only as an explicit last resort
+                        # inside _context_length_from_model_payload, for servers
+                        # that report nothing else.
+                        ctx = _context_length_from_model_payload(data)
+                        if ctx is not None:
+                            return ctx
 
             # Try /v1/models and find the model in the list.
             # Use _model_id_matches to handle "publisher/slug" vs bare "slug".
@@ -2449,7 +2684,9 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
                         if ctx is not None:
                             return ctx
     except Exception as exc:
-        if _is_connect_timeout(exc):
+        # A short optional check cannot mark the endpoint unavailable for a
+        # subsequent cold lookup with the normal connection/read budget.
+        if _is_connect_timeout(exc) and not bounded_recheck:
             _note_endpoint_blackholed(server_url)
 
     return None
@@ -2954,6 +3191,7 @@ def get_model_context_length(
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,
+    *, requested_provider: str = "",
 ) -> int:
     """Get the context length for a model.
 
@@ -3053,6 +3291,9 @@ def get_model_context_length(
                 return cp_ctx
         except Exception:
             pass  # fall through to probing
+
+    native_protocol_probes = not is_explicit_remote_router(provider, requested_provider)
+    probe_options = {} if native_protocol_probes else {"native_protocol_probes": False}
 
     # Malformed user-provided URLs (for example an unmatched IPv6 bracket)
     # make urllib.parse raise. Context resolution should treat those as an
@@ -3178,7 +3419,7 @@ def get_model_context_length(
             else:
                 if is_local_endpoint(base_url):
                     return _reconcile_local_cached_context_length(
-                        model, base_url, cached, api_key=api_key,
+                        model, base_url, cached, api_key=api_key, **probe_options,
                     )
                 return cached
 
@@ -3243,7 +3484,7 @@ def get_model_context_length(
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key, **probe_options)
         if context_length is not None:
             return context_length
         if not _is_known_provider_base_url(base_url):
@@ -3254,7 +3495,7 @@ def get_model_context_length(
             # would create a false-safe window for compression (#63122).
             # Non-local endpoints preserve the existing GGUF-first behavior.
             if is_local_endpoint(base_url):
-                local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+                local_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
                 if local_ctx and local_ctx > 0:
                     if not _skip_persistent_context_cache(base_url, provider):
                         _maybe_cache_local_context_length(model, base_url, local_ctx)
@@ -3262,7 +3503,7 @@ def get_model_context_length(
             # 2b. Ollama native /api/show — non-local endpoints preserve
             # the existing generic /api/show GGUF-first behavior.
             # Non-Ollama servers return 404/405 quickly.
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            ctx = _query_ollama_api_show(model, base_url, api_key=api_key) if native_protocol_probes else None
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):
                     save_context_length(model, base_url, ctx)
@@ -3365,7 +3606,7 @@ def get_model_context_length(
     if effective_provider == "gmi" and base_url:
         # GMI exposes authoritative context_length via /models, but it is not
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
-        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key, **probe_options)
         if ctx is not None:
             return ctx
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
@@ -3386,7 +3627,7 @@ def get_model_context_length(
             and "ollama" not in _inferred_for_probe
         )
         if not _skip_ollama_probe:
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            ctx = _query_ollama_api_show(model, base_url, api_key=api_key) if native_protocol_probes else None
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):
                     save_context_length(model, base_url, ctx)
@@ -3453,7 +3694,7 @@ def get_model_context_length(
     # ``Hermes-3-Llama-3.1-70B`` substring-match ``llama`` (131072) even when
     # vLLM is running at a lower ``--max-model-len`` (e.g. 32768 on limited VRAM).
     if base_url and is_local_endpoint(base_url):
-        local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+        local_ctx = _query_local_context_length(model, base_url, api_key=api_key, **probe_options)
         if local_ctx and local_ctx > 0:
             if not _skip_persistent_context_cache(base_url, provider):
                 _maybe_cache_local_context_length(model, base_url, local_ctx)

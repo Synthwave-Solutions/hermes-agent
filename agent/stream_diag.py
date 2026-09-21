@@ -14,11 +14,19 @@ tests that patch ``run_agent.<helper>`` keep working.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_timing_clock = time.perf_counter
+_TIMING_MARKS = (
+    "sdk_dispatch", "response_headers", "first_chunk",
+    "first_reasoning_chunk", "first_text_dispatch",
+)
 
 
 # Per-attempt stream diagnostic headers.  Lowercased; httpx returns
@@ -53,6 +61,76 @@ def stream_diag_init() -> Dict[str, Any]:
         "headers": {},
         "http_status": None,
     }
+
+
+def stream_diag_start_timing(agent: Any, diag: dict) -> None:
+    """Bind one attempt before dispatch; a later turn cannot relabel it."""
+    try:
+        def identity(value):
+            if isinstance(value, str) and value:
+                return hashlib.sha256(value.encode()).hexdigest()[:16]
+            return None
+
+        diag.update({
+            "_timing_started": _timing_clock(), "_timing_offsets": {},
+            "sdk_requests": 0,
+            "_timing_session": identity(getattr(agent, "session_id", None)),
+            "_timing_request": identity(getattr(agent, "_current_api_request_id", None)),
+            "_timing_call_count": getattr(agent, "_api_call_count", None),
+        })
+    except Exception:
+        pass
+
+
+def stream_diag_mark_timing(diag: dict, mark: str) -> None:
+    """Record only a fixed, content-free boundary; never affect delivery."""
+    try:
+        if mark not in _TIMING_MARKS:
+            return
+        if mark == "sdk_dispatch":
+            diag["sdk_requests"] += 1
+        diag["_timing_offsets"].setdefault(
+            mark, max(0.0, (_timing_clock() - diag["_timing_started"]) * 1000)
+        )
+    except Exception:
+        pass
+
+
+def log_stream_attempt_timing(diag: dict, *, attempt: int, outcome: str) -> None:
+    """Persist successful main-chat stream boundaries as well as failures.
+
+    No headers, addresses, model names, prompts, arguments or error strings.
+    These are SDK/delivery boundaries, not browser paint or upstream inference
+    timings. A missing observation remains null, including headerless adapters.
+    """
+    try:
+        if not isinstance(diag, dict) or "_timing_started" not in diag or diag.get("_timing_logged"):
+            return
+        if outcome not in {"success", "error", "cancelled"}:
+            return
+
+        def number(value):
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                return round(value, 3)
+            return None
+
+        marks = diag.get("_timing_offsets", {})
+        row = {
+            "session_hash": diag.get("_timing_session"),
+            "api_request_hash": diag.get("_timing_request"),
+            "api_call_count": number(diag.get("_timing_call_count")),
+            "stream_attempt": number(attempt),
+            "outcome": outcome,
+            "sdk_requests": number(diag.get("sdk_requests")),
+            "chunks": number(diag.get("chunks")),
+            "http_status": number(diag.get("http_status")),
+            "end_ms": number((_timing_clock() - diag["_timing_started"]) * 1000),
+            **{mark + "_ms": number(marks.get(mark)) for mark in _TIMING_MARKS},
+        }
+        diag["_timing_logged"] = True
+        logger.info("stream_attempt_timing %s", json.dumps(row, separators=(",", ":")))
+    except Exception:
+        pass
 
 
 def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response: Any) -> None:

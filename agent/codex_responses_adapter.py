@@ -1536,6 +1536,15 @@ def _normalize_codex_response(
     else:
         response_status = None
 
+    # A failed/cancelled response commonly has no output at all. Preserve its
+    # provider cause before validating the successful-response payload; the
+    # generic no-output error otherwise hides quota/context/entitlement failures
+    # from the caller's classifier and recovery policy.
+    if response_status in {"failed", "cancelled"}:
+        error_obj = getattr(response, "error", None)
+        error_msg = _format_responses_error(error_obj, response_status)
+        raise RuntimeError(error_msg)
+
     incomplete_details = getattr(response, "incomplete_details", None)
     incomplete_reason = ""
     if isinstance(incomplete_details, dict):
@@ -1573,11 +1582,6 @@ def _normalize_codex_response(
             response.output = output
         else:
             raise RuntimeError("Responses API returned no output items")
-
-    if response_status in {"failed", "cancelled"}:
-        error_obj = getattr(response, "error", None)
-        error_msg = _format_responses_error(error_obj, response_status)
-        raise RuntimeError(error_msg)
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []

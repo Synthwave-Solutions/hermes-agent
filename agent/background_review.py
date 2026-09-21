@@ -19,16 +19,50 @@ for invariants and PR review criteria.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+
+def trace_background_review(agent: Any, event: str, *, review_run=None, **fields) -> None:
+    """Best-effort local diagnostics; never log content or affect a review."""
+    try:
+        if event not in {"gate", "skipped", "scheduled", "started", "request_started",
+                         "completed", "failed", "cancelled", "cancel_requested"}:
+            return
+        session = getattr(agent, "session_id", None)
+        if not isinstance(session, str) or not 1 <= len(session) <= 200:
+            return
+        record = {"event": event, "session": hashlib.sha256(session.encode()).hexdigest(),
+                  "background": getattr(agent, "_memory_write_origin", None) == "background_review"}
+        review_id = getattr(review_run, "trace_id", None)
+        if isinstance(review_id, str) and len(review_id) == 32 and all(c in "0123456789abcdef" for c in review_id):
+            record["review"] = review_id
+        for name, value in fields.items():
+            if name in {"skill_available", "eligible", "review_skills", "review_memory", "skip_background_review",
+                        "final_response_present", "interrupted"}:
+                if type(value) is bool:
+                    record[name] = value
+            elif name in {"skill_counter", "skill_interval"}:
+                if type(value) is int:
+                    record[name] = max(-1, min(value, 1_000_000))
+            elif name == "reason" and value in {"disabled", "delegated", "reservation_unavailable",
+                    "startup_exception", "provider_cannot_use_tools", "before_start", "live_turn"}:
+                record[name] = value
+            elif name == "result" and value in {"none", "memory", "skill", "skill+memory"}:
+                record[name] = value
+        logger.info("Background review trace: %s", json.dumps(record, sort_keys=True))
+    except Exception:
+        pass  # Observability must not change a gate, request or cleanup outcome.
 
 
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
@@ -44,6 +78,10 @@ class _BackgroundReviewRun:
         self._review_agent = None
         self._request_finished = False
         self._cancel_dispatched = False
+        try:
+            self.trace_id = uuid.uuid4().hex
+        except Exception:
+            self.trace_id = None
 
     def begin_request(self, review_agent: Any) -> bool:
         """Atomically admit the first provider-capable review phase."""
@@ -173,6 +211,7 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
         return
 
     review_agent = run.cancel()
+    trace_background_review(agent, "cancel_requested", review_run=run, reason="live_turn")
     if review_agent is not None:
         _interrupt_background_review(review_agent)
 
@@ -318,6 +357,19 @@ def is_background_review_enabled(
 
 
 
+def _review_requested_provider(provider: str, requested: Optional[str]) -> str:
+    """Keep a named custom route only on its current compatible transport.
+
+    A fallback to another provider must not inherit the old router label. The
+    runtime's current identity (parent or explicit auxiliary) is authoritative.
+    """
+    if provider in {"custom", "openai"} and isinstance(requested, str):
+        requested = requested.strip().lower()
+        if requested.startswith("custom:"):
+            return requested
+    return provider
+
+
 def _resolve_review_runtime(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -336,6 +388,9 @@ def _resolve_review_runtime(
         parent_api_mode = "codex_responses"
     parent = {
         "provider": agent.provider,
+        "requested_provider": _review_requested_provider(
+            agent.provider, getattr(agent, "requested_provider", None)
+        ),
         "model": agent.model,
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
@@ -366,6 +421,10 @@ def _resolve_review_runtime(
         )
         return {
             "provider": rp.get("provider") or task_provider,
+            "requested_provider": _review_requested_provider(
+                rp.get("provider") or task_provider,
+                rp.get("requested_provider") or task_provider,
+            ),
             "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
@@ -1223,6 +1282,7 @@ def build_cache_parity_fork(
         quiet_mode=True,
         platform=agent.platform,
         provider=_rt.get("provider") or agent.provider,
+        requested_provider=_rt.get("requested_provider"),
         api_mode=_rt.get("api_mode"),
         base_url=_rt.get("base_url") or None,
         api_key=_rt.get("api_key") or None,
@@ -1411,8 +1471,10 @@ def _run_review_in_thread(
     the review aborts without entering ``run_conversation()`` (#84423).
     """
     if review_run is not None and review_run.cancel_requested.is_set():
+        trace_background_review(agent, "cancelled", review_run=review_run, reason="before_start")
         finish_background_review_run(agent, review_run)
         return
+    trace_background_review(agent, "started", review_run=review_run)
 
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
@@ -1444,6 +1506,7 @@ def _run_review_in_thread(
     if not _parent_can_emit_tool_calls(agent) and not bool(
         _resolve_review_runtime(agent, task_cfg).get("routed")
     ):
+        trace_background_review(agent, "skipped", review_run=review_run, reason="provider_cannot_use_tools")
         logger.warning(
             "Background review skipped: provider %r cannot emit Hermes tool calls, "
             "so the review fork could not write memories or skills. Set "
@@ -1460,6 +1523,9 @@ def _run_review_in_thread(
     review_agent = None
     review_messages: List[Dict] = []
     review_usage: Dict[str, Any] = {}
+    actions: List[str] = []
+    review_result = None
+    trace_outcome = "failed"
 
     def _unregister_review_agent(agent_ref) -> None:
         """Idempotent: clears the review fork from both tracking slots.
@@ -1617,6 +1683,10 @@ def _run_review_in_thread(
                     review_run is None or review_run.begin_request(review_agent)
                 )
                 if request_admitted:
+                    trace_background_review(
+                        agent, "request_started", review_run=review_run,
+                        skill_available="skill_manage" in (getattr(review_agent, "valid_tool_names", ()) or ()),
+                    )
                     # Routed to a different model -> replay a digest (cache is cold
                     # on that model anyway, so minimise cold-written tokens). Same
                     # model -> replay the full snapshot (warm cache reads).
@@ -1624,7 +1694,7 @@ def _run_review_in_thread(
                         _digest_history(messages_snapshot) if _routed
                         else messages_snapshot
                     )
-                    review_agent.run_conversation(
+                    review_result = review_agent.run_conversation(
                         user_message=(
                             prompt
                             + "\n\nYou can only call memory and skill "
@@ -1655,10 +1725,26 @@ def _run_review_in_thread(
                 # returned or startup cancellation has fenced it out.
                 _finish_request_phase(review_agent)
 
-            # Snapshot review actions before teardown. close() is allowed to
-            # clean per-session state, but the user-visible self-improvement
-            # summary still needs the completed review agent's tool results.
-            review_messages = list(getattr(review_agent, "_session_messages", []))
+                # A review may complete real writes before a later provider
+                # step raises or is cancelled. Observe those results exactly
+                # once on every request exit, before close() can clear them.
+                # Keep request completion published first so this optional
+                # observation cannot delay a waiting foreground turn.
+                try:
+                    review_messages = list(getattr(review_agent, "_session_messages", []))
+                    actions = summarize_background_review_actions(
+                        review_messages,
+                        messages_snapshot,
+                        notification_mode=getattr(agent, "memory_notifications", "on"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "summarize_background_review_actions returned partial results "
+                        "after exception (treating as empty); suppressing AttributeError "
+                        "that previously aborted the entire review (#59437): %s",
+                        e,
+                    )
+                    actions = []
 
             # Tear down memory providers while stdout is still
             # redirected so background thread teardown (Honcho flush,
@@ -1674,39 +1760,20 @@ def _run_review_in_thread(
                 pass
             review_agent = None
 
-        # Scan the review agent's messages for successful tool actions
-        # and surface a compact summary to the user. Tool messages
-        # already present in messages_snapshot must be skipped, since
-        # the review agent inherits that history and would otherwise
-        # re-surface stale "created"/"updated" messages from the prior
-        # conversation as if they just happened (issue #14944).
-        #
-        # Wrapped in try/except: a buggy/legacy tool response shape
-        # (e.g. ``_change`` returned as a list instead of a dict, #59437)
-        # must NOT take down the whole review with an AttributeError,
-        # since the caller's outer except logs only "Background
-        # memory/skill review failed" and discards every successful
-        # action the fork DID complete before the crash. Coerce an
-        # exception into an empty actions list so the partial valid
-        # actions from earlier in the messages are returned instead.
-        try:
-            actions = summarize_background_review_actions(
-                review_messages,
-                messages_snapshot,
-                notification_mode=getattr(agent, "memory_notifications", "on"),
-            )
-        except Exception as e:
-            logger.warning(
-                "summarize_background_review_actions returned partial results "
-                "after exception (treating as empty); suppressing AttributeError "
-                "that previously aborted the entire review (#59437): %s",
-                e,
-            )
-            actions = []
-
+        # The request-exit observer already excluded inherited tool results.
+        # Keep normal completion logging and callbacks on the success path;
+        # partial failure remains an error, even when some writes succeeded.
         _log_review_completion(
             review_usage, _classify_review_result(actions)
         )
+        if (not request_admitted
+                or (review_run is not None and review_run.cancel_requested.is_set())
+                or (isinstance(review_result, dict) and review_result.get("interrupted"))):
+            trace_outcome = "cancelled"
+        elif isinstance(review_result, dict) and (review_result.get("failed") or review_result.get("error")):
+            trace_outcome = "failed"
+        else:
+            trace_outcome = "completed"
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
@@ -1723,11 +1790,17 @@ def _run_review_in_thread(
                     pass
 
     except Exception as e:
+        trace_outcome = "cancelled" if review_run is not None and review_run.cancel_requested.is_set() else "failed"
         logger.warning("Background memory/skill review failed: %s", e)
         if review_usage:
             _log_review_completion(review_usage, "error")
         agent._emit_auxiliary_failure("background review", e)
     finally:
+        try:
+            trace_background_review(agent, trace_outcome, review_run=review_run,
+                                    result=_classify_review_result(actions))
+        except Exception:
+            pass  # Diagnostics must never interrupt the existing cleanup below.
         # Safety-net cleanup for the exception path.  Normal completion already
         # shut down inside the thread-scoped silence above.  Re-enter the
         # thread-scoped silence here so teardown output (Honcho flush, Hindsight
@@ -1806,13 +1879,19 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(
-            agent,
-            messages_snapshot,
-            prompt,
-            task_cfg=task_cfg,
-            review_run=review_run,
-        )
+        try:
+            _run_review_in_thread(
+                agent,
+                messages_snapshot,
+                prompt,
+                task_cfg=task_cfg,
+                review_run=review_run,
+            )
+        except Exception:
+            # Covers startup imports/capability checks before the native worker's
+            # existing request try/finally. Preserve its original exception.
+            trace_background_review(agent, "failed", review_run=review_run, reason="startup_exception")
+            raise
 
     return _target, prompt
 

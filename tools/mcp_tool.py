@@ -3470,13 +3470,20 @@ class MCPServerTask:
             client_kwargs["cert"] = client_cert
 
         probe_headers = dict(headers) if headers else {}
+        # httpx timeouts apply to individual I/O phases, not the combined
+        # HEAD -> GET -> POST probe. Share one budget across the client
+        # lifetime so this optional diagnosis cannot stack those waits.
+        deadline = asyncio.timeout(timeout)
         try:
-            async with _httpx.AsyncClient(**client_kwargs) as client:
+            async with deadline, _httpx.AsyncClient(**client_kwargs) as client:
                 # HEAD is cheapest; fall back to GET if the server doesn't
                 # implement it (405 Method Not Allowed / 501 Not Implemented).
                 resp = await client.head(url, headers=probe_headers)
                 if resp.status_code in (405, 501):
-                    resp = await client.get(url, headers=probe_headers)
+                    # Diagnose only headers: an MCP GET may be a valid SSE
+                    # stream that intentionally never finishes its body.
+                    async with client.stream("GET", url, headers=probe_headers) as resp:
+                        pass
 
                 # Some MCP servers (e.g. DocuSeal) serve their web UI on
                 # HEAD/GET but speak Streamable HTTP only via POST.  Before
@@ -3493,8 +3500,8 @@ class MCPServerTask:
                     and ct not in self._MCP_CONTENT_TYPES
                     and 200 <= resp.status_code < 300
                 ):
-                    post_resp = await client.post(
-                        url,
+                    async with client.stream(
+                        "POST", url,
                         headers={
                             **probe_headers,
                             "Content-Type": "application/json",
@@ -3508,7 +3515,10 @@ class MCPServerTask:
                             '"clientInfo":{"name":"hermes-probe",'
                             '"version":"0.1"}}}'
                         ),
-                    )
+                    ) as post_resp:
+                        # initialize may also return an open SSE stream. Close
+                        # this optional probe before the real SDK handshake.
+                        pass
                     if 200 <= post_resp.status_code < 300:
                         post_ct = (
                             post_resp.headers.get("content-type", "")
@@ -3518,6 +3528,10 @@ class MCPServerTask:
                         )
                         if post_ct in self._MCP_CONTENT_TYPES:
                             resp = post_resp
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            return  # Probe budget exhausted — let the real SDK handshake try.
         except _httpx.HTTPError:
             return  # DNS/connect/timeout/transport error — let the SDK try.
 
@@ -5238,6 +5252,11 @@ def _handle_session_expired_and_retry(
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
 _parallel_safe_servers: set = set()
+# Servers whose config sets ``supports_parallel_tool_calls: false`` EXPLICITLY.
+# Admission is allow-by-default (see tool_dispatch_helpers), so this is how an
+# operator pins a stateful server — one whose next call depends on the state
+# the previous one left behind — back to serial execution.
+_parallel_blocked_servers: set = set()
 
 # Exact MCP tool-name provenance. The generated registry name is lossy because
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
@@ -7697,8 +7716,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(srv_name)
+                _parallel_blocked_servers.discard(srv_name)
             else:
                 _parallel_safe_servers.discard(srv_name)
+                if "supports_parallel_tool_calls" in (srv_cfg or {}):
+                    _parallel_blocked_servers.add(srv_name)
+                else:
+                    _parallel_blocked_servers.discard(srv_name)
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -7873,6 +7897,36 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 
+    # The cross-process lock serializes connection creation, not reads of an
+    # already-live local registry. Reuse only exact configs with healthy live
+    # sessions; missing, changed or reconnecting servers retain the guarded
+    # registration path below. This never creates a connection outside it.
+    reuse_safe = _filter_suspicious_mcp_servers(servers) == servers
+    with _lock:
+        reuse_connected = reuse_safe and all(
+            name in _servers
+            and name not in _server_connecting
+            and name not in _server_connect_errors
+            and getattr(_servers[name], "session", None) is not None
+            and getattr(_servers[name], "_error", None) is None
+            and getattr(_servers[name], "_config", None) == cfg
+            for name, cfg in servers.items()
+        )
+        if reuse_connected:
+            # Preserve register_mcp_servers' per-config parallel-call flags.
+            for name, cfg in servers.items():
+                if _parse_boolish(cfg.get("supports_parallel_tool_calls", False), default=False):
+                    _parallel_safe_servers.add(name)
+                    _parallel_blocked_servers.discard(name)
+                else:
+                    _parallel_safe_servers.discard(name)
+                    if "supports_parallel_tool_calls" in (cfg or {}):
+                        _parallel_blocked_servers.add(name)
+                    else:
+                        _parallel_blocked_servers.discard(name)
+    if reuse_connected:
+        return _existing_tool_names()
+
     # Cross-process discovery guard (#62771). A lock loser waits for
     # the holder, then performs its own process-local discovery. If locking is
     # unavailable or the bounded wait expires, preserve the previous
@@ -7952,6 +8006,22 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
         return bool(server_name and server_name in _parallel_safe_servers)
+
+
+def is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
+    """Check whether an MCP tool's server is pinned to serial execution.
+
+    True only when the server's config carries an explicit
+    ``supports_parallel_tool_calls: false``. Under allow-by-default admission
+    that flag is the operator's handle for a stateful server (a browser, a
+    build session, a viewer) where the next call depends on the state the
+    previous one left behind.
+    """
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+        return bool(server_name and server_name in _parallel_blocked_servers)
 
 
 def get_mcp_status() -> List[dict]:

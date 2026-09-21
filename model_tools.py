@@ -405,20 +405,40 @@ def _governance_record_tool_usage(tool_name: str, args: Optional[Dict[str, Any]]
         logger.debug("dashboard governance usage recording failed for %s: %s", tool_name, exc)
 
 
-def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]], *, _scope_status=None) -> List[Dict[str, Any]]:
     ctx = _current_dashboard_governance_context()
     if ctx is None or (getattr(ctx.access, "mode", "off") != "enforce" and not getattr(ctx, "continuation_contexts", ())
                        and not getattr(ctx, "workspace_path", "")):
         return tool_defs
-    filtered: List[Dict[str, Any]] = []
-    for td in tool_defs:
-        name = td.get("function", {}).get("name", "")
-        if not name:
-            continue
-        decision = _governance_tool_decision(name)
-        if decision is None or decision.allowed:
-            filtered.append(td)
-    return filtered
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import project_tool_names_for_context
+        names = [td.get("function", {}).get("name", "") for td in tool_defs]
+        projection = project_tool_names_for_context(ctx, (name for name in names if name), registry)
+        if _scope_status is not None:
+            _scope_status.append(projection.scope_allowed)
+        return [td for td, name in zip(tool_defs, names) if name in projection.names]
+    except Exception:
+        if _scope_status is not None:
+            _scope_status.append(False)
+        return []
+
+
+def _recheck_cached_tool_projection(tool_defs):
+    # Cached schemas are not proof of current workspace/bot membership. Do not
+    # re-filter assembled virtual tools or mutate the shared schema cache.
+    ctx = _current_dashboard_governance_context()
+    allowed = True
+    if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce"
+                            or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
+        try:
+            from hermes_cli.dashboard_governance.tool_policy import tool_projection_scope_allowed
+            allowed = tool_projection_scope_allowed(ctx)
+        except Exception:
+            allowed = False
+    result = list(tool_defs) if allowed else []
+    global _last_resolved_tool_names
+    _last_resolved_tool_names = [td["function"]["name"] for td in result]
+    return result
 
 
 def _clear_tool_defs_cache() -> None:
@@ -488,17 +508,17 @@ def get_tool_definitions(
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
-            # Update _last_resolved_tool_names so downstream callers see
-            # consistent state even on a cache hit.
-            global _last_resolved_tool_names
-            _last_resolved_tool_names = [t["function"]["name"] for t in cached]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
-            return list(cached)
+            return _recheck_cached_tool_projection(cached)
 
+    # Only a per-call status, never a reusable permission snapshot. A denied
+    # live scope must not cache [] and keep a later re-authorized user empty.
+    scope_status = []
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode and cache_key is not None:
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       _scope_status=scope_status)
+    if quiet_mode and cache_key is not None and all(scope_status):
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -513,12 +533,15 @@ def get_tool_definitions(
             # Another thread may have populated this exact key while this
             # thread computed. Reuse it and serialize capacity eviction.
             cached = _tool_defs_cache.get(cache_key)
+            reused = cached is not None
             if cached is None:
                 if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
                     _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
                 _tool_defs_cache[cache_key] = result
                 cached = result
-        return list(cached)
+        # A concurrent constructor may have populated the cache after this
+        # call's projection; its earlier live membership checks cannot be reused.
+        return _recheck_cached_tool_projection(cached) if reused else list(cached)
     if quiet_mode:
         return list(result)
     return result
@@ -529,6 +552,8 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    *,
+    _scope_status=None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -618,7 +643,7 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
-    filtered_tools = _filter_tools_by_governance(filtered_tools)
+    filtered_tools = _filter_tools_by_governance(filtered_tools, _scope_status=_scope_status)
 
     # The set of tool names that actually passed check_fn and governance filtering.
     # Use this (not tools_to_include) for any downstream schema that references

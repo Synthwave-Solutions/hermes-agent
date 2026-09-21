@@ -20,6 +20,9 @@ def make_context(tmp_path, server, *, grants=None, denied=None):
         "mcp": grants or {"servers": ["*"], "tools": {"*": ["*"]}},
     }}}, "users": {subject.email: {"roles": ["member"], "access_mode": "blacklist",
         "access_level": "elevated", "deny": {"mcp": {"tools": denied or {}}}}}}
+    if grants is not None:
+        policy["users"][subject.email]["access_mode"] = "whitelist"
+        policy["users"][subject.email]["grants"] = policy["roles"]["member"]["grants"]
     path = tmp_path / "policy.yaml"
     path.write_text(yaml.safe_dump(policy))
     return DashboardGovernanceContext(subject=subject,

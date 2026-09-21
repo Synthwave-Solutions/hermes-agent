@@ -2461,12 +2461,16 @@ class ContextCompressor(ContextEngine):
     def _resolve_context_length(self) -> int:
         """Resolve and cache the model's context length on first access."""
         if self._resolved_context_length is None:
+            metadata_options = {}
+            if getattr(self, "metadata_requested_provider", ""):
+                metadata_options["requested_provider"] = self.metadata_requested_provider
             self._resolved_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 config_context_length=self._config_context_length,
                 provider=self.provider,
+                **metadata_options,
             )
             # Small-context threshold floor: models under 512K trigger at
             # >=75% so compaction doesn't fire with half the window still
@@ -3124,6 +3128,7 @@ class ContextCompressor(ContextEngine):
             base_url != self.base_url,
             api_mode != self.api_mode,
         ))
+        self.metadata_requested_provider = ""
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -3379,7 +3384,9 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "lean",
+        metadata_requested_provider: str = "",
     ):
+        self.metadata_requested_provider = metadata_requested_provider
         self.model = model
         self.base_url = base_url
         self.api_key = api_key

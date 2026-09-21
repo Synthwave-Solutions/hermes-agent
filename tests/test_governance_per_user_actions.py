@@ -87,7 +87,7 @@ def test_hard_ceiling_before_any_model_call(fixture, monkeypatch, mutation):
     elif mutation == "whitelist":
         user["access_mode"] = "whitelist"
     else:
-        policy["roles"]["member"]["grants"]["profiles"] = ["bob"]
+        user["deny"] = {"profiles": ["alice"]}
     write()
     calls = model(monkeypatch)
     result = review.authorize_tool_action(context(), "web_search", {"query": "public facts"}, Registry())
