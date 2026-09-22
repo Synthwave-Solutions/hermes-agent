@@ -1391,3 +1391,12 @@ class TestSkillManageBatchNamesEveryTarget:
     def test_the_legacy_flat_shape_still_works(self):
         assert self._decide(self._access({"docx"}), {"action": "patch", "name": "docx"}).allowed
         assert not self._decide(self._access({"docx"}), {"action": "patch", "name": "powerpoint"}).allowed
+
+
+def test_a_refused_skill_edit_becomes_a_grantable_request():
+    """22-09-2026: skill_manage_not_allowed had no request mapping, so the
+    refusal was silent for admins: no row in Approvals, nothing to decide."""
+    from hermes_cli.dashboard_governance.grant_requests import _map_denial
+    assert _map_denial("skill_manage", "skill_manage_not_allowed", "docx") == ("skill_manage", "docx")
+    assert _map_denial("skill_manage", "skill_manage_not_allowed", "synthwave/docx") == ("skill_manage", "docx")
+    assert _map_denial("skill_manage", "skill_manage_not_allowed", "") is None

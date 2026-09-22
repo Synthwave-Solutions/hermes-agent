@@ -48,6 +48,11 @@ def _map_denial(tool_name: str, reason: str, detail: str) -> tuple[str, str] | N
         return "cli", detail
     if reason == "skill_not_allowed" and detail:
         return "skill", detail.rsplit("/", 1)[-1]
+    if reason == "skill_manage_not_allowed" and detail:
+        # Editing a skill the person may use but not change. Grantable per
+        # skill: approving adds it to their skills.manage. Without this
+        # mapping the refusal was silent: no request, nothing for an admin.
+        return "skill_manage", detail.rsplit("/", 1)[-1]
     if reason == "cli_workdir_not_allowed" and detail:
         return "workdir", detail
     if reason == "file_read_root_not_allowed" and detail:
