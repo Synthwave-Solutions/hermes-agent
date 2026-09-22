@@ -4,6 +4,7 @@ import fnmatch
 import os
 import re
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -816,10 +817,46 @@ def session_attachment_inbox(session_id: Any) -> str:
 
 
 def _in_session_inbox(path: Any, inbox: str) -> bool:
-    if not inbox or not path:
+    if not path:
         return False
     candidate = _resolve_candidate_path(path)
-    return candidate == inbox or candidate.startswith(inbox.rstrip(os.sep) + os.sep)
+    if inbox and (candidate == inbox or candidate.startswith(inbox.rstrip(os.sep) + os.sep)):
+        return True
+    return _in_own_state_cache(candidate)
+
+
+# The turn's own technical output lands under <hermes home>/cache/: the live
+# transcript of a subagent it delegated (cache/delegation/live/<id>/task-N.log),
+# a tool result too large for the context (cache/spillover) and terminal
+# output that spilled (cache/terminal-output). All of it sits under the
+# generic `**/.hermes/**` secret boundary, so an agent that wanted to know
+# why its own worker timed out got "file_denied_glob" on the log it had just
+# written itself (Yaser, IvCB repair, 21-09-2026), and admins kept approving
+# one-off allow_globs per log file. That output is the caller's own work, not
+# a secret: reading it needs no grant. Only the running turn's state
+# directory qualifies (the context-local Hermes home, so a profile never
+# reads another profile's cache), writes stay governed, and a symlink or
+# `..` inside the cache resolves to its real target first.
+_OWN_STATE_CACHE_SUBDIRS = ("delegation", "spillover", "terminal-output")
+
+
+def _own_state_cache_roots() -> tuple[str, ...]:
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home()) / "cache"
+    except Exception:
+        return ()
+    return tuple(_resolve_candidate_path(str(base / sub)) for sub in _OWN_STATE_CACHE_SUBDIRS)
+
+
+def _in_own_state_cache(path: Any) -> bool:
+    if not path:
+        return False
+    candidate = _resolve_candidate_path(path)
+    for root in _own_state_cache_roots():
+        if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
 
 
 def _command_id(command: Any) -> tuple[str, str]:
@@ -899,6 +936,29 @@ def _interpreter_targets(tokens: list[str]) -> list[str]:
         else:
             index += 1
     return targets
+
+
+def _skill_names(args: Mapping[str, Any] | dict[str, Any]) -> list[str]:
+    """Every skill a skill_view/skill_manage call targets.
+
+    skill_manage's advertised shape is a batch: {"operations": [{"name":
+    ..., "action": ...}, ...]} with no top-level name. Reading only
+    args["name"] judged an empty string, so every batch edit was refused with
+    skill_manage_not_allowed, for admins with `*` as well (Yaser and Michaël,
+    22-09-2026). The legacy flat shape (top-level name) stays supported.
+    """
+    names: list[str] = []
+    top = str(args.get("name") or "").strip()
+    if top:
+        names.append(top)
+    operations = args.get("operations")
+    if isinstance(operations, (list, tuple)):
+        for op in operations:
+            if isinstance(op, Mapping):
+                name = str(op.get("name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+    return names
 
 
 def _skill_name_allowed(values: frozenset[str], name: Any) -> bool:
@@ -1079,19 +1139,22 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         return AccessDecision(True, "governance_inactive")
     grants = access.grants
     inbox = session_attachment_inbox(session_id)
-    if tool_name in {"read_file", "search_files"} and _in_session_inbox(args.get("path") or ".", inbox):
-        return AccessDecision(True, "session_attachment_allowed")
+    if tool_name in {"read_file", "search_files"}:
+        if _in_own_state_cache(args.get("path") or "."):
+            return AccessDecision(True, "own_state_cache_allowed")
+        if _in_session_inbox(args.get("path") or ".", inbox):
+            return AccessDecision(True, "session_attachment_allowed")
     from .models import grant_matches
     if tool_name in {"skill_view", "skill_manage"}:
         dim = "skills_view" if tool_name == "skill_view" else "skills_manage"
-        name = str(args.get("name") or "")
-        if grant_matches(getattr(access.deny, dim), name) or grant_matches(getattr(access.deny, dim), name.rsplit("/", 1)[-1]):
-            return AccessDecision(False, "explicit_deny", detail=name)
-        if tool_name == "skill_view" and (grant_matches(access.deny.skills_load, name) or
-                                          grant_matches(access.deny.skills_load, name.rsplit("/", 1)[-1])):
-            return AccessDecision(False, "explicit_deny", detail=name)
-        if (access.access_mode or access.access_level) and not access.allows(dim, name):
-            return AccessDecision(False, "skill_not_allowed", detail=name)
+        for name in _skill_names(args):
+            if grant_matches(getattr(access.deny, dim), name) or grant_matches(getattr(access.deny, dim), name.rsplit("/", 1)[-1]):
+                return AccessDecision(False, "explicit_deny", detail=name)
+            if tool_name == "skill_view" and (grant_matches(access.deny.skills_load, name) or
+                                              grant_matches(access.deny.skills_load, name.rsplit("/", 1)[-1])):
+                return AccessDecision(False, "explicit_deny", detail=name)
+            if (access.access_mode or access.access_level) and not access.allows(dim, name):
+                return AccessDecision(False, "skill_not_allowed", detail=name)
     if tool_name in {"read_file", "search_files", "write_file", "patch"}:
         path = str(args.get("path") or ".")
         canonical = _resolve_candidate_path(path)
@@ -1126,8 +1189,12 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         if not _skill_name_allowed(grants.skills_view, args.get("name")):
             return AccessDecision(False, "skill_not_allowed", detail=str(args.get("name") or ""))
     elif tool_name == "skill_manage":
-        if not _skill_name_allowed(grants.skills_manage, args.get("name")):
-            return AccessDecision(False, "skill_manage_not_allowed", detail=str(args.get("name") or ""))
+        names = _skill_names(args)
+        if not names:
+            return AccessDecision(False, "skill_manage_not_allowed", detail="")
+        for name in names:
+            if not _skill_name_allowed(grants.skills_manage, name):
+                return AccessDecision(False, "skill_manage_not_allowed", detail=name)
     elif tool_name in {"read_file", "search_files"}:
         path = args.get("path") or "."
         if _matches_denied_glob(str(path), grants.file_denied_globs) \

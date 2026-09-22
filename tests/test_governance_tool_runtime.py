@@ -1254,3 +1254,140 @@ class TestBlacklistTerminalIsStructureAgnostic:
         access = self._access(approval={"deploy-prod"})
         assert cli_command_requires_manual_approval(access, "for e in a; do deploy-prod $e; done")
         assert not cli_command_requires_manual_approval(access, "for e in a; do ls $e; done")
+
+
+class TestOwnStateCacheIsReadable:
+    """22-09-2026: a subagent's live transcript, a spilled tool result and
+    spilled terminal output land under <hermes home>/cache/, inside the
+    `**/.hermes/**` boundary, so the agent that had just delegated a repair
+    could not read why its own worker timed out (Yaser, IvCB) and admins kept
+    approving one-off allow_globs per log. The running turn's own cache is its
+    own output: readable without a grant. Another profile's cache, anything a
+    link inside it points at, and writes stay governed."""
+
+    ME = "marcel@synthwave.solutions"
+
+    @pytest.fixture(autouse=True)
+    def _cache(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes" / "profiles" / "marcel"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_WEBUI_ATTACHMENT_DIR", raising=False)
+        self.log = home / "cache" / "delegation" / "live" / "deleg_d1d0bd42" / "task-0.log"
+        self.log.parent.mkdir(parents=True)
+        self.log.write_text("worker timed out")
+        self.spill = home / "cache" / "spillover" / "call_abc.txt"
+        self.spill.parent.mkdir(parents=True)
+        self.spill.write_text("large result")
+        self.terminal = home / "cache" / "terminal-output" / "out-1.log"
+        self.terminal.parent.mkdir(parents=True)
+        self.terminal.write_text("stdout")
+        self.other = tmp_path / ".hermes" / "profiles" / "yaser" / "cache" / "delegation" / "live" / "deleg_x" / "task-0.log"
+        self.other.parent.mkdir(parents=True)
+        self.other.write_text("someone else's worker")
+        self.secret = home / "auth.json"
+        self.secret.write_text("{}")
+        self.link = home / "cache" / "delegation" / "auth-link.json"
+        self.link.symlink_to(self.secret)
+
+    def _access(self):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset({"cat", "head"}),
+                file_read_roots=frozenset({"/home/synthwavehq/work"}),
+                file_write_roots=frozenset({"/home/synthwavehq/work"}),
+                file_denied_globs=frozenset({"**/.hermes/**"}),
+            ),
+        )
+
+    def _decide(self, tool, args):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(self._access(), tool, args, session_id="")
+
+    def test_the_own_delegation_log_is_readable(self):
+        d = self._decide("read_file", {"path": str(self.log), "offset": 1, "limit": 120})
+        assert d.allowed and d.reason == "own_state_cache_allowed"
+
+    def test_spillover_and_terminal_output_are_readable(self):
+        assert self._decide("read_file", {"path": str(self.spill)}).allowed
+        assert self._decide("read_file", {"path": str(self.terminal)}).allowed
+        assert self._decide("search_files", {"path": str(self.log.parent)}).allowed
+
+    def test_the_terminal_may_read_it_too(self):
+        assert self._decide("terminal", {"command": f"head -50 {self.log}"}).allowed
+
+    def test_another_profiles_cache_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.other)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}).allowed
+
+    def test_a_link_inside_the_cache_resolves_to_its_target_first(self):
+        d = self._decide("read_file", {"path": str(self.link)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_writing_into_the_cache_stays_governed(self):
+        d = self._decide("write_file", {"path": str(self.log), "content": "x"})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_the_rest_of_the_state_directory_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.secret)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_the_workspace_membership_check_treats_it_as_no_workspace(self):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        seen = []
+        access = self._access()
+        ctx = DashboardGovernanceContext(
+            subject=access.subject, access=access, active_profile="marcel", session_id="", request_id="",
+            workspace_path="/home/synthwavehq/work/synthpulse",
+            workspace_access_check=lambda path: seen.append(path) or path == "/home/synthwavehq/work/synthpulse",
+        )
+        d = tool_arguments_allowed_for_context(ctx, "read_file", {"path": str(self.log)})
+        assert d.allowed, d
+        assert str(self.log) not in seen
+
+
+class TestSkillManageBatchNamesEveryTarget:
+    """22-09-2026: skill_manage's advertised shape is {"operations": [{name,
+    action, ...}]} without a top-level name, so the policy judged an empty
+    name and refused every batch edit with skill_manage_not_allowed, for
+    admins with `*` as well (Yaser, Michaël). Each op's target is checked."""
+
+    def _access(self, manage, deny=()):
+        from hermes_cli.dashboard_governance.models import GrantSet as _GrantSet
+        return EffectiveAccess(
+            subject=GovernanceSubject(email="yaser@synthwave.solutions"),
+            mode="enforce",
+            grants=GrantSet(skills_manage=frozenset(manage)),
+            deny=_GrantSet(skills_manage=frozenset(deny)),
+        )
+
+    def _decide(self, access, args):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "skill_manage", args)
+
+    OPS = {"operations": [{"action": "patch", "name": "docx", "old_string": "a", "new_string": "b"},
+                          {"action": "write_file", "name": "powerpoint", "file_path": "x.md", "file_content": ""}]}
+
+    def test_a_wildcard_grant_allows_a_batch(self):
+        d = self._decide(self._access({"*"}), self.OPS)
+        assert d.allowed, d
+
+    def test_every_op_target_must_be_granted(self):
+        d = self._decide(self._access({"docx"}), self.OPS)
+        assert not d.allowed and d.reason == "skill_manage_not_allowed" and d.detail == "powerpoint"
+        assert self._decide(self._access({"docx", "powerpoint"}), self.OPS).allowed
+
+    def test_a_denied_target_inside_the_batch_is_refused(self):
+        d = self._decide(self._access({"*"}, deny={"powerpoint"}), self.OPS)
+        assert not d.allowed and d.reason == "explicit_deny" and d.detail == "powerpoint"
+
+    def test_a_batch_without_any_target_is_refused(self):
+        d = self._decide(self._access({"*"}), {"operations": []})
+        assert not d.allowed and d.reason == "skill_manage_not_allowed"
+
+    def test_the_legacy_flat_shape_still_works(self):
+        assert self._decide(self._access({"docx"}), {"action": "patch", "name": "docx"}).allowed
+        assert not self._decide(self._access({"docx"}), {"action": "patch", "name": "powerpoint"}).allowed
