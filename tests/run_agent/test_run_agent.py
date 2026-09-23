@@ -27,6 +27,7 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from tests.run_agent.raw_response_mock import wire_raw_response
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +75,9 @@ def agent():
             skip_context_files=True,
             skip_memory=True,
         )
-        a.client = MagicMock()
         # SynthPulse captures OmniRoute routing headers through the SDK raw
         # response API; retain each test's configured parsed-response mock.
-        def raw_create(**kwargs):
-            parsed = a.client.chat.completions.create(**kwargs)
-            raw = MagicMock()
-            raw.headers = {}
-            raw.parse.return_value = parsed
-            return raw
-        a.client.chat.completions.with_raw_response.create.side_effect = raw_create
+        a.client = wire_raw_response(MagicMock())
         return a
 
 
@@ -2664,12 +2658,31 @@ class TestParallelScopePathNormalization:
 class TestMcpParallelToolBatch:
     """Integration test: _should_parallelize_tool_batch respects MCP parallel flag."""
 
-    def test_mcp_tools_default_sequential(self):
-        """MCP tools without supports_parallel_tool_calls are sequential."""
+    def test_mcp_tools_default_parallel(self):
+        """Allow-by-default admission (SynthPulse, bdf9b7afd): MCP tools from a
+        server without an explicit serial pin run concurrently."""
         from run_agent import _should_parallelize_tool_batch
         tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
         tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
-        assert not _should_parallelize_tool_batch([tc1, tc2])
+        assert _should_parallelize_tool_batch([tc1, tc2])
+
+    def test_mcp_tools_sequential_when_server_pinned_serial(self):
+        """``supports_parallel_tool_calls: false`` keeps a stateful server serial."""
+        from run_agent import _should_parallelize_tool_batch
+        from tools.mcp_tool import _lock, _mcp_tool_server_names, _parallel_blocked_servers
+        with _lock:
+            _parallel_blocked_servers.add("github")
+            _mcp_tool_server_names["mcp__github__list_repos"] = "github"
+            _mcp_tool_server_names["mcp__github__search_code"] = "github"
+        try:
+            tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
+            tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
+            assert not _should_parallelize_tool_batch([tc1, tc2])
+        finally:
+            with _lock:
+                _parallel_blocked_servers.discard("github")
+                _mcp_tool_server_names.pop("mcp__github__list_repos", None)
+                _mcp_tool_server_names.pop("mcp__github__search_code", None)
 
     def test_mcp_tools_parallel_when_server_opted_in(self):
         """MCP tools from a parallel-safe server can run concurrently."""

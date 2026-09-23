@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from tests.run_agent.raw_response_mock import wire_raw_response
 
 
 def _tool_call():
@@ -112,6 +113,7 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
         )
 
     agent.client = MagicMock()
+    wire_raw_response(agent.client)
     responses = [_tool_response(prompt_tokens), _final_response()]
     if provider_recovery:
         responses.insert(0, _malformed_response())

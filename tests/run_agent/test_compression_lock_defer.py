@@ -29,6 +29,7 @@ import pytest
 from agent.conversation_compression import compression_skipped_due_to_lock
 from run_agent import AIAgent
 import run_agent
+from tests.run_agent.raw_response_mock import wire_raw_response
 
 
 LOCK_HOLDER = "pid=4242:tid=1:agent=deadbeef:nonce=abcd1234"
@@ -103,6 +104,7 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        wire_raw_response(a.client)
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         a.tool_delay = 0
@@ -258,6 +260,9 @@ class TestPreApiLockDeferDoesNotBurnBudget:
             should_compress=lambda t: t >= 100_000,
             should_defer_preflight_to_real_usage=lambda _t: False,
             get_active_compression_failure_cooldown=lambda: None,
+            # SynthPulse resizes the compressor for the model that answered
+            # (capture_omniroute_route); the stub keeps its fixed window.
+            update_model=lambda **_kwargs: None,
         )
 
         agent.client.chat.completions.create.side_effect = [

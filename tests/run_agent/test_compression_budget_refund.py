@@ -25,6 +25,7 @@ import pytest
 
 from agent.conversation_loop import _should_rearm_compression_budget
 from run_agent import AIAgent
+from tests.run_agent.raw_response_mock import wire_raw_response
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,7 @@ def agent():
             max_iterations=20,
         )
     a.client = MagicMock()
+    wire_raw_response(a.client)
     a._cached_system_prompt = "You are helpful."
     a._use_prompt_caching = False
     a._disable_streaming = True
