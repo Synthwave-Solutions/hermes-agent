@@ -150,7 +150,12 @@ _novita_metadata_cache_time: float = 0
 _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
-_ENDPOINT_MODEL_CACHE_TTL = 300
+_ENDPOINT_MODEL_CACHE_TTL = 1800
+# SYNTHWAVE fork: an expired snapshot younger than this is served at once while
+# one background refresh rebuilds it (stale-while-revalidate). A router catalog
+# (OmniRoute: ~5k models, 12-15 s per build) must never hold a finished turn
+# open; only a cold cache still waits for the first fetch.
+_ENDPOINT_MODEL_STALE_MAX_AGE = 86400
 _ENDPOINT_MODEL_CACHE_MAX_SIZE = 256
 _ENDPOINT_MODEL_FETCH_WAIT_SECONDS = 60.0
 _endpoint_model_metadata_lock = threading.Lock()
@@ -1548,22 +1553,38 @@ def fetch_endpoint_model_metadata(
     key = _endpoint_metadata_cache_key(normalized, api_key)
     if not native_protocol_probes:
         key += "|remote-router"
+    stale = None
     with _endpoint_model_metadata_lock:
         if not force_refresh:
             cached = _endpoint_model_metadata_cache.get(key)
             cached_at = _endpoint_model_metadata_cache_time.get(key, 0)
-            if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
+            age = time.time() - cached_at
+            if cached is not None and age < _ENDPOINT_MODEL_CACHE_TTL:
                 return cached
+            if cached is not None and age < _ENDPOINT_MODEL_STALE_MAX_AGE:
+                stale = cached
         if cached_only:
             return {}
         # Do not cache a host's short-lived connect timeout as a full-TTL miss.
         if _endpoint_blackholed(normalized):
-            return {}
+            return stale if stale is not None else {}
         flight = _endpoint_model_metadata_inflight.get(key)
         leader = flight is None
         if leader:
             flight = _EndpointMetadataFetch()
             _endpoint_model_metadata_inflight[key] = flight
+
+    options = {} if native_protocol_probes else {"native_protocol_probes": False}
+    if stale is not None:
+        if leader:
+            threading.Thread(
+                target=_run_endpoint_metadata_fetch,
+                args=(key, normalized, api_key, options, flight),
+                kwargs={"background": True},
+                name="endpoint-metadata-refresh",
+                daemon=True,
+            ).start()
+        return stale
 
     if not leader:
         # Optional metadata must not wait indefinitely on another worker's
@@ -1572,11 +1593,23 @@ def fetch_endpoint_model_metadata(
             return flight.result if flight.result is not None else {}
         return {}
 
+    return _run_endpoint_metadata_fetch(key, normalized, api_key, options, flight)
+
+
+def _run_endpoint_metadata_fetch(key, normalized, api_key, options, flight, background=False):
+    """Leader fetch: probe, store the snapshot and release followers."""
     try:
-        options = {} if native_protocol_probes else {"native_protocol_probes": False}
         result = _fetch_endpoint_model_metadata_uncached(normalized, api_key, **options)
         with _endpoint_model_metadata_lock:
             flight.result = result
+            previous = _endpoint_model_metadata_cache.get(key)
+            if background and not result and previous:
+                # A failed refresh must not replace a good snapshot with an
+                # empty one; keep it and retry in five minutes.
+                _endpoint_model_metadata_cache_time[key] = (
+                    time.time() - _ENDPOINT_MODEL_CACHE_TTL + 300
+                )
+                return previous
             _endpoint_model_metadata_cache[key] = result
             _endpoint_model_metadata_cache_time[key] = time.time()
             while len(_endpoint_model_metadata_cache) > _ENDPOINT_MODEL_CACHE_MAX_SIZE:
@@ -1585,6 +1618,12 @@ def fetch_endpoint_model_metadata(
                 del _endpoint_model_metadata_cache[oldest]
                 _endpoint_model_metadata_cache_time.pop(oldest, None)
         return result
+    except Exception:
+        # A background refresh has no caller to raise to; keep the old snapshot.
+        if background:
+            logger.debug("Background endpoint metadata refresh failed for %s", normalized, exc_info=True)
+            return {}
+        raise
     finally:
         # Also release followers after cancellation/BaseException. They get an
         # unknown snapshot, and a later call may retry; no failure is invented.

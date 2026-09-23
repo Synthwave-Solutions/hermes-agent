@@ -74,6 +74,13 @@ def local_catalog(*, serialized_delay=0):
         thread.join(timeout=3)
 
 
+def wait_for_background_refresh(timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while metadata._endpoint_model_metadata_inflight and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not metadata._endpoint_model_metadata_inflight, "background refresh did not finish"
+
+
 def fetch_in_profile(home, url, key="key-A", **kwargs):
     token = set_hermes_home_override(home)
     try:
@@ -282,6 +289,10 @@ def test_metadata_cache_expires_and_is_bounded_without_raw_credentials(monkeypat
         monkeypatch.setattr(metadata.time, "time", lambda: now + metadata._ENDPOINT_MODEL_CACHE_TTL + 1)
         state["contexts"]["key-B"] = 98304
         assert fetch_in_profile(tmp_path, url, "key-B", cached_only=True) == {}
+        # Stale-while-revalidate (SYNTHWAVE fork): the expired snapshot is served
+        # at once and a background refresh replaces it.
+        assert fetch_in_profile(tmp_path, url, "key-B")[MODEL]["context_length"] == 131072
+        wait_for_background_refresh()
         assert fetch_in_profile(tmp_path, url, "key-B")[MODEL]["context_length"] == 98304
 
 
@@ -310,3 +321,58 @@ def test_real_agent_context_and_usage_accounting_share_scoped_snapshot(monkeypat
                                      provider="custom", base_url=url, api_key="key-A", cached_only=True)
         assert result.amount_usd is not None and result.amount_usd > 0
         assert len(state["requests"]) == count
+
+
+# ── Stale-while-revalidate (SYNTHWAVE fork) ─────────────────────────────────
+
+
+def _expire(monkeypatch, age):
+    now = time.time()
+    monkeypatch.setattr(metadata.time, "time", lambda: now + age)
+
+
+def test_expired_snapshot_is_served_while_refresh_is_blocked(monkeypatch, tmp_path):
+    with local_catalog() as (url, state):
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        _expire(monkeypatch, metadata._ENDPOINT_MODEL_CACHE_TTL + 1)
+        state["contexts"]["key-A"] = 262144
+        state["block"] = True
+        state["entered"].clear()
+
+        started = time.monotonic()
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        assert time.monotonic() - started < 1.0
+        assert state["entered"].wait(2), "no background refresh was started"
+        # A second caller while the refresh is still blocked also gets the stale
+        # snapshot and does not start another request.
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        # One catalog request for the cold fetch, one for the single refresh.
+        assert [path for path, _key in state["requests"]].count("/v1/models") == 2
+
+        state["release"].set()
+        wait_for_background_refresh()
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 262144
+
+
+def test_failed_background_refresh_keeps_the_good_snapshot(monkeypatch, tmp_path):
+    with local_catalog() as (url, state):
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        _expire(monkeypatch, metadata._ENDPOINT_MODEL_CACHE_TTL + 1)
+        state["status"] = 500
+
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        wait_for_background_refresh()
+        requests_after_refresh = len(state["requests"])
+        # Still the good snapshot, and it counts as fresh again for a short
+        # retry window instead of refetching on every call.
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        assert len(state["requests"]) == requests_after_refresh
+
+
+def test_snapshot_older_than_stale_window_waits_for_fresh_data(monkeypatch, tmp_path):
+    with local_catalog() as (url, state):
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
+        _expire(monkeypatch, metadata._ENDPOINT_MODEL_STALE_MAX_AGE + 1)
+        state["contexts"]["key-A"] = 262144
+        assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 262144
+
