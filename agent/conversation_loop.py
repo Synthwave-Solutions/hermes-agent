@@ -40,6 +40,10 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.routed_failover import (
+    failover_threshold_tokens,
+    should_compact_for_routed_failover,
+)
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -5599,6 +5603,76 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # ── Routed failover window (SYNTHWAVE fork) ──────────
+                # The router already dropped every fallback target whose
+                # window is too small for this request, so when the larger
+                # primary (a 1M Opus route) fails here, switching providers
+                # or retrying resends a request nothing else can take, and no
+                # model returns the context-overflow error that would start
+                # the compaction path above. Compact once to the fallback
+                # window and retry; the router then accepts the fallbacks.
+                # Only armed when compression.failover_context_length is set.
+                _failover_ctx = getattr(agent, "_failover_context_length", None)
+                if _failover_ctx and _wrapped_output_cap_budget is None:
+                    compressor = agent.context_compressor
+                    _failover_request_tokens = estimate_request_tokens_rough(
+                        api_messages, tools=agent.tools or None,
+                    )
+                    if should_compact_for_routed_failover(
+                        reason=classified.reason,
+                        retry_count=retry_count,
+                        request_tokens=_failover_request_tokens,
+                        failover_context_length=_failover_ctx,
+                        failover_threshold=failover_threshold_tokens(compressor, _failover_ctx),
+                        routed=getattr(agent, "_effective_routed_model", None) is not None,
+                        compression_enabled=getattr(agent, "compression_enabled", True),
+                    ):
+                        old_ctx = compressor.context_length
+                        if old_ctx > _failover_ctx:
+                            compressor.update_model(
+                                model=getattr(compressor, "model", agent.model),
+                                context_length=_failover_ctx,
+                                base_url=agent.base_url,
+                                api_key=getattr(agent, "api_key", ""),
+                                provider=agent.provider,
+                                api_mode=agent.api_mode,
+                            )
+                            if hasattr(compressor, "_context_probed"):
+                                compressor._context_probed = True
+                                # A routing condition, not a model limit: the
+                                # next answer re-resolves the routed window.
+                                compressor._context_probe_persistable = False
+                        # Let the next successful answer re-resolve its route
+                        # (a recovered Opus restores the 1M window).
+                        agent._effective_routed_model = None
+                        agent._buffer_vprint(
+                            f"⚠️  Routed primary failed ({classified.reason.value}) on a "
+                            f"{_failover_request_tokens:,}-token request that the fallback "
+                            f"models cannot take; compacting to their "
+                            f"{_failover_ctx:,}-token window ({old_ctx:,} before)"
+                        )
+                        compression_attempts += 1
+                        if compression_attempts <= max_compression_attempts:
+                            original_len = len(messages)
+                            messages, active_system_prompt = agent._compress_context(
+                                messages, system_message,
+                                approx_tokens=_failover_request_tokens,
+                                task_id=effective_task_id,
+                            )
+                            conversation_history = conversation_history_after_compression(
+                                agent, messages, conversation_history
+                            )
+                            if len(messages) < original_len:
+                                agent._buffer_status(
+                                    "🗜️ Primary model unavailable for this large session: "
+                                    f"compacted to {_failover_ctx:,} tokens, "
+                                    "continuing on the fallback model"
+                                )
+                                _retry.restart_with_compressed_messages = True
+                                break
+                        # Compaction exhausted or ineffective: fall through
+                        # to the normal failover handling below.
+
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)

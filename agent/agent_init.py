@@ -2366,6 +2366,13 @@ def init_agent(
         }
     else:
         compression_model_thresholds = {}
+    # SYNTHWAVE fork: window of the router's fallback targets; when a routed
+    # primary fails on a larger request the loop compacts to it and retries
+    # (agent/routed_failover.py). None keeps upstream behavior.
+    from agent.routed_failover import parse_failover_context_length
+    agent._failover_context_length = parse_failover_context_length(
+        _compression_cfg.get("failover_context_length")
+    )
     # Absolute token cap: when set, compression triggers at the lower of
     # the ratio-based threshold and this absolute count. Clamped to the
     # model's context length at apply-time so a cap above the window is

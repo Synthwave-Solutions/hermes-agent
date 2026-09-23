@@ -1034,6 +1034,14 @@ DEFAULT_CONFIG = {
                                       # models) still applies on top of overrides
                                       # (raise-only: an override above the floor
                                       # wins; one below it is raised to the floor).
+        "failover_context_length": None,  # SYNTHWAVE fork. Context window of the
+                                      # router's fallback targets (e.g. 272000 when
+                                      # Codex models back a 1M Opus route). When a
+                                      # routed primary fails for a transient reason
+                                      # on a request larger than that window, the
+                                      # router has already filtered the fallbacks
+                                      # out; compact to this window once and retry.
+                                      # None = off (upstream behavior).
         "idle_compact_after_seconds": 0,  # Opt-in idle compaction (0 = disabled).
                                       # When > 0, a session that resumes after at
                                       # least this many seconds of inactivity
