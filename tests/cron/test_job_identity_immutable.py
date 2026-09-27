@@ -361,9 +361,8 @@ def test_reassign_is_refused_from_a_governed_shell(owned_job, monkeypatch):
 
 
 def test_reassign_is_refused_in_a_governed_non_admin_session(owned_job):
-    from hermes_cli.dashboard_governance.context import governance_context
-
     from cron.jobs import reassign_job_owner
+    from hermes_cli.dashboard_governance.context import governance_context
 
     with governance_context(_governed("mallory@example.test")):
         with pytest.raises(PermissionError):
@@ -372,9 +371,8 @@ def test_reassign_is_refused_in_a_governed_non_admin_session(owned_job):
 
 
 def test_reassign_is_allowed_in_a_governed_admin_session(owned_job):
-    from hermes_cli.dashboard_governance.context import governance_context
-
     from cron.jobs import reassign_job_owner
+    from hermes_cli.dashboard_governance.context import governance_context
 
     with governance_context(_governed("root@example.test", admin=True)):
         result = reassign_job_owner(owned_job["id"], "bob@example.test", actor="root@example.test")

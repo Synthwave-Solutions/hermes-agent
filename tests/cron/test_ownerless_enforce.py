@@ -12,8 +12,15 @@ with the system principal so they do not end up ownerless.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import os
+import stat
+import subprocess
+import sys
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import yaml
@@ -320,9 +327,8 @@ def test_the_cli_scope_stamps_the_system_principal():
 
 
 def test_the_cli_scope_never_overrides_a_governed_person():
-    from hermes_cli.dashboard_governance.context import governance_context
-
     from cron.jobs import system_principal_create_scope
+    from hermes_cli.dashboard_governance.context import governance_context
 
     _write_config(PRINCIPAL)
     with system_principal_create_scope(), governance_context(_governed("alice@example.test")):
@@ -384,14 +390,6 @@ def test_hermes_cron_create_without_a_principal_stays_ownerless():
 # ---------------------------------------------------------------------------
 # scripts/cron_assign_system_owner.py: dry run by default, --apply at go-live
 # ---------------------------------------------------------------------------
-
-import hashlib
-import importlib.util
-import os
-import stat
-import subprocess
-import sys
-from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "cron_assign_system_owner.py"
