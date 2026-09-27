@@ -1,6 +1,6 @@
 """``hermes cron`` subcommand parser.
 
-Extracted verbatim from ``hermes_cli/main.py:main()`` — same arguments, same
+Extracted verbatim from ``hermes_cli/main.py:main()``: same arguments, same
 ``func=cmd_cron`` dispatch. The handler is injected so this module does not
 import ``main`` (cycle avoidance).
 """
@@ -133,7 +133,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         action="store_true",
         default=False,
         help=(
-            "Skip the LLM entirely — run --script on schedule and deliver "
+            "Skip the LLM entirely: run --script on schedule and deliver "
             "its stdout directly. Empty stdout = silent. Classic watchdog "
             "pattern (memory alerts, disk alerts, CI pings)."
         ),
@@ -352,7 +352,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
-    # cron incidents — durable failure incidents (list/ack)
+    # cron incidents: durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents"
     )
@@ -372,7 +372,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "incident_id", nargs="?", help="Incident ID to acknowledge (ack)"
     )
 
-    # cron notepad — per-job durable KV scratchpad (injected into the job
+    # cron notepad: per-job durable KV scratchpad (injected into the job
     # prompt each run; the running agent writes it via this CLI).
     cron_notepad = cron_subparsers.add_parser(
         "notepad",
