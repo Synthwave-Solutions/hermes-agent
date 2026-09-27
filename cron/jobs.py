@@ -474,11 +474,22 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             )
         yield owns_claim
 
-# Fields on a cron job that must never change after creation. ``id`` is used
-# as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
-# updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# Fields on a cron job that must never change through ``update_job``.
+#
+# ``id`` is used as a filesystem path component under ``OUTPUT_DIR``; allowing
+# it to be updated lets an unsafe value (``../escape``, absolute path, nested)
+# leak into output writes/deletes.
+#
+# ``owner_email``, ``origin`` and ``created_at`` are the job's identity: the
+# owner decides whose governance every fire runs under (see
+# ``cron.scheduler._governed_as_job_owner``), ``origin`` is where "origin"
+# delivery goes. When only ``id`` was protected, anyone who could edit a job
+# (the agent ``cronjob`` tool, the engine dashboard, an API client) could blank
+# the owner so the job ran with nobody's governance, or re-own it. The only
+# way to change the owner afterwards is ``reassign_job_owner`` (``hermes cron
+# reassign-owner``), which is refused inside governed sessions and audited.
+# ``origin`` and ``created_at`` are set once, by ``create_job``.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "owner_email", "origin", "created_at"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -2562,9 +2573,10 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
-    # Block mutation of immutable fields. ``id`` in particular is a filesystem
-    # path component under OUTPUT_DIR — letting an update change it leaks
-    # path-escape values into output writes/deletes.
+    # Block mutation of immutable fields (see _IMMUTABLE_JOB_FIELDS). ``id``
+    # is a filesystem path component under OUTPUT_DIR; the identity fields
+    # decide whose governance a fire runs under. The whole update is refused,
+    # so a mixed payload never half-applies.
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(
