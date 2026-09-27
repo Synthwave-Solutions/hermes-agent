@@ -7118,6 +7118,8 @@ def _record_refused_fire(job: dict, reason: str) -> None:
     Best-effort per store so one failing bookkeeping write never hides the
     others. ``mark_job_run`` clears the fire claim and advances a recurring
     job to its next occurrence, fenced by the claim owner like a normal run.
+    A refusal is not a run, so it does not count toward a repeat limit: a job
+    limited to N runs keeps all N for when it has an owner.
     """
     job_id = str(job.get("id") or "")
     logger.warning(
@@ -7125,7 +7127,7 @@ def _record_refused_fire(job: dict, reason: str) -> None:
     )
     _upsert_incident_for_failure(job, reason)
     claim = job.get("fire_claim")
-    mark_kwargs = {"status": "blocked_config"}
+    mark_kwargs = {"status": "blocked_config", "counts_toward_repeat": False}
     if isinstance(claim, dict):
         mark_kwargs["expected_fire_owner"] = str(claim.get("by") or "")
     try:
@@ -7165,7 +7167,8 @@ def _governed_as_job_owner(job: dict):
     An owner whose grants cannot be resolved stops the run rather than
     falling back to unrestricted. Every refusal is recorded on the job, its
     execution and the incident store (visible, where a silent fallback would
-    not be) and raised as ``CronJobOwnerRefused``.
+    not be) and raised as ``CronJobOwnerRefused``; ``run_one_job`` turns that
+    into a processed fire, callers that run a job themselves stop on it.
     """
     owner = str(job.get("owner_email") or "").strip().lower()
     if not owner:
@@ -7280,6 +7283,10 @@ def run_one_job(
                     execution_token=execution_token,
                 ),
             )
+    except CronJobOwnerRefused:
+        # The gate refused the fire and already recorded it on the job, its
+        # execution and the incident store, like any failed run: processed.
+        return True
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])

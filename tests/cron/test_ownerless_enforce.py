@@ -121,8 +121,9 @@ def test_an_ownerless_agent_job_is_refused_under_enforce(monkeypatch):
     job = _job()
     assert job["owner_email"] == ""
 
-    with pytest.raises(s.CronJobOwnerRefused):
-        s.run_one_job(_get(job["id"]))
+    # Processed, like any failed run: the refusal is recorded on the job, so
+    # the caller (ticker, provider, cronjob tool) has nothing left to handle.
+    assert s.run_one_job(_get(job["id"])) is True
 
     assert calls == [], "the agent must not run"
     stored = _get(job["id"])
@@ -145,7 +146,8 @@ def test_the_refusal_text_is_plain_and_names_no_internals(monkeypatch):
     _patch_run(monkeypatch)
     job = _job()
     with pytest.raises(s.CronJobOwnerRefused) as exc:
-        s.run_one_job(_get(job["id"]))
+        with s.governed_as_job_owner(_get(job["id"])):
+            pass
     text = str(exc.value)
     assert text == _get(job["id"])["last_error"]
     for word in ("hermes", "Hermes", "governance.yaml", chr(0x2013), chr(0x2014)):
@@ -239,8 +241,7 @@ def test_an_unreadable_policy_refuses_an_ownerless_agent_job(monkeypatch):
     calls = _patch_run(monkeypatch)
     job = _job()
 
-    with pytest.raises(s.CronJobOwnerRefused):
-        s.run_one_job(_get(job["id"]))
+    assert s.run_one_job(_get(job["id"])) is True
     assert calls == []
     stored = _get(job["id"])
     assert stored["last_status"] == "blocked_config"
@@ -253,10 +254,96 @@ def test_an_unreadable_policy_refuses_an_owned_job_and_records_it(monkeypatch):
     calls = _patch_run(monkeypatch)
     job = _job(owner_email="alice@example.test")
 
-    with pytest.raises(s.CronJobOwnerRefused):
-        s.run_one_job(_get(job["id"]))
+    assert s.run_one_job(_get(job["id"])) is True
     assert calls == []
     assert "policy" in _get(job["id"])["last_error"]
+
+
+def test_the_public_gate_still_raises_for_callers_that_run_jobs_themselves(monkeypatch):
+    """The WebUI "Run now" path wraps ``run_job`` in ``governed_as_job_owner``
+    and needs the raise to stop; only ``run_one_job`` swallows it."""
+    _write_policy("enforce")
+    job = _job()
+    with pytest.raises(s.CronJobOwnerRefused):
+        with s.governed_as_job_owner(_get(job["id"])):
+            pytest.fail("the body must not run")
+    assert _get(job["id"])["last_status"] == "blocked_config"
+
+
+def test_a_refused_fire_is_not_logged_as_a_failed_future(monkeypatch, caplog):
+    """The ticker counts a refused fire as processed: the refusal is on the
+    job, so no ERROR "Cron job future failed" traceback per fire."""
+    import logging
+
+    from cron.jobs import _hermes_now, update_job
+
+    _write_policy("enforce")
+    _patch_run(monkeypatch)
+    job = _job()
+    update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(minutes=1)).isoformat()})
+
+    with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+        assert s.tick(verbose=False, sync=True) == 1
+
+    assert not [r for r in caplog.records if "future failed" in r.getMessage()]
+    assert _get(job["id"])["last_status"] == "blocked_config"
+
+
+def test_a_provider_fire_of_a_refused_job_returns_processed(monkeypatch):
+    """``fire_claimed`` (dashboard and API server fires) no longer raises."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
+    job = _job()
+    provider = InProcessCronScheduler()
+    claimed = provider.claim_fire(job["id"], force=True)
+    assert isinstance(claimed, dict)
+
+    assert provider.fire_claimed(claimed) is True
+    assert calls == []
+    stored = _get(job["id"])
+    assert stored["last_status"] == "blocked_config"
+    assert stored.get("fire_claim") is None
+
+
+def test_a_refused_fire_does_not_use_up_a_repeat_limit(monkeypatch):
+    """A refusal is not a run: a job limited to N runs keeps all N for when an
+    administrator has given it an owner."""
+    from cron.jobs import reassign_job_owner
+
+    _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
+    job = _job(repeat=2)
+
+    for _ in range(3):
+        assert s.run_one_job(_get(job["id"])) is True
+    stored = _get(job["id"])
+    assert calls == []
+    assert stored["repeat"]["completed"] == 0
+    assert stored["enabled"] is True
+    assert stored["state"] == "scheduled"
+    assert stored["next_run_at"]
+
+    reassign_job_owner(job["id"], PRINCIPAL, actor="os:test")
+    assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], PRINCIPAL)]
+    assert _get(job["id"])["repeat"]["completed"] == 1
+
+
+def test_a_refused_one_shot_is_not_counted_as_a_run(monkeypatch):
+    """A one-shot has no next occurrence, so it still ends, but the record
+    does not claim that it used its run."""
+    _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
+    job = _job(schedule="in 30m")
+    assert job["schedule"]["kind"] == "once"
+
+    assert s.run_one_job(_get(job["id"])) is True
+    stored = _get(job["id"])
+    assert calls == []
+    assert stored["repeat"]["completed"] == 0
+    assert stored["last_status"] == "blocked_config"
 
 
 def test_the_gate_unbinds_after_the_run(monkeypatch):
@@ -643,8 +730,7 @@ def test_a_profile_store_without_its_own_policy_follows_the_platform(monkeypatch
     with _Profile(root) as profile:
         job = _job()
         assert job["owner_email"] == ""
-        with pytest.raises(s.CronJobOwnerRefused):
-            s.run_one_job(_get(job["id"]))
+        assert s.run_one_job(_get(job["id"])) is True
         stored = _get(job["id"])
     assert calls == []
     assert stored["last_status"] == "blocked_config"
@@ -699,8 +785,7 @@ def test_an_unreadable_platform_config_refuses_an_ownerless_profile_job(monkeypa
     calls = _patch_run_with_mode(monkeypatch)
     with _Profile(root):
         job = _job()
-        with pytest.raises(s.CronJobOwnerRefused):
-            s.run_one_job(_get(job["id"]))
+        assert s.run_one_job(_get(job["id"])) is True
         assert "policy" in _get(job["id"])["last_error"]
     assert calls == []
 

@@ -3410,6 +3410,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    counts_toward_repeat: bool = True,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3421,6 +3422,7 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            counts_toward_repeat=counts_toward_repeat,
         )
 
 
@@ -3515,6 +3517,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    counts_toward_repeat: bool = True,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -3530,6 +3533,11 @@ def _mark_job_run_locked(
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
+
+    ``counts_toward_repeat=False`` records the outcome without using up a
+    repeat limit, for a fire that was refused before anything ran (a job
+    without an owner under governance ``enforce``). The job still moves to
+    its next occurrence, and a one-shot still ends (it has no next one).
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -3600,7 +3608,7 @@ def _mark_job_run_locked(
                         and times > 0
                         and completed > 0
                     )
-                    if not preclaimed_oneshot:
+                    if counts_toward_repeat and not preclaimed_oneshot:
                         completed += 1
                         repeat["completed"] = completed
 
