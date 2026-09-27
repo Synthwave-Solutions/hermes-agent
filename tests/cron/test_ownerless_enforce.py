@@ -1952,6 +1952,56 @@ def test_owned_jobs_are_still_created_under_enforce(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Go-live coupling: an administrator's WebUI chat turn under enforce
+#
+# The WebUI binds no governance context for a bootstrap administrator's chat
+# turn (bind_governed_agent_turn in its api/governance/agent_context.py runs
+# such a turn unbound), so the engine cannot tell that turn from an unmapped
+# gateway sender: under enforce a job the agent schedules there has no owner
+# and is refused. It gets the system principal once the WebUI binds the
+# administrator's resolved context for the turn, the way a mapped gateway
+# administrator or an OWUI administrator already is. Do not switch the policy
+# to enforce before that WebUI change is live, or administrators can no
+# longer schedule a task by asking the agent in WebUI chat.
+# ---------------------------------------------------------------------------
+
+
+def _webui_turn(monkeypatch, user="root@example.test"):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "20260927_120000_abcdef")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", user)
+
+
+def test_an_unbound_webui_admin_turn_cannot_schedule_under_enforce(monkeypatch):
+    from cron.jobs import list_jobs
+    from tools.cronjob_tools import cronjob
+
+    _write_config(PRINCIPAL)
+    _write_policy("enforce", bootstrap_admins=(PRINCIPAL, "root@example.test"))
+    _webui_turn(monkeypatch)
+
+    result = json.loads(cronjob(action="create", prompt="Summarise my inbox", schedule="0 8 * * *", name="brief"))
+    assert result["success"] is False
+    assert "no owner" in result["error"]
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_a_webui_admin_turn_bound_as_administrator_gets_the_principal(monkeypatch):
+    from hermes_cli.dashboard_governance.context import governance_context
+    from tools.cronjob_tools import cronjob
+
+    _write_config(PRINCIPAL)
+    _write_policy("enforce", bootstrap_admins=(PRINCIPAL, "root@example.test"))
+    _webui_turn(monkeypatch)
+
+    with governance_context(_governed("root@example.test", admin=True)):
+        result = json.loads(cronjob(action="create", prompt="Summarise my inbox", schedule="0 8 * * *", name="brief"))
+    assert result["success"] is True, result
+    assert _get(result["job_id"])["owner_email"] == PRINCIPAL
+    assert _get(result["job_id"])["deliver"] == "origin"
+
+
+# ---------------------------------------------------------------------------
 # An enforced platform policy is the floor for every named profile store
 #
 # A named profile's config.yaml chose its own cron policy. The loader reads
