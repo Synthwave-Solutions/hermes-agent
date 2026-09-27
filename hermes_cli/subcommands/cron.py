@@ -26,10 +26,12 @@ def _cli_actor() -> str:
 def _stamping_system_principal(cmd_cron: Callable) -> Callable:
     """Wrap the create handler so the new job gets ``cron.system_principal``.
 
-    ``hermes cron create`` is the operator at the host shell, outside any
+    ``hermes cron create`` at the host shell is the operator, outside any
     governed session; without an owner the job would be refused under
-    governance ``enforce``. A governed session's own address still wins
-    (see ``cron.jobs._resolve_creating_owner``).
+    governance ``enforce``. Run from a governed person's shell (their
+    terminal carries ``HERMES_DWD_IDENTITY``) the job is that person's, or
+    the create is refused; it never gets the principal (see
+    ``cron.jobs._resolve_creating_owner``).
     """
 
     def _create_as_system_principal(args):

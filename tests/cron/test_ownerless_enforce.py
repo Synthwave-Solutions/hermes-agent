@@ -7,7 +7,8 @@ refused and the refusal is recorded on the job, its execution and the
 incident store. Jobs owned by the configured system principal
 (``cron.system_principal``) run under that principal's governance like any
 other owner. Jobs made at the CLI, or by a governed administrator, are stamped
-with the system principal so they do not end up ownerless.
+with the system principal so they do not end up ownerless; a job made in a
+governed person's shell is theirs and never the principal's.
 """
 
 from __future__ import annotations
@@ -385,6 +386,175 @@ def test_hermes_cron_create_without_a_principal_stays_ownerless():
     _cli(["cron", "create", "every 1h", "Summarise the inbox", "--name", "cli job"])
     (job,) = [j for j in list_jobs(include_disabled=True) if j["name"] == "cli job"]
     assert job["owner_email"] == ""
+
+
+def test_an_admin_behind_a_bot_ceiling_does_not_get_the_principal():
+    """A principal-owned job runs as an administrator, without the bot's
+    ceiling. The session was narrower than that, so the job stays ownerless
+    (and enforce refuses it) instead of widening to the principal."""
+    from dataclasses import replace
+
+    from hermes_cli.dashboard_governance.context import governance_context
+    from hermes_cli.dashboard_governance.models import (
+        EffectiveAccess,
+        GovernanceSubject,
+        GrantSet,
+    )
+
+    _write_config(PRINCIPAL)
+    ceiling = EffectiveAccess(
+        subject=GovernanceSubject(email="bot@example.test"),
+        mode="enforce",
+        roles=frozenset({"bot"}),
+        grants=GrantSet(tools=frozenset({"web_search"})),
+    )
+    ctx = replace(
+        _governed("root@example.test", admin=True),
+        bot_access_ceiling=ceiling,
+        bot_access_check=lambda: True,
+    )
+    with governance_context(ctx):
+        job = _job()
+    assert job["owner_email"] == ""
+
+
+def test_an_admin_turn_continuing_a_non_admin_envelope_does_not_get_the_principal():
+    from dataclasses import replace
+
+    from hermes_cli.dashboard_governance.context import (
+        governance_context,
+        serialize_context_for_env,
+    )
+
+    _write_config(PRINCIPAL)
+    narrower = serialize_context_for_env(_governed("root@example.test"))
+    ctx = replace(
+        _governed("root@example.test", admin=True),
+        continuation_contexts=(narrower,),
+    )
+    with governance_context(ctx):
+        job = _job()
+    assert job["owner_email"] == ""
+
+
+# ---------------------------------------------------------------------------
+# A governed person's shell never gets the system principal
+#
+# tools/environments/local.py gives every child process of a governed
+# non-admin session under enforce HERMES_DWD_IDENTITY, but no governance
+# context. `hermes cron create` in that shell is that person, not the operator
+# at the host shell, so the job must be theirs (or refused), never the
+# administrator principal's.
+# ---------------------------------------------------------------------------
+
+MALLORY = "mallory@example.test"
+
+
+def _governed_shell(monkeypatch, identity=MALLORY):
+    _write_config(PRINCIPAL)
+    _write_policy("enforce", users={MALLORY: {"roles": ["tech_lead"]}})
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", identity)
+
+
+@pytest.mark.parametrize("verb", ["create", "add"])
+def test_hermes_cron_create_in_a_governed_shell_belongs_to_that_person(monkeypatch, capsys, verb):
+    from cron.jobs import list_jobs
+    from hermes_cli.dashboard_governance.context import current_governance_context
+
+    _governed_shell(monkeypatch, "Mallory@Example.Test")
+    assert current_governance_context() is None, "the shell has no in-process context"
+
+    assert _cli(["cron", verb, "every 1h", "Read every mailbox", "--name", "shell job"]) == 0
+    assert "Created job" in capsys.readouterr().out
+    (job,) = [j for j in list_jobs(include_disabled=True) if j["name"] == "shell job"]
+    assert job["owner_email"] == MALLORY
+    assert job["owner_email"] != PRINCIPAL
+
+
+@pytest.mark.parametrize("identity", ["unresolved-identity", "not an address", "a@b@c"])
+def test_hermes_cron_create_in_a_shell_with_an_unusable_identity_is_refused(monkeypatch, capsys, identity):
+    from cron.jobs import list_jobs
+
+    _governed_shell(monkeypatch, identity)
+
+    assert _cli(["cron", "create", "every 1h", "Read every mailbox", "--name", "shell job"]) == 1
+    assert "no verified account" in capsys.readouterr().out
+    assert list_jobs(include_disabled=True) == []
+
+
+@pytest.mark.parametrize("identity", ["", "   "])
+def test_an_empty_shell_identity_is_the_operator(monkeypatch, identity):
+    from cron.jobs import system_principal_create_scope
+
+    _governed_shell(monkeypatch, identity)
+    with system_principal_create_scope():
+        assert _job()["owner_email"] == PRINCIPAL
+
+
+def test_the_cli_scope_never_stamps_the_principal_in_a_governed_shell(monkeypatch):
+    from cron.jobs import system_principal_create_scope
+
+    _governed_shell(monkeypatch)
+    with system_principal_create_scope():
+        job = _job()
+    assert job["owner_email"] == MALLORY
+
+
+def test_the_cli_scope_refuses_a_shell_whose_identity_is_unresolved(monkeypatch):
+    from cron.jobs import list_jobs, system_principal_create_scope
+
+    _governed_shell(monkeypatch, "unresolved-identity")
+    with system_principal_create_scope(), pytest.raises(ValueError, match="no verified account"):
+        _job()
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_a_governed_shell_under_an_admin_context_still_owns_its_job(monkeypatch):
+    """The shell identity marks a governed non-admin. An administrator context
+    bound in the same process does not turn the job into the principal's."""
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    _governed_shell(monkeypatch)
+    with governance_context(_governed("root@example.test", admin=True)):
+        job = _job()
+    assert job["owner_email"] == MALLORY
+
+
+@pytest.mark.parametrize("claimed", [PRINCIPAL, "alice@example.test"])
+def test_a_governed_shell_cannot_give_its_job_to_someone_else(monkeypatch, claimed):
+    from cron.jobs import list_jobs, system_principal_create_scope
+
+    _governed_shell(monkeypatch)
+    with system_principal_create_scope(), pytest.raises(ValueError, match="own account"):
+        _job(owner_email=claimed)
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_a_governed_shell_and_a_different_governed_context_conflict(monkeypatch):
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    _governed_shell(monkeypatch)
+    with governance_context(_governed("alice@example.test")), pytest.raises(ValueError):
+        _job()
+
+
+def test_a_governed_shell_may_name_itself_as_owner(monkeypatch):
+    _governed_shell(monkeypatch)
+    assert _job(owner_email="MALLORY@example.test")["owner_email"] == MALLORY
+
+
+def test_a_job_made_in_a_governed_shell_fires_as_that_person(monkeypatch):
+    """End to end: never as the administrator principal."""
+    from cron.jobs import list_jobs
+
+    _governed_shell(monkeypatch)
+    _cli(["cron", "create", "every 1h", "Read every mailbox", "--name", "shell job"])
+    monkeypatch.delenv("HERMES_DWD_IDENTITY")  # the ticker is not that shell
+    calls = _patch_run(monkeypatch)
+    (job,) = [j for j in list_jobs(include_disabled=True) if j["name"] == "shell job"]
+
+    assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], MALLORY)]
 
 
 # ---------------------------------------------------------------------------

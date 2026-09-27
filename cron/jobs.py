@@ -2230,6 +2230,22 @@ _OWNER_ADMIN_ONLY_ERROR = (
     "is not available inside a governed session."
 )
 
+_NO_VERIFIED_ACCOUNT_ERROR = (
+    "Cannot schedule a job for this session: no verified account to run it as. "
+    "Ask your admin."
+)
+
+_FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR = (
+    "A scheduled task made in this session always runs as your own account; "
+    "it cannot be given to another account."
+)
+
+# Set by tools/environments/local.py (``_inject_dwd_identity_env``) on every
+# child process of a governed non-admin session under ``enforce``: their
+# terminal, and the scripts of their cron jobs. It carries the person's
+# address, or "unresolved-identity" when their address could not be read.
+_GOVERNED_SHELL_IDENTITY_ENV = "HERMES_DWD_IDENTITY"
+
 
 def normalize_owner_identity(value: Any) -> str:
     """Return ``value`` as a canonical owner address, or raise ValueError.
@@ -2291,7 +2307,7 @@ def ensure_owner_admin_caller() -> None:
     re-own a job (to themselves or to anyone else) from inside their own
     session. The operator at the host shell and governed administrators pass.
     """
-    if str(os.environ.get("HERMES_DWD_IDENTITY") or "").strip():
+    if str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip():
         raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
@@ -2321,8 +2337,10 @@ def system_principal_create_scope():
 
     Used by ``hermes cron create``: the operator at the host shell is outside
     any governed session, so the job would otherwise have no owner and be
-    refused under governance ``enforce``. An explicit owner, and the address
-    of a governed session, still win over the principal.
+    refused under governance ``enforce``. It never applies to a governed
+    person: an explicit owner, the address of a governed session and the
+    address of a governed shell (``HERMES_DWD_IDENTITY``) all win over the
+    principal (see ``_resolve_creating_owner``).
     """
     token = _SYSTEM_PRINCIPAL_CREATE_SCOPE.set(True)
     try:
@@ -2331,32 +2349,80 @@ def system_principal_create_scope():
         _SYSTEM_PRINCIPAL_CREATE_SCOPE.reset(token)
 
 
-def _creating_session_is_enforced_admin() -> bool:
-    """True for a governed administrator's session under ``enforce``."""
+def _governed_shell_identity() -> Optional[str]:
+    """The governed person whose shell (or cron script) this process is.
+
+    None when ``HERMES_DWD_IDENTITY`` is unset or blank: the operator at the
+    host shell, an administrator's shell, or an ungoverned process. A set
+    value is a governed non-admin under ``enforce`` (see
+    ``_GOVERNED_SHELL_IDENTITY_ENV``); when it is not a usable address
+    ("unresolved-identity") the caller is governed but we cannot tell as
+    whom, so ValueError refuses the create instead of guessing.
+    """
+    raw = str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip()
+    if not raw:
+        return None
     try:
-        from hermes_cli.dashboard_governance.context import current_governance_context
+        return normalize_owner_identity(raw)
+    except ValueError:
+        raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR) from None
+
+
+def _creating_session_is_enforced_admin() -> bool:
+    """True for a governed administrator's session under ``enforce``.
+
+    Only when nothing narrower applies: a principal-owned job runs with the
+    principal's (administrator) rights, so a session held down by a bot
+    ceiling or by a continuation envelope of a non-admin does not qualify.
+    Its job stays ownerless and ``enforce`` refuses it, rather than running
+    wider than the session that made it. Anything unreadable is False.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
         from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
 
         ctx = current_governance_context()
         if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
             return False
-        return dwd_identity_for(ctx.access) is None
-    except ImportError:
+        for bound in policy_contexts(ctx):
+            if getattr(bound, "bot_access_ceiling", None) is not None:
+                return False
+            if getattr(bound.access, "mode", "") != "enforce":
+                continue
+            if dwd_identity_for(bound.access) is not None:  # None means administrator
+                return False
+        return True
+    except Exception:
+        logger.debug("cron: could not read the creating session's envelopes", exc_info=True)
         return False
 
 
 def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     """The owner stamped on a new job.
 
-    In order: an explicit ``owner_email``; the governed person creating it
-    (``_creating_owner_email``); the configured system principal when the
-    creator is the CLI operator (``system_principal_create_scope``) or a
-    governed administrator under ``enforce``. Anyone else (an ungoverned
-    gateway sender, a direct library call) still gets an ownerless job, which
-    runs as before outside ``enforce`` and is refused under it.
+    A governed shell (``_governed_shell_identity``) always owns what it
+    creates: an explicit owner or an in-process governed person that differs
+    from it is refused, and the system principal is never stamped for it.
+    Otherwise, in order: an explicit ``owner_email``; the governed person
+    creating it (``_creating_owner_email``); the configured system principal
+    when the creator is the CLI operator (``system_principal_create_scope``)
+    or a governed administrator under ``enforce`` with nothing narrower
+    applied. Anyone else (an ungoverned gateway sender, a direct library
+    call) still gets an ownerless job, which runs as before outside
+    ``enforce`` and is refused under it.
     """
-    if owner_email:
-        return str(owner_email).strip().lower()
+    explicit = str(owner_email).strip().lower() if owner_email else ""
+    shell_owner = _governed_shell_identity()
+    if shell_owner is not None:
+        for claimed in (explicit, _creating_owner_email()):
+            if claimed and claimed != shell_owner:
+                raise ValueError(_FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR)
+        return shell_owner
+    if explicit:
+        return explicit
     owner = _creating_owner_email()
     if owner:
         return owner
@@ -2410,10 +2476,7 @@ def _creating_owner_email() -> str:
         # A governed session whose address we cannot read would otherwise
         # produce an ownerless job, which is the very thing this prevents:
         # such a job runs unbound. Refuse the create instead.
-        raise ValueError(
-            "Cannot schedule a job for this session: no verified account to run it as. "
-            "Ask your admin."
-        )
+        raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR)
     return owner
 
 
