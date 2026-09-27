@@ -7063,6 +7063,80 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
 
 
+_OWNERLESS_FIRE_REFUSAL = (
+    "Not run: this scheduled task has no owner and access control is "
+    "enforced. An administrator must assign an owner before it can run."
+)
+_POLICY_UNAVAILABLE_FIRE_REFUSAL = (
+    "Not run: the access policy could not be read, so this scheduled task "
+    "cannot be checked. An administrator must fix the policy before it can run."
+)
+
+
+class CronJobOwnerRefused(PermissionError):
+    """A fire refused by ``_governed_as_job_owner``.
+
+    The refusal is already recorded on the job, its execution and the
+    incident store when this is raised; callers only need to stop.
+    """
+
+
+def _ownerless_fire_refusal(job: dict) -> Optional[str]:
+    """Why an ownerless job may not fire, or None when it may run unbound.
+
+    Only agent jobs under governance ``enforce`` are refused: a ``no_agent``
+    script has no agent turn to govern, and outside ``enforce`` ownerless jobs
+    keep running as before. A policy that cannot be read fails closed.
+    """
+    if job.get("no_agent"):
+        return None
+    try:
+        from hermes_cli.dashboard_governance.loader import load_governance_policy
+    except ImportError:
+        return None
+    try:
+        policy = load_governance_policy()
+    except Exception:
+        logger.warning(
+            "Job '%s': governance policy unreadable; refusing the ownerless fire",
+            job.get("id"),
+            exc_info=True,
+        )
+        return _POLICY_UNAVAILABLE_FIRE_REFUSAL
+    if getattr(policy, "mode", "off") != "enforce":
+        return None
+    return _OWNERLESS_FIRE_REFUSAL
+
+
+def _record_refused_fire(job: dict, reason: str) -> None:
+    """Record a refused fire where people look: job, execution, incidents.
+
+    Best-effort per store so one failing bookkeeping write never hides the
+    others. ``mark_job_run`` clears the fire claim and advances a recurring
+    job to its next occurrence, fenced by the claim owner like a normal run.
+    """
+    job_id = str(job.get("id") or "")
+    logger.warning(
+        "Job '%s' (ID: %s): %s", job.get("name", job_id), job_id, reason
+    )
+    _upsert_incident_for_failure(job, reason)
+    claim = job.get("fire_claim")
+    mark_kwargs = {"status": "blocked_config"}
+    if isinstance(claim, dict):
+        mark_kwargs["expected_fire_owner"] = str(claim.get("by") or "")
+    try:
+        mark_job_run(job_id, False, reason, **mark_kwargs)
+    except Exception:
+        logger.warning("Job '%s': could not record the refused fire", job_id, exc_info=True)
+    try:
+        execution_id = job.get("execution_id") or create_execution(
+            job_id, source="direct"
+        )["id"]
+        finish_execution(execution_id, success=False, error=reason)
+    except Exception:
+        logger.debug("Job '%s': could not record the refused execution", job_id, exc_info=True)
+
+
 @contextlib.contextmanager
 def _governed_as_job_owner(job: dict):
     """Run a fire under the governance of the person who created the job.
@@ -7070,15 +7144,27 @@ def _governed_as_job_owner(job: dict):
     A cron job outlives the conversation that made it. Without this the run
     has no identity at all, so a job a governed user created would act with
     the owner's full rights, including every Google account in the domain
-    (29-08-2026). Jobs without an owner (everything made before this, and
-    everything an admin or the CLI makes) run exactly as before.
+    (29-08-2026).
+
+    Jobs without an owner run unbound, exactly as before, unless the policy
+    is in ``enforce`` mode: then an ownerless agent job is refused, because
+    running it unbound is running it with everyone's rights. Jobs made at the
+    CLI or by an administrator are stamped with ``cron.system_principal``
+    (``cron.jobs._resolve_creating_owner``) and older ones are migrated with
+    ``scripts/cron_assign_system_owner.py``; the principal then governs them
+    like any other owner.
 
     An owner whose grants cannot be resolved stops the run rather than
-    falling back to unrestricted: the failure is recorded on the job, which
-    is visible, where a silent fallback would not be.
+    falling back to unrestricted. Every refusal is recorded on the job, its
+    execution and the incident store (visible, where a silent fallback would
+    not be) and raised as ``CronJobOwnerRefused``.
     """
     owner = str(job.get("owner_email") or "").strip().lower()
     if not owner:
+        refusal = _ownerless_fire_refusal(job)
+        if refusal:
+            _record_refused_fire(job, refusal)
+            raise CronJobOwnerRefused(refusal)
         yield
         return
     from hermes_cli.dashboard_governance.context import (
@@ -7090,8 +7176,18 @@ def _governed_as_job_owner(job: dict):
     from hermes_cli.dashboard_governance.models import GovernanceSubject
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
 
-    policy = load_governance_policy()
-    access = resolve_effective_access(policy, GovernanceSubject(email=owner))
+    try:
+        policy = load_governance_policy()
+        access = resolve_effective_access(policy, GovernanceSubject(email=owner))
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': governance for owner %s could not be resolved",
+            job.get("id"),
+            owner,
+            exc_info=True,
+        )
+        _record_refused_fire(job, _POLICY_UNAVAILABLE_FIRE_REFUSAL)
+        raise CronJobOwnerRefused(_POLICY_UNAVAILABLE_FIRE_REFUSAL) from exc
     token = bind_governance_context(
         DashboardGovernanceContext(
             subject=access.subject,

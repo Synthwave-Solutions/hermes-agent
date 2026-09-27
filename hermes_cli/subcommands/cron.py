@@ -23,6 +23,25 @@ def _cli_actor() -> str:
     return f"os:{user or 'unknown'}"
 
 
+def _stamping_system_principal(cmd_cron: Callable) -> Callable:
+    """Wrap the create handler so the new job gets ``cron.system_principal``.
+
+    ``hermes cron create`` is the operator at the host shell, outside any
+    governed session; without an owner the job would be refused under
+    governance ``enforce``. A governed session's own address still wins
+    (see ``cron.jobs._resolve_creating_owner``).
+    """
+
+    def _create_as_system_principal(args):
+        from cron.jobs import system_principal_create_scope
+
+        with system_principal_create_scope():
+            return cmd_cron(args)
+
+    _create_as_system_principal.__wrapped__ = cmd_cron
+    return _create_as_system_principal
+
+
 def cmd_cron_reassign_owner(args) -> int:
     """``hermes cron reassign-owner``: the audited admin path for owner changes.
 
@@ -95,6 +114,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create = cron_subparsers.add_parser(
         "create", aliases=["add"], help="Create a scheduled job"
     )
+    # Jobs made here get cron.system_principal as owner when no governed
+    # session owns them (subparser defaults win over the cron parser's func).
+    cron_create.set_defaults(func=_stamping_system_principal(cmd_cron))
     cron_create.add_argument(
         "schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'"
     )

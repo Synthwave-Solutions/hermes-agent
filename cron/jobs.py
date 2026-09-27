@@ -2309,6 +2309,62 @@ def ensure_owner_admin_caller() -> None:
         raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
 
 
+_SYSTEM_PRINCIPAL_CREATE_SCOPE: ContextVar[bool] = ContextVar(
+    "cron_system_principal_create_scope",
+    default=False,
+)
+
+
+@contextlib.contextmanager
+def system_principal_create_scope():
+    """Give jobs created in this block to ``cron.system_principal``.
+
+    Used by ``hermes cron create``: the operator at the host shell is outside
+    any governed session, so the job would otherwise have no owner and be
+    refused under governance ``enforce``. An explicit owner, and the address
+    of a governed session, still win over the principal.
+    """
+    token = _SYSTEM_PRINCIPAL_CREATE_SCOPE.set(True)
+    try:
+        yield
+    finally:
+        _SYSTEM_PRINCIPAL_CREATE_SCOPE.reset(token)
+
+
+def _creating_session_is_enforced_admin() -> bool:
+    """True for a governed administrator's session under ``enforce``."""
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        ctx = current_governance_context()
+        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+            return False
+        return dwd_identity_for(ctx.access) is None
+    except ImportError:
+        return False
+
+
+def _resolve_creating_owner(owner_email: Optional[str]) -> str:
+    """The owner stamped on a new job.
+
+    In order: an explicit ``owner_email``; the governed person creating it
+    (``_creating_owner_email``); the configured system principal when the
+    creator is the CLI operator (``system_principal_create_scope``) or a
+    governed administrator under ``enforce``. Anyone else (an ungoverned
+    gateway sender, a direct library call) still gets an ownerless job, which
+    runs as before outside ``enforce`` and is refused under it.
+    """
+    if owner_email:
+        return str(owner_email).strip().lower()
+    owner = _creating_owner_email()
+    if owner:
+        return owner
+    if _SYSTEM_PRINCIPAL_CREATE_SCOPE.get() or _creating_session_is_enforced_admin():
+        return cron_system_principal()
+    return ""
+
+
 def owner_audit_file() -> Path:
     """The owner change audit log of the active cron store."""
     return _current_cron_store().cron_dir / OWNER_AUDIT_FILE_NAME
@@ -2599,7 +2655,8 @@ def create_job(
         "workdir": normalized_workdir,
         # The person this job runs as. Every fire binds their governance
         # context, so a job can never do more than the person who made it.
-        "owner_email": (str(owner_email).strip().lower() if owner_email else _creating_owner_email()),
+        # Immutable after creation (see _IMMUTABLE_JOB_FIELDS).
+        "owner_email": _resolve_creating_owner(owner_email),
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
