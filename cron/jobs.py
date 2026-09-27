@@ -2253,6 +2253,16 @@ _FOREIGN_CONTEXT_SOURCE_ERROR = (
     "'{ref}' is not one of them."
 )
 
+_OWNERLESS_CREATE_REFUSAL = (
+    "Cannot schedule this task: access control is enforced and the task would "
+    "have no owner to run as, so it would never run. Ask your admin."
+)
+
+_POLICY_UNAVAILABLE_CREATE_REFUSAL = (
+    "Cannot schedule this task: the access policy could not be read, so the "
+    "task could not be checked. Ask your admin."
+)
+
 # Set by tools/environments/local.py (``_inject_dwd_identity_env``) on every
 # child process of a governed non-admin session under ``enforce``: their
 # terminal, and the scripts of their cron jobs. It carries the person's
@@ -2579,6 +2589,27 @@ def _check_context_sources(refs: Any, jobs: List[Dict[str, Any]], identities: Op
             raise CronJobAccessDenied(_FOREIGN_CONTEXT_SOURCE_ERROR.format(ref=text))
 
 
+def _ownerless_create_refusal() -> Optional[str]:
+    """Why an ownerless agent job may not be created here, or None.
+
+    The fire gate (``cron.scheduler._ownerless_fire_refusal``) refuses such a
+    job on every fire under ``enforce``, and when the policy cannot be read;
+    creating it would only hide that. Same policy, same rule.
+    """
+    try:
+        import hermes_cli.dashboard_governance.loader  # noqa: F401 (governance installed?)
+    except ImportError:
+        return None
+    try:
+        policy = load_cron_governance_policy()
+    except Exception:
+        logger.warning("cron: governance policy unreadable; refusing an ownerless create", exc_info=True)
+        return _POLICY_UNAVAILABLE_CREATE_REFUSAL
+    if getattr(policy, "mode", "off") != "enforce":
+        return None
+    return _OWNERLESS_CREATE_REFUSAL
+
+
 _SYSTEM_PRINCIPAL_CREATE_SCOPE: ContextVar[bool] = ContextVar(
     "cron_system_principal_create_scope",
     default=False,
@@ -2595,7 +2626,8 @@ def system_principal_create_scope():
     person: an explicit owner, the address of a governed session and the
     address of a governed shell (``HERMES_DWD_IDENTITY``) all win over the
     principal, and below any other agent session (``_is_operator_shell``)
-    the job stays ownerless (see ``_resolve_creating_owner``).
+    the job gets no owner, so an agent job is refused under ``enforce``
+    (see ``_resolve_creating_owner``).
     """
     token = _SYSTEM_PRINCIPAL_CREATE_SCOPE.set(True)
     try:
@@ -2687,8 +2719,9 @@ def _creating_session_is_enforced_admin() -> bool:
     Only when nothing narrower applies: a principal-owned job runs with the
     principal's (administrator) rights, so a session held down by a bot
     ceiling or by a continuation envelope of a non-admin does not qualify.
-    Its job stays ownerless and ``enforce`` refuses it, rather than running
-    wider than the session that made it. Anything unreadable is False.
+    Its job gets no owner, so ``enforce`` refuses to create it, rather than
+    let it run wider than the session that made it. Anything unreadable is
+    False.
     """
     try:
         from hermes_cli.dashboard_governance.context import (
@@ -2728,9 +2761,8 @@ def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     marker, no governance context), or, outside the CLI, a governed
     administrator under ``enforce`` with nothing narrower applied. Anyone
     else (the CLI below an agent session, an ungoverned gateway sender, a
-    direct library call) still gets an ownerless job, which runs as before
-    outside ``enforce`` and is refused under it until an administrator
-    assigns an owner.
+    direct library call) gets no owner: ``create_job`` then refuses an agent
+    job under ``enforce`` and creates it ownerless otherwise.
     """
     explicit = str(owner_email).strip().lower() if owner_email else ""
     governed = _governed_caller_identities()
@@ -2980,6 +3012,16 @@ def create_job(
         no_agent=normalized_no_agent,
     )
 
+    # The person this job runs as. Every fire binds their governance context,
+    # so a job can never do more than the person who made it. Immutable after
+    # creation (see _IMMUTABLE_JOB_FIELDS). Under enforce an agent job without
+    # an owner would be refused on every fire, so it is not created at all.
+    job_owner = _resolve_creating_owner(owner_email)
+    if not job_owner and not normalized_no_agent:
+        refusal = _ownerless_create_refusal()
+        if refusal:
+            raise ValueError(refusal)
+
     next_run_at = compute_next_run(parsed_schedule)
     if parsed_schedule.get("kind") == "once" and next_run_at is None:
         run_at = parsed_schedule.get("run_at") or schedule
@@ -3038,10 +3080,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
-        # The person this job runs as. Every fire binds their governance
-        # context, so a job can never do more than the person who made it.
-        # Immutable after creation (see _IMMUTABLE_JOB_FIELDS).
-        "owner_email": _resolve_creating_owner(owner_email),
+        # The person this job runs as (resolved above).
+        "owner_email": job_owner,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the

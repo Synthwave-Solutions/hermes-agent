@@ -155,6 +155,22 @@ def test_the_legacy_webui_post_create_origin_stamp_is_refused():
     assert "category" not in stored, "the refused update applies nothing"
 
 
+def test_the_legacy_webui_create_leaves_nothing_under_enforce():
+    """Under enforce the legacy flow now stops at create_job, because the job
+    would have no owner: the Tasks panel still answers an error, but no
+    ownerless job is left behind. Outside enforce the job above is still
+    left, so the WebUI fix stays a go-live precondition."""
+    from cron.jobs import create_job, list_jobs
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "dashboard-governance.yaml").write_text(
+        "version: 1\nmode: enforce\ndefault_effect: deny\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="no owner"):
+        create_job(prompt="Summarise the inbox", schedule="every 1h", deliver="local")
+    assert list_jobs(include_disabled=True) == []
+
+
 def test_the_webui_create_shape_keeps_the_identity_through_its_follow_up_update():
     from cron.jobs import create_job, update_job
 

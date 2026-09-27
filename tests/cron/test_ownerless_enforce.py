@@ -114,6 +114,26 @@ def _get(job_id):
     return get_job(job_id)
 
 
+def _legacy_job(**kw):
+    """An ownerless agent job as older engines stored it.
+
+    Under enforce ``create_job`` no longer makes one (it could never run),
+    but jobs.json still holds them from before, and the fire gate must still
+    refuse them: create the job with an owner, then blank the owner in the
+    store as an older engine would have written it.
+    """
+    from cron.jobs import _jobs_lock, load_jobs, save_jobs
+
+    job = _job(owner_email="legacy-placeholder@example.test", **kw)
+    with _jobs_lock():
+        jobs = load_jobs()
+        for stored in jobs:
+            if stored["id"] == job["id"]:
+                stored["owner_email"] = ""
+        save_jobs(jobs)
+    return _get(job["id"])
+
+
 # ---------------------------------------------------------------------------
 # The fire gate
 # ---------------------------------------------------------------------------
@@ -122,7 +142,7 @@ def _get(job_id):
 def test_an_ownerless_agent_job_is_refused_under_enforce(monkeypatch):
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
     assert job["owner_email"] == ""
 
     # Processed, like any failed run: the refusal is recorded on the job, so
@@ -148,7 +168,7 @@ def test_an_ownerless_agent_job_is_refused_under_enforce(monkeypatch):
 def test_the_refusal_text_is_plain_and_names_no_internals(monkeypatch):
     _write_policy("enforce")
     _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
     result = s.run_job_governed(_get(job["id"]), reason="manual")
     text = result.refusal
     assert text and text == _get(job["id"])["last_error"]
@@ -161,7 +181,7 @@ def test_a_due_ownerless_agent_job_is_refused_by_the_ticker(monkeypatch):
 
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
     update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(minutes=1)).isoformat()})
 
     s.tick(verbose=False, sync=True)
@@ -177,7 +197,7 @@ def test_a_manual_run_of_an_ownerless_job_is_refused_and_recorded_once(monkeypat
 
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
 
     result = json.loads(cronjob(action="run", job_id=job["id"]))
 
@@ -241,7 +261,7 @@ def test_an_unreadable_policy_refuses_an_ownerless_agent_job(monkeypatch):
     applies, so the ownerless job does not run unbound."""
     _write_policy(raw_text="mode: [enforce\n")
     calls = _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
 
     assert s.run_one_job(_get(job["id"])) is True
     assert calls == []
@@ -294,7 +314,7 @@ def test_run_job_governed_refuses_an_ownerless_agent_job_without_raising(monkeyp
 
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
 
     with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
         result = s.run_job_governed(_get(job["id"]), reason="manual")
@@ -325,7 +345,7 @@ def test_an_on_demand_refusal_leaves_the_schedule_alone(monkeypatch, schedule):
     pause or complete the job's own schedule, or use up a repeat."""
     _write_policy("enforce")
     _patch_run(monkeypatch)
-    job = _job(schedule=schedule, repeat=3)
+    job = _legacy_job(schedule=schedule, repeat=3)
     before = _get(job["id"])
 
     assert s.run_job_governed(before, reason="manual").refused
@@ -343,7 +363,7 @@ def test_run_job_governed_can_leave_the_record_to_the_caller(monkeypatch):
 
     _write_policy("enforce")
     _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
     before = _get(job["id"])
 
     result = s.run_job_governed(before, reason="manual", record_refusal=False)
@@ -417,7 +437,7 @@ def test_the_run_result_travels_as_plain_data(monkeypatch):
 
     _write_policy("enforce")
     _patch_run(monkeypatch)
-    refused = s.run_job_governed(_get(_job()["id"]), reason="manual")
+    refused = s.run_job_governed(_get(_legacy_job()["id"]), reason="manual")
 
     data = refused.to_dict()
     assert json.loads(json.dumps(data)) == data
@@ -439,7 +459,7 @@ def test_a_refused_fire_is_not_logged_as_a_failed_future(monkeypatch, caplog):
 
     _write_policy("enforce")
     _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
     update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(minutes=1)).isoformat()})
 
     with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
@@ -458,7 +478,7 @@ def test_a_provider_fire_of_a_refused_job_returns_processed(monkeypatch):
 
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job()
+    job = _legacy_job()
     provider = InProcessCronScheduler()
     claimed = provider.claim_fire(job["id"], force=True)
     assert isinstance(claimed, dict)
@@ -477,7 +497,7 @@ def test_a_refused_fire_does_not_use_up_a_repeat_limit(monkeypatch):
 
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job(repeat=2)
+    job = _legacy_job(repeat=2)
 
     for _ in range(3):
         assert s.run_one_job(_get(job["id"])) is True
@@ -499,7 +519,7 @@ def test_a_refused_recurring_fire_through_the_ticker_keeps_its_repeats(monkeypat
 
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job(repeat=2)
+    job = _legacy_job(repeat=2)
     for _ in range(3):
         update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(minutes=1)).isoformat()})
         assert s.tick(verbose=False, sync=True) == 1
@@ -517,7 +537,7 @@ def test_a_refused_one_shot_is_not_counted_as_a_run(monkeypatch):
     It is paused with the reason instead."""
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
-    job = _job(schedule="in 30m")
+    job = _legacy_job(schedule="in 30m")
     assert job["schedule"]["kind"] == "once"
 
     assert s.run_one_job(_get(job["id"])) is True
@@ -562,7 +582,7 @@ def test_a_refused_one_shot_through_the_ticker_keeps_its_run(monkeypatch):
         return real_claim_dispatch(job_id)
 
     monkeypatch.setattr(s, "claim_dispatch", recording_claim_dispatch)
-    job = _job(schedule="in 30m")
+    job = _legacy_job(schedule="in 30m")
     assert job["repeat"] == {"times": 1, "completed": 0}
     _make_one_shot_due(job["id"])
 
@@ -1089,7 +1109,7 @@ def test_a_profile_store_without_its_own_policy_follows_the_platform(monkeypatch
     root = _platform(location)
     calls = _patch_run_with_mode(monkeypatch)
     with _Profile(root) as profile:
-        job = _job()
+        job = _legacy_job()
         assert job["owner_email"] == ""
         assert s.run_one_job(_get(job["id"])) is True
         stored = _get(job["id"])
@@ -1149,7 +1169,7 @@ def test_a_profile_that_names_a_missing_policy_file_fails_closed(monkeypatch, tm
     with _Profile(root, config=cfg) as profile:
         with pytest.raises(ValueError, match="does not exist"):
             resolve_cron_policy_path(hermes_home=profile, config=cfg)
-        ownerless = _job()
+        ownerless = _legacy_job()
         owned = _job(owner_email="alice@example.test")
         script = _job(prompt="", script="watchdog.sh", no_agent=True)
         for job in (ownerless, owned, script):
@@ -1190,7 +1210,7 @@ def test_an_unreadable_platform_config_refuses_an_ownerless_profile_job(monkeypa
     (root / "config.yaml").write_text("dashboard: [governance\n", encoding="utf-8")
     calls = _patch_run_with_mode(monkeypatch)
     with _Profile(root):
-        job = _job()
+        job = _legacy_job()
         assert s.run_one_job(_get(job["id"])) is True
         assert "policy" in _get(job["id"])["last_error"]
     assert calls == []
@@ -1321,7 +1341,7 @@ def test_the_migration_dry_run_reports_what_apply_would_do(capsys):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce")
-    agent = create_job(prompt="legacy agent", schedule="every 1h")
+    agent = _legacy_job(prompt="legacy agent", schedule="every 1h")
     job_script = create_job(prompt="", script="watchdog.sh", no_agent=True, schedule="every 1h")
     create_job(prompt="owned", schedule="every 1h", owner_email="alice@example.test")
     owners_before = _owners(_home())
@@ -1350,7 +1370,7 @@ def test_the_migration_apply_assigns_the_principal_and_audits(capsys):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce")
-    agent = create_job(prompt="legacy agent", schedule="every 1h")
+    agent = _legacy_job(prompt="legacy agent", schedule="every 1h")
     job_script = create_job(prompt="", script="watchdog.sh", no_agent=True, schedule="every 1h")
     owned = create_job(prompt="owned", schedule="every 1h", owner_email="alice@example.test")
 
@@ -1380,7 +1400,7 @@ def test_the_migration_covers_every_profile(capsys):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce")
-    root_job = create_job(prompt="root", schedule="every 1h")
+    root_job = _legacy_job(prompt="root", schedule="every 1h")
     profile = _make_store(_home() / "profiles" / "worker", [_raw_job("agent2")])
 
     assert script.main(["--apply", "--all-profiles"]) == 0
@@ -1395,7 +1415,7 @@ def test_the_migration_takes_an_explicit_principal(capsys):
     script = _load_script()
     _write_config(None)
     _write_policy("enforce", bootstrap_admins=("ops@example.test",))
-    job = create_job(prompt="legacy", schedule="every 1h")
+    job = _legacy_job(prompt="legacy", schedule="every 1h")
 
     assert script.main(["--apply", "--principal", "Ops@Example.Test"]) == 0
     assert _owners(_home())[job["id"]] == "ops@example.test"
@@ -1420,7 +1440,7 @@ def test_the_migration_refuses_to_apply_when_something_blocks(capsys, setup, mes
 
     script = _load_script()
     setup()
-    job = create_job(prompt="legacy", schedule="every 1h")
+    job = _legacy_job(prompt="legacy", schedule="every 1h")
 
     assert script.main([]) == 1, "the dry run already says apply would be refused"
     assert script.main(["--apply"]) == 1
@@ -1436,7 +1456,7 @@ def test_a_missing_policy_entry_only_warns_outside_enforce(capsys):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("off", bootstrap_admins=())
-    job = create_job(prompt="legacy", schedule="every 1h")
+    job = _legacy_job(prompt="legacy", schedule="every 1h")
 
     assert script.main(["--apply"]) == 0
     assert "no entry in the governance policy" in capsys.readouterr().out
@@ -1449,7 +1469,7 @@ def test_the_migration_warns_about_a_restricted_principal(capsys):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce", bootstrap_admins=(), users={PRINCIPAL: {"roles": ["tech_lead"]}})
-    create_job(prompt="legacy", schedule="every 1h")
+    _legacy_job(prompt="legacy", schedule="every 1h")
 
     assert script.main([]) == 0
     out = capsys.readouterr().out
@@ -1463,7 +1483,7 @@ def test_the_migration_refuses_to_apply_from_a_governed_shell(monkeypatch):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce")
-    job = create_job(prompt="legacy", schedule="every 1h")
+    job = _legacy_job(prompt="legacy", schedule="every 1h")
     monkeypatch.setenv("HERMES_DWD_IDENTITY", "mallory@example.test")
 
     assert script.main(["--apply"]) == 1
@@ -1523,7 +1543,7 @@ def test_the_migration_never_overwrites_an_owner_set_meanwhile():
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce")
-    job = create_job(prompt="legacy", schedule="every 1h")
+    job = _legacy_job(prompt="legacy", schedule="every 1h")
     report = script.inspect_store(_home(), principal_override="", agent_only=False)
     reassign_job_owner(job["id"], "alice@example.test", actor="os:tester")
 
@@ -1584,7 +1604,7 @@ def test_the_migration_checks_the_whole_platform_when_given_one_profile(capsys):
     script = _load_script()
     _write_config(PRINCIPAL)
     _write_policy("enforce")
-    left = create_job(prompt="root legacy", schedule="every 1h")
+    left = _legacy_job(prompt="root legacy", schedule="every 1h")
     profile = _make_store(_home() / "profiles" / "worker", [_raw_job("agent2")])
 
     assert script.main(["--apply", "--hermes-home", str(profile)]) == 1
@@ -1679,3 +1699,111 @@ def test_a_profile_with_its_own_policy_still_belongs_to_its_person(capsys):
 
     assert script.main(["--apply", "--all-profiles"]) == 0
     assert _owners(profile) == {"agent3": MALLORY, "script3": MALLORY}
+
+
+# ---------------------------------------------------------------------------
+# Under enforce an ownerless agent job is refused when it is created
+#
+# Such a job is refused on every fire, so creating it only hides the problem:
+# every surface that creates one without an owner (the engine dashboard, the
+# cronjob tool in an operator process such as the interactive CLI, the TUI,
+# gateway chats and the API server, `hermes cron create` below an agent
+# session) now gets a plain error instead of a job that never runs.
+# ---------------------------------------------------------------------------
+
+
+def test_an_ownerless_agent_job_cannot_be_created_under_enforce():
+    from cron.jobs import create_job, list_jobs
+
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    with pytest.raises(ValueError, match="no owner") as exc:
+        create_job(prompt="Summarise the inbox", schedule="every 1h")
+    for word in ("hermes", "Hermes", "governance", "principal", chr(0x2013), chr(0x2014)):
+        assert word not in str(exc.value)
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_the_cronjob_tool_in_an_operator_process_reports_the_refusal():
+    from cron.jobs import list_jobs
+    from tools.cronjob_tools import cronjob
+
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    result = json.loads(cronjob(action="create", schedule="every 1h", prompt="daily summary", name="op-tool"))
+
+    assert result["success"] is False
+    assert "no owner" in result["error"]
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_hermes_cron_create_below_a_session_is_refused_under_enforce(monkeypatch, capsys):
+    from cron.jobs import list_jobs
+
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+
+    assert _cli(["cron", "create", "every 1h", "Read every mailbox", "--name", "webui shell job"]) == 1
+    assert "no owner" in capsys.readouterr().out
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_the_engine_dashboard_create_reports_the_refusal(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    from hermes_cli import profiles, web_server
+
+    default_home = tmp_path / ".hermes"
+    (default_home / "cron").mkdir(parents=True)
+    (default_home / "config.yaml").write_text(yaml.safe_dump({"model": "test-model"}), encoding="utf-8")
+    (default_home / "dashboard-governance.yaml").write_text(
+        yaml.safe_dump({"version": 1, "mode": "enforce", "default_effect": "deny", "bootstrap_admins": [PRINCIPAL]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: default_home / "profiles")
+
+    with pytest.raises(HTTPException) as exc:
+        web_server._create_cron_job_sync(
+            web_server.CronJobCreate(prompt="Summarise the inbox", schedule="every 1h"), profile="default"
+        )
+    assert exc.value.status_code == 400
+    assert "no owner" in exc.value.detail
+    assert web_server._call_cron_for_profile("default", "list_jobs", True) == []
+
+
+@pytest.mark.parametrize("mode", ["off", "report_only", None])
+def test_an_ownerless_agent_job_is_still_created_outside_enforce(mode):
+    if mode is not None:
+        _write_policy(mode)
+    assert _job()["owner_email"] == ""
+
+
+def test_an_ownerless_script_job_is_still_created_under_enforce():
+    _write_policy("enforce")
+    assert _job(prompt="", script="watchdog.sh", no_agent=True)["owner_email"] == ""
+
+
+def test_an_unreadable_policy_refuses_an_ownerless_create():
+    from cron.jobs import list_jobs
+
+    _write_policy(raw_text="mode: [enforce\n")
+    with pytest.raises(ValueError, match="policy"):
+        _job()
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_owned_jobs_are_still_created_under_enforce(monkeypatch):
+    from cron.jobs import system_principal_create_scope
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    assert _job(owner_email="alice@example.test")["owner_email"] == "alice@example.test"
+    with system_principal_create_scope():
+        assert _job()["owner_email"] == PRINCIPAL
+    with governance_context(_governed("alice@example.test")):
+        assert _job()["owner_email"] == "alice@example.test"
+    with governance_context(_governed("root@example.test", admin=True)):
+        assert _job()["owner_email"] == PRINCIPAL
