@@ -623,6 +623,111 @@ def test_the_gate_unbinds_after_the_run(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# A governed non-admin tick never touches another person's due jobs
+#
+# The fire claim is refused for a foreign job, so if the due scan and the
+# occurrence advance ran for a foreign job first, the occurrence would be lost
+# and (for a one-shot) its run_claim wedged for the claim TTL. A governed
+# caller who reaches the tick (``hermes cron tick`` in their governed shell,
+# or a governed in-process context) must find no foreign job due at all; the
+# ungoverned gateway tick then still runs it at its preserved occurrence.
+# ---------------------------------------------------------------------------
+
+
+def _make_recurring_due(job_id, *, seconds_ago=30):
+    from cron.jobs import _hermes_now, load_jobs, save_jobs
+
+    due_at = (_hermes_now() - timedelta(seconds=seconds_ago)).isoformat()
+    jobs = load_jobs()
+    for record in jobs:
+        if record["id"] == job_id:
+            record["next_run_at"] = due_at
+    save_jobs(jobs)
+
+
+@pytest.mark.parametrize("governed_as", ["shell", "context"])
+def test_a_governed_tick_leaves_other_peoples_due_jobs_untouched(monkeypatch, governed_as):
+    from cron.jobs import create_job, get_job
+
+    _write_policy(
+        "enforce",
+        users={
+            "alice@example.test": {"roles": ["tech_lead"]},
+            MALLORY: {"roles": ["tech_lead"]},
+        },
+    )
+    _write_config()
+    calls = _patch_run(monkeypatch)
+
+    recurring = create_job(
+        prompt="Alice inbox",
+        schedule="every 1h",
+        owner_email="alice@example.test",
+        name="alice-recurring",
+    )
+    one_shot = create_job(
+        prompt="Alice reminder",
+        schedule="in 30m",
+        owner_email="alice@example.test",
+        name="alice-once",
+    )
+    _make_recurring_due(recurring["id"])
+    _make_one_shot_due(one_shot["id"])
+    before_next = get_job(recurring["id"])["next_run_at"]
+
+    if governed_as == "shell":
+        monkeypatch.setenv("HERMES_DWD_IDENTITY", MALLORY)
+        assert s.tick(verbose=False, sync=True) == 0
+        monkeypatch.delenv("HERMES_DWD_IDENTITY")
+    else:
+        from hermes_cli.dashboard_governance.context import governance_context
+
+        with governance_context(_governed(MALLORY)):
+            assert s.tick(verbose=False, sync=True) == 0
+
+    # Nothing ran, and neither foreign job was advanced or claimed.
+    assert calls == []
+    assert get_job(recurring["id"])["next_run_at"] == before_next
+    assert get_job(recurring["id"])["last_status"] != "blocked_config"
+    assert get_job(one_shot["id"]).get("run_claim") is None
+    assert get_job(one_shot["id"]).get("fire_claim") is None
+    assert get_job(one_shot["id"])["last_status"] != "blocked_config"
+
+    # The ungoverned gateway tick still runs both, each under alice's
+    # governance, at the occurrence the governed tick left intact.
+    assert s.tick(verbose=False, sync=True) == 2
+    assert sorted(jid for jid, _owner in calls) == sorted([recurring["id"], one_shot["id"]])
+    assert {owner for _jid, owner in calls} == {"alice@example.test"}
+
+
+def test_a_refused_fire_claim_in_the_ticker_releases_the_one_shot_run_claim(monkeypatch):
+    """Defense in depth in the tick worker: if the fire claim is refused after
+    the due scan (the job was reassigned away between scan and claim), the
+    occurrence's execution is finished and a one-shot's ``run_claim`` (stamped
+    by ``get_due_jobs``) is released, so the row is not left claimed for its
+    TTL and the ticker still counts the job as processed rather than crashing
+    into a failed future."""
+    from cron.jobs import CronJobAccessDenied, get_job
+
+    _write_policy("enforce")
+    _write_config()
+    calls = _patch_run(monkeypatch)
+    job = _job(schedule="in 30m", owner_email=PRINCIPAL)
+    _make_one_shot_due(job["id"])
+
+    def refusing_claim(_job_id, **_kw):
+        raise CronJobAccessDenied("This scheduled task belongs to another account.")
+
+    monkeypatch.setattr(s, "claim_job_for_fire", refusing_claim)
+
+    # get_due_jobs (ungoverned scan) stamps the one-shot's run_claim before the
+    # worker's claim is refused.
+    assert s.tick(verbose=False, sync=True) == 1
+    assert calls == []
+    assert get_job(job["id"]).get("run_claim") is None
+
+
+# ---------------------------------------------------------------------------
 # Owner stamping at create time
 # ---------------------------------------------------------------------------
 

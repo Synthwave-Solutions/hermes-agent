@@ -716,6 +716,7 @@ from cron.jobs import (
     advance_next_runs,
     claim_dispatch,
     claim_job_for_fire,
+    CronJobAccessDenied,
     fire_claim_fence,
     clear_run_claim,
     get_due_jobs,
@@ -8408,7 +8409,39 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            try:
+                claimed = claim_job_for_fire(job["id"], return_job=True)
+            except CronJobAccessDenied as denied:
+                # The scan runs outside any governed context, so the ticker
+                # normally never claims a foreign job (get_due_jobs also filters
+                # them out for a governed caller). This is the safety net for a
+                # governed caller reaching this path (a governed ``hermes cron
+                # tick``, or ownership changing between scan and claim): record
+                # the refusal and release the one-shot run_claim get_due_jobs
+                # stamped, so the occurrence is not lost and the execution row
+                # does not stay 'claimed' for its TTL.
+                logger.warning(
+                    "Job '%s': fire claim refused by governance; not dispatched: %s",
+                    job.get("name", job["id"]),
+                    denied,
+                )
+                finish_execution(
+                    job["execution_id"],
+                    success=False,
+                    error=f"Fire claim refused by governance: {denied}",
+                )
+                _schedule = job.get("schedule")
+                if isinstance(_schedule, dict) and _schedule.get("kind") == "once":
+                    try:
+                        clear_run_claim(job["id"])
+                    except Exception as _claim_err:
+                        logger.warning(
+                            "Could not clear run_claim for job '%s' after a "
+                            "refused fire: %s (claim will expire at TTL)",
+                            job.get("name", job["id"]),
+                            _claim_err,
+                        )
+                return True
             if not claimed:
                 finish_execution(
                     job["execution_id"],

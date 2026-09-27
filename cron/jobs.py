@@ -4708,6 +4708,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         needs_save = True
         jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
 
+    # A governed person who is not an administrator dispatches only their own
+    # jobs. The ticker runs outside any governed context, so this is None then
+    # and every job is scanned. It matters when a governed caller reaches this
+    # scan directly (``hermes cron tick`` in a governed shell, or a governed
+    # in-process context): another person's due job must never be fast-forwarded,
+    # run_claim-stamped or returned here, because the fire claim would then be
+    # refused by ``_claim_job_for_fire_locked`` and the occurrence lost. It is
+    # simply not due for this caller.
+    governed = _governed_caller_identities()
+
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
         # unexpected job record must never abort the whole scan. The id /
@@ -4716,6 +4726,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # job this tick" so healthy siblings still run and their recovered
         # state still reaches save_jobs() below.
         try:
+            if governed is not None and not _owned_by(job, governed):
+                continue
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 continue
             if not job.get("enabled", True):
