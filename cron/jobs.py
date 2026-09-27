@@ -2546,7 +2546,7 @@ def _owner_or_blank(value: Any) -> str:
         return ""
 
 
-def _governed_caller_identities() -> Optional[frozenset]:
+def _governed_caller_identities(*, include_ceiling: bool = True) -> Optional[frozenset]:
     """Who a governed caller who is not an administrator is, or None.
 
     None means the caller is not held to their own jobs: the operator, an
@@ -2555,6 +2555,22 @@ def _governed_caller_identities() -> Optional[frozenset]:
     governed shell (``HERMES_DWD_IDENTITY``, only ever set for a governed
     non-admin under enforce) and from every envelope of an in-process
     governance context that is in ``enforce`` and not an administrator's.
+
+    When ``include_ceiling`` (the default, for acting on existing jobs), an
+    administrator's session narrowed by a bot access ceiling is bound to the
+    administrator's own address, not treated as a full administrator: a
+    ceiling caps what the session may do, so acting on a principal-owned or
+    ownerless job (which the resolver would run under unbounded administrator
+    rights) is a widening the ceiling exists to prevent. The ceiled session
+    keeps full control of jobs it owns. Owner changes are refused for such a
+    session separately (``ensure_owner_admin_caller``).
+
+    Creating a job passes ``include_ceiling=False``: a ceiled administrator's
+    create must not be given the admin's own (unbounded) address as owner,
+    because the fire would then run wider than the ceiled session that made
+    it. It stays ownerless there (``_creating_session_is_enforced_admin``
+    refuses it under enforce), the pre-existing behaviour.
+
     An address that cannot be used, or a context that cannot be read, is
     "" and matches no job, so the caller acts on nothing (fail closed).
     """
@@ -2579,6 +2595,10 @@ def _governed_caller_identities() -> Optional[frozenset]:
     for bound in envelopes:
         access = getattr(bound, "access", None)
         if getattr(access, "mode", "") != "enforce":
+            continue
+        if include_ceiling and getattr(bound, "bot_access_ceiling", None) is not None:
+            # A ceiled session, admin or not, acts only on jobs it owns.
+            identities.add(_owner_or_blank(getattr(getattr(access, "subject", None), "email", "")))
             continue
         identity = dwd_identity_for(access)
         if identity is not None:  # None means administrator
@@ -2812,7 +2832,12 @@ def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     job under ``enforce`` and creates it ownerless otherwise.
     """
     explicit = str(owner_email).strip().lower() if owner_email else ""
-    governed = _governed_caller_identities()
+    # A bot ceiling does not make the creator own the new job by their own
+    # (unbounded administrator) address: that would let a ceiled session make
+    # a job that fires wider than itself. Such a create stays ownerless below
+    # (refused under enforce). Acting on existing jobs still honours the
+    # ceiling (include_ceiling defaults to True there).
+    governed = _governed_caller_identities(include_ceiling=False)
     if governed is not None:
         if "" in governed:
             raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR)

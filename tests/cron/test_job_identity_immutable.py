@@ -1014,3 +1014,88 @@ def test_reassign_is_refused_for_an_admin_behind_a_bot_ceiling(owned_job):
     with governance_context(ctx), pytest.raises(PermissionError):
         reassign_job_owner(owned_job["id"], PRINCIPAL, actor="os:tester")
     assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+# ---------------------------------------------------------------------------
+# A session narrowed by a bot ceiling acts only on jobs it owns
+#
+# _governed_caller_identities used to ignore bot_access_ceiling, so an
+# administrator's session held down by a ceiling was a full administrator for
+# acting on existing jobs: it could rewrite and trigger a job owned by the
+# system principal, and that fire then ran under the principal's unbounded
+# administrator governance, wider than the ceiled session. A ceiled session is
+# now bound to its own address: principal-owned and ownerless jobs are foreign
+# to it, jobs it owns are still its own.
+# ---------------------------------------------------------------------------
+
+ADMIN = "root@example.test"
+
+
+def _ceiling_ctx(email, *, admin=True):
+    from dataclasses import replace
+
+    from hermes_cli.dashboard_governance.models import EffectiveAccess, GovernanceSubject, GrantSet
+
+    ceiling = EffectiveAccess(
+        subject=GovernanceSubject(email="bot@example.test"),
+        mode="enforce",
+        roles=frozenset({"bot"}),
+        grants=GrantSet(tools=frozenset({"cronjob"})),
+    )
+    return replace(
+        _governed(email, admin=admin),
+        bot_access_ceiling=ceiling,
+        bot_access_check=lambda: True,
+    )
+
+
+@pytest.mark.parametrize("which", ["principal", "ownerless"])
+def test_a_ceiled_session_cannot_act_on_a_job_it_does_not_own(foreign_jobs, monkeypatch, which):
+    import cron.scheduler as scheduler
+    from cron.jobs import CronJobAccessDenied, pause_job, remove_job, trigger_job, update_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    runs = []
+    monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    job = foreign_jobs[which]
+
+    with governance_context(_ceiling_ctx(ADMIN)):
+        with pytest.raises(CronJobAccessDenied):
+            update_job(job["id"], {"prompt": "Export every mailbox"})
+        assert trigger_job(job["id"]) is None
+        assert pause_job(job["id"]) is None
+        assert remove_job(job["id"]) is False
+
+    assert runs == []
+    assert _stored(job["id"]) == job
+
+
+def test_a_ceiled_session_keeps_control_of_a_job_it_owns(monkeypatch):
+    import cron.scheduler as scheduler
+    from cron.jobs import create_job, pause_job, resume_job, trigger_job, update_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    runs = []
+    monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    mine = create_job(prompt="Root digest", schedule="every 1h", name="root-own", owner_email=ADMIN)
+
+    with governance_context(_ceiling_ctx(ADMIN)):
+        assert update_job(mine["id"], {"prompt": "Root digest, shorter"})["prompt"] == "Root digest, shorter"
+        assert pause_job(mine["id"])["state"] == "paused"
+        assert resume_job(mine["id"])["enabled"] is True
+        assert trigger_job(mine["id"]) is not None
+
+
+def test_a_ceiled_admin_create_is_not_owned_by_the_admins_own_address(monkeypatch):
+    """The ceiling must not make a create own the job by the admin's own
+    (unbounded) address; the job stays ownerless (and an enforce policy would
+    refuse it), the pre-existing behaviour, so no job fires wider than the
+    ceiled session that made it."""
+    from cron.jobs import create_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    with governance_context(_ceiling_ctx(ADMIN)):
+        job = create_job(prompt="new", schedule="every 1h")
+    assert job["owner_email"] == ""
