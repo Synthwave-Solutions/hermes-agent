@@ -379,3 +379,283 @@ def test_hermes_cron_create_without_a_principal_stays_ownerless():
     _cli(["cron", "create", "every 1h", "Summarise the inbox", "--name", "cli job"])
     (job,) = [j for j in list_jobs(include_disabled=True) if j["name"] == "cli job"]
     assert job["owner_email"] == ""
+
+
+# ---------------------------------------------------------------------------
+# scripts/cron_assign_system_owner.py: dry run by default, --apply at go-live
+# ---------------------------------------------------------------------------
+
+import hashlib
+import importlib.util
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "cron_assign_system_owner.py"
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("cron_assign_system_owner", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _raw_job(job_id, *, owner="", no_agent=False, name=None):
+    return {
+        "id": job_id,
+        "name": name or f"job {job_id}",
+        "prompt": "" if no_agent else "Summarise the inbox",
+        "script": "watchdog.sh" if no_agent else None,
+        "no_agent": no_agent,
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+        "schedule_display": "every 60m",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "created_at": "2026-09-01T09:00:00+00:00",
+        "next_run_at": "2026-09-27T10:00:00+00:00",
+        "deliver": "local",
+        "origin": None,
+        "owner_email": owner,
+    }
+
+
+def _make_store(home, jobs, *, principal=PRINCIPAL, mode="enforce", admins=(PRINCIPAL,)):
+    (home / "cron").mkdir(parents=True, exist_ok=True)
+    cfg = {"model": "test-model"}
+    if principal:
+        cfg["cron"] = {"system_principal": principal}
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    policy = {"version": 1, "mode": mode, "default_effect": "deny", "bootstrap_admins": list(admins)}
+    (home / "dashboard-governance.yaml").write_text(yaml.safe_dump(policy), encoding="utf-8")
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}, indent=2), encoding="utf-8")
+    return home
+
+
+def _tree(root):
+    """Every path under root with type, mode, size, mtime and content hash."""
+    snapshot = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            st = path.lstat()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(st.st_mode) else ""
+            snapshot[str(path.relative_to(root))] = (
+                stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_size, st.st_mtime_ns, digest
+            )
+    return snapshot
+
+
+def _owners(home):
+    data = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8"))
+    return {job["id"]: job.get("owner_email") for job in data["jobs"]}
+
+
+def test_the_migration_dry_run_changes_nothing(tmp_path):
+    """Run as the operator would, in a fresh process: the report is complete
+    and not one byte, mode or timestamp changes, in the store or in HOME."""
+    store = _make_store(
+        tmp_path / "store",
+        [_raw_job("agent1"), _raw_job("script1", no_agent=True), _raw_job("owned1", owner="alice@example.test")],
+    )
+    _make_store(store / "profiles" / "worker", [_raw_job("agent2")])
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    before, home_before = _tree(store), _tree(fake_home)
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(fake_home),
+        "HERMES_HOME": str(store),
+        "PYTHONPATH": str(REPO_ROOT),
+        "LANG": "C.UTF-8",
+        "TZ": "UTC",
+    }
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--all-profiles"],
+        env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Dry run: nothing was changed" in proc.stdout
+    for job_id in ("agent1", "script1", "agent2"):
+        assert job_id in proc.stdout
+    assert "owned1" not in proc.stdout
+    assert _tree(store) == before
+    assert _tree(fake_home) == home_before
+
+
+def test_the_migration_dry_run_reports_what_apply_would_do(capsys):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    agent = create_job(prompt="legacy agent", schedule="every 1h")
+    job_script = create_job(prompt="", script="watchdog.sh", no_agent=True, schedule="every 1h")
+    create_job(prompt="owned", schedule="every 1h", owner_email="alice@example.test")
+    owners_before = _owners(_home())
+
+    assert script.main(["--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "dry_run" and report["ok"] is True
+    (store,) = report["stores"]
+    assert store["principal"] == PRINCIPAL
+    assert store["governance_mode"] == "enforce"
+    assert store["principal_policy_entry"] == "admin"
+    assert {(j["id"], j["kind"], j["action"]) for j in store["jobs"]} == {
+        (agent["id"], "agent", "would_assign"),
+        (job_script["id"], "script", "would_assign"),
+    }
+    assert _owners(_home()) == owners_before
+
+    assert script.main(["--json", "--agent-only"]) == 0
+    (store,) = json.loads(capsys.readouterr().out)["stores"]
+    assert [j["id"] for j in store["jobs"]] == [agent["id"]]
+
+
+def test_the_migration_apply_assigns_the_principal_and_audits(capsys):
+    from cron.jobs import create_job, owner_audit_file
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    agent = create_job(prompt="legacy agent", schedule="every 1h")
+    job_script = create_job(prompt="", script="watchdog.sh", no_agent=True, schedule="every 1h")
+    owned = create_job(prompt="owned", schedule="every 1h", owner_email="alice@example.test")
+
+    assert script.main(["--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "Assigned the system principal to 2 job(s)" in out
+    assert "Ownerless agent jobs left: 0" in out
+    owners = _owners(_home())
+    assert owners[agent["id"]] == PRINCIPAL
+    assert owners[job_script["id"]] == PRINCIPAL
+    assert owners[owned["id"]] == "alice@example.test"
+    rows = [json.loads(line) for line in owner_audit_file().read_text().splitlines()]
+    assert {r["job_id"] for r in rows} == {agent["id"], job_script["id"]}
+    assert all(r["source"] == "cron_assign_system_owner" for r in rows)
+    assert all(r["previous_owner"] == "" and r["new_owner"] == PRINCIPAL for r in rows)
+    assert all(r["actor"].startswith("os:") for r in rows)
+
+    # A second run finds nothing to do and writes no new audit rows.
+    assert script.main(["--apply"]) == 0
+    assert "Ownerless jobs: 0" in capsys.readouterr().out
+    assert len(owner_audit_file().read_text().splitlines()) == 2
+
+
+def test_the_migration_covers_every_profile(capsys):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    root_job = create_job(prompt="root", schedule="every 1h")
+    profile = _make_store(_home() / "profiles" / "worker", [_raw_job("agent2")])
+
+    assert script.main(["--apply", "--all-profiles"]) == 0
+    assert _owners(_home())[root_job["id"]] == PRINCIPAL
+    assert _owners(profile)["agent2"] == PRINCIPAL
+    assert (profile / "cron" / "owner-audit.jsonl").is_file()
+
+
+def test_the_migration_takes_an_explicit_principal(capsys):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(None)
+    _write_policy("enforce", bootstrap_admins=("ops@example.test",))
+    job = create_job(prompt="legacy", schedule="every 1h")
+
+    assert script.main(["--apply", "--principal", "Ops@Example.Test"]) == 0
+    assert _owners(_home())[job["id"]] == "ops@example.test"
+    assert "cron.system_principal is not set" in capsys.readouterr().out
+
+
+def test_the_migration_rejects_an_invalid_principal_argument(capsys):
+    script = _load_script()
+    assert script.main(["--principal", "not an address"]) == 2
+
+
+@pytest.mark.parametrize(
+    "setup, message",
+    [
+        (lambda: (_write_config(None), _write_policy("enforce")), "No system principal"),
+        (lambda: (_write_config(PRINCIPAL), _write_policy("enforce", bootstrap_admins=())), "no entry"),
+        (lambda: (_write_config(PRINCIPAL), _write_policy(raw_text="mode: [enforce\n")), "policy"),
+    ],
+)
+def test_the_migration_refuses_to_apply_when_something_blocks(capsys, setup, message):
+    from cron.jobs import create_job, owner_audit_file
+
+    script = _load_script()
+    setup()
+    job = create_job(prompt="legacy", schedule="every 1h")
+
+    assert script.main([]) == 1, "the dry run already says apply would be refused"
+    assert script.main(["--apply"]) == 1
+    out = capsys.readouterr().out
+    assert message in out and "Nothing was changed" in out
+    assert _owners(_home())[job["id"]] == ""
+    assert not owner_audit_file().exists()
+
+
+def test_a_missing_policy_entry_only_warns_outside_enforce(capsys):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("off", bootstrap_admins=())
+    job = create_job(prompt="legacy", schedule="every 1h")
+
+    assert script.main(["--apply"]) == 0
+    assert "no entry in the governance policy" in capsys.readouterr().out
+    assert _owners(_home())[job["id"]] == PRINCIPAL
+
+
+def test_the_migration_warns_about_a_restricted_principal(capsys):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce", bootstrap_admins=(), users={PRINCIPAL: {"roles": ["tech_lead"]}})
+    create_job(prompt="legacy", schedule="every 1h")
+
+    assert script.main([]) == 0
+    out = capsys.readouterr().out
+    assert "principal policy entry: restricted" in out
+    assert "not an administrator" in out
+
+
+def test_the_migration_refuses_to_apply_from_a_governed_shell(monkeypatch):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    job = create_job(prompt="legacy", schedule="every 1h")
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", "mallory@example.test")
+
+    assert script.main(["--apply"]) == 1
+    assert _owners(_home())[job["id"]] == ""
+
+
+def test_the_migration_never_overwrites_an_owner_set_meanwhile():
+    from cron.jobs import create_job, reassign_job_owner
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    job = create_job(prompt="legacy", schedule="every 1h")
+    report = script.inspect_store(_home(), principal_override="", agent_only=False)
+    reassign_job_owner(job["id"], "alice@example.test", actor="os:tester")
+
+    script.apply_store(report, actor="os:tester", reason="test")
+
+    (item,) = report["jobs"]
+    assert item["action"] == "skipped"
+    assert _owners(_home())[job["id"]] == "alice@example.test"
