@@ -2381,6 +2381,13 @@ def resolve_cron_policy_path(
     platform was in ``enforce``, so its ownerless agent jobs ran unbound and
     its owned jobs ran without their owner's restrictions.
 
+    A named profile whose config.yaml names a ``policy_file`` that does not
+    exist raises ValueError instead of returning it: the loader reads a
+    missing file as "off", which would turn a typo or a moved file into a
+    store whose ownerless agent jobs run unbound. A root home keeps the
+    loader's rule, because the WebUI and the dashboard read its missing
+    policy as "off" too.
+
     ``hermes_home`` and ``config`` default to the active store. Raises
     ValueError when the platform config.yaml cannot be read (fail closed).
     """
@@ -2395,10 +2402,15 @@ def resolve_cron_policy_path(
         except Exception:
             config = {}
     own = resolve_policy_path(config=config, hermes_home=home)
-    if _configured_policy_file(config) or own.exists():
-        return own, "store"
     root = platform_root_for(home)
-    if root is None:
+    if _configured_policy_file(config):
+        if root is not None and not own.exists():
+            raise ValueError(
+                f"The policy file {own} named in the config.yaml of the profile "
+                f"{home.name} does not exist"
+            )
+        return own, "store"
+    if own.exists() or root is None:
         return own, "store"
     root_config = read_config_file(root / "config.yaml")
     return resolve_policy_path(config=root_config, hermes_home=root), "platform"
@@ -2412,7 +2424,8 @@ def load_cron_governance_policy(
     """The governance policy a cron store's fires run under.
 
     See ``resolve_cron_policy_path``. A missing policy file reads as mode
-    ``off`` (the loader's rule); an unreadable one raises.
+    ``off`` (the loader's rule), except one a named profile names, which
+    raises like an unreadable one.
     """
     from hermes_cli.dashboard_governance.loader import load_governance_policy
 

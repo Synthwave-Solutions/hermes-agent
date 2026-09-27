@@ -1012,6 +1012,51 @@ def test_a_profile_that_names_a_policy_file_keeps_it(monkeypatch, tmp_path):
     assert calls == [(job["id"], None, None)]
 
 
+@pytest.mark.parametrize("platform_mode", ["enforce", "off", None])
+def test_a_profile_that_names_a_missing_policy_file_fails_closed(monkeypatch, tmp_path, platform_mode):
+    """The loader reads a missing policy file as governance "off". For a
+    profile that names one (a typo, a moved file) that would run its ownerless
+    agent jobs unbound, so it fails closed instead, whatever the platform's
+    mode, and an owned job is refused too because its owner's grants cannot be
+    resolved."""
+    from cron.jobs import resolve_cron_policy_path
+
+    if platform_mode is None:
+        root = _home()
+        _write_config(PRINCIPAL)
+    else:
+        root = _platform(mode=platform_mode)
+    calls = _patch_run_with_mode(monkeypatch)
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(tmp_path / "gone.yaml")}}}
+    with _Profile(root, config=cfg) as profile:
+        with pytest.raises(ValueError, match="does not exist"):
+            resolve_cron_policy_path(hermes_home=profile, config=cfg)
+        ownerless = _job()
+        owned = _job(owner_email="alice@example.test")
+        script = _job(prompt="", script="watchdog.sh", no_agent=True)
+        for job in (ownerless, owned, script):
+            assert s.run_one_job(_get(job["id"])) is True
+        stored = {job["id"]: _get(job["id"]) for job in (ownerless, owned)}
+    assert calls == [(script["id"], None, None)], "only the ownerless script still runs"
+    for record in stored.values():
+        assert record["last_status"] == "blocked_config"
+        assert "policy" in record["last_error"]
+
+
+def test_a_root_home_that_names_a_missing_policy_file_keeps_the_loader_rule(monkeypatch, tmp_path):
+    """The root store is the platform: its missing policy is "off" for the
+    WebUI and the dashboard as well, so cron follows the same rule there."""
+    from cron.jobs import resolve_cron_policy_path
+
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(tmp_path / "gone.yaml")}}}
+    (_home() / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    assert resolve_cron_policy_path() == (tmp_path / "gone.yaml", "store")
+    calls = _patch_run(monkeypatch)
+    job = _job()
+    assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], None)]
+
+
 def test_a_profile_store_runs_as_before_when_the_platform_has_no_policy(monkeypatch):
     root = _home()
     _write_config(PRINCIPAL)
