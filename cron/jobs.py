@@ -3761,8 +3761,11 @@ def mark_job_refused(
     are released and the job moves on. A recurring job goes to its next
     occurrence. A one-shot is paused with ``reason`` and keeps no
     ``last_run_at``: left due it would be refused on every tick until it aged
-    out of its grace window and was removed. After an owner is assigned, run
-    it (``hermes cron run``) or resume it.
+    out of its grace window and was removed. After an owner is assigned,
+    re-arm it with ``hermes cron resume <id> --run-now`` (``rearm_oneshot``),
+    or with a plain ``hermes cron resume <id>`` while its time is still
+    inside the grace window. ``hermes cron run`` does not run it: a manual
+    run refuses a paused job.
 
     ``consume_occurrence=False`` is for a run someone asked for outside the
     schedule (``cron.scheduler.run_job_governed``): only the outcome is
