@@ -2215,6 +2215,117 @@ def _validate_job_mode_invariants(
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
 
+# ---------------------------------------------------------------------------
+# Job owner identity
+# ---------------------------------------------------------------------------
+
+_OWNER_IDENTITY_RE = re.compile(r"[^@\s]+@[^@\s]+")
+_OWNER_IDENTITY_MAX_LEN = 254
+
+# Append-only record of every owner change, next to jobs.json (per profile).
+OWNER_AUDIT_FILE_NAME = "owner-audit.jsonl"
+
+_OWNER_ADMIN_ONLY_ERROR = (
+    "Changing the owner of a scheduled task is an administrator action and "
+    "is not available inside a governed session."
+)
+
+
+def normalize_owner_identity(value: Any) -> str:
+    """Return ``value`` as a canonical owner address, or raise ValueError.
+
+    A job owner is a person or the configured system principal, always an
+    address that the governance policy is keyed by. Empty is not an owner:
+    there is no way to turn an owned job back into an ownerless one.
+    """
+    text = value.strip().lower() if isinstance(value, str) else ""
+    if (
+        not text
+        or len(text) > _OWNER_IDENTITY_MAX_LEN
+        or not _OWNER_IDENTITY_RE.fullmatch(text)
+    ):
+        raise ValueError(f"Not a valid owner address: {value!r}")
+    return text
+
+
+def system_principal_from_config(config: Any) -> str:
+    """``cron.system_principal`` from an already loaded config mapping.
+
+    Returns "" when unset. An invalid value is logged and treated as unset,
+    which fails closed: ownerless jobs are then refused under enforce rather
+    than stamped with something the policy can never match.
+    """
+    cron_cfg = config.get("cron") if isinstance(config, dict) else None
+    raw = cron_cfg.get("system_principal") if isinstance(cron_cfg, dict) else None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return ""
+    try:
+        return normalize_owner_identity(raw)
+    except ValueError:
+        logger.warning(
+            "cron.system_principal %r is not a valid address; treating it as unset",
+            raw,
+        )
+        return ""
+
+
+def cron_system_principal() -> str:
+    """The configured ``cron.system_principal`` of the active profile, or ""."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        logger.debug("cron: config unavailable, no system principal", exc_info=True)
+        return ""
+    return system_principal_from_config(config)
+
+
+def ensure_owner_admin_caller() -> None:
+    """Refuse the owner admin path inside a governed, non-admin session.
+
+    Changing who a job runs as is an administrator action. A governed
+    person's shell carries ``HERMES_DWD_IDENTITY`` (set for their child
+    processes by ``tools/environments/local.py``) and an in-process governed
+    turn has its governance context bound; both are refused, so nobody can
+    re-own a job (to themselves or to anyone else) from inside their own
+    session. The operator at the host shell and governed administrators pass.
+    """
+    if str(os.environ.get("HERMES_DWD_IDENTITY") or "").strip():
+        raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+    except ImportError:
+        return
+    try:
+        ctx = current_governance_context()
+    except Exception as exc:
+        # A governance payload is present but unreadable: fail closed.
+        raise PermissionError(_OWNER_ADMIN_ONLY_ERROR) from exc
+    if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+        return
+    if dwd_identity_for(ctx.access) is not None:  # None means administrator
+        raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+
+
+def owner_audit_file() -> Path:
+    """The owner change audit log of the active cron store."""
+    return _current_cron_store().cron_dir / OWNER_AUDIT_FILE_NAME
+
+
+def _append_owner_audit(row: Dict[str, Any]) -> None:
+    """Append one audit row and flush it to disk before returning."""
+    path = owner_audit_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _secure_file(path)
+
+
 def _creating_owner_email() -> str:
     """The person whose session is creating this job.
 
@@ -2756,6 +2867,113 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
     return None
+
+
+def reassign_job_owner(
+    job_ref: str,
+    new_owner: Any,
+    *,
+    actor: str,
+    reason: str = "",
+    source: str = "cli",
+    expected_owner: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Give a job a new owner: the only way to change ``owner_email``.
+
+    ``update_job`` refuses the identity fields, so this admin path is the one
+    door. It is refused inside a governed, non-admin session
+    (``ensure_owner_admin_caller``), takes a valid address only (a job is
+    re-owned, never un-owned), and appends an audit row to
+    ``owner_audit_file()``. When the audit row cannot be written the change is
+    rolled back, so no owner change exists without its record.
+
+    ``expected_owner`` makes the change conditional on the current owner (use
+    "" for "still ownerless"), so a batch migration never overwrites an owner
+    someone set in the meantime; a mismatch raises ValueError and changes
+    nothing.
+
+    Returns ``{"job", "previous_owner", "new_owner", "changed"}``, or None when
+    no job matches ``job_ref`` (an ID, or a unique name).
+    """
+    ensure_owner_admin_caller()
+    owner = normalize_owner_identity(new_owner)
+    actor_text = str(actor or "").strip()
+    if not actor_text:
+        raise ValueError("An actor is required: every owner change is audited.")
+    reason_text = str(reason or "").strip()[:500]
+    source_text = str(source or "").strip()[:64] or "unknown"
+    wanted = None if expected_owner is None else str(expected_owner).strip().lower()
+
+    job = resolve_job_ref(str(job_ref or "").strip())
+    if not job:
+        return None
+    job_id = job["id"]
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, stored in enumerate(jobs):
+            if stored.get("id") != job_id:
+                continue
+            previous = str(stored.get("owner_email") or "").strip().lower()
+            if wanted is not None and previous != wanted:
+                raise ValueError(
+                    f"The owner of cron job {job_id} is {previous or 'unset'}, "
+                    f"not {wanted or 'unset'}; nothing was changed."
+                )
+            if previous == owner:
+                return {
+                    "job": _normalize_job_record(stored),
+                    "previous_owner": previous,
+                    "new_owner": owner,
+                    "changed": False,
+                }
+            updated = dict(stored)
+            updated["owner_email"] = owner
+            jobs[i] = updated
+            save_jobs(jobs)
+            row = {
+                "ts": _hermes_now().isoformat(),
+                "event": "cron_owner_reassigned",
+                "job_id": job_id,
+                "job_name": str(stored.get("name") or ""),
+                "previous_owner": previous,
+                "new_owner": owner,
+                "actor": actor_text,
+                "reason": reason_text,
+                "source": source_text,
+                "host": _audit_host(),
+                "pid": os.getpid(),
+            }
+            try:
+                _append_owner_audit(row)
+            except BaseException:
+                jobs[i] = stored
+                save_jobs(jobs)
+                raise
+            logger.warning(
+                "cron: owner of job %s reassigned from %r to %r by %s (%s)",
+                job_id,
+                previous or "(none)",
+                owner,
+                actor_text,
+                source_text,
+            )
+            return {
+                "job": _normalize_job_record(updated),
+                "previous_owner": previous,
+                "new_owner": owner,
+                "changed": True,
+            }
+    return None
+
+
+def _audit_host() -> str:
+    try:
+        import socket
+
+        return socket.gethostname()
+    except Exception:
+        return ""
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:

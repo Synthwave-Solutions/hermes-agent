@@ -221,3 +221,273 @@ def test_dashboard_update_refuses_identity_fields(dashboard_profile, monkeypatch
     assert stored["owner_email"] == "alice@example.test"
     assert stored["origin"] == ORIGIN
     assert stored["created_at"] == job["created_at"]
+
+
+# ---------------------------------------------------------------------------
+# The admin path: reassign_job_owner / ``hermes cron reassign-owner``
+# ---------------------------------------------------------------------------
+
+
+def _audit_rows():
+    from cron.jobs import owner_audit_file
+
+    path = owner_audit_file()
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _governed(email, *, admin=False, mode="enforce"):
+    from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+    from hermes_cli.dashboard_governance.models import (
+        EffectiveAccess,
+        GovernanceSubject,
+        GrantSet,
+    )
+
+    access = EffectiveAccess(
+        subject=GovernanceSubject(email=email),
+        mode=mode,
+        roles=frozenset({"owner", "admin"} if admin else {"tech_lead"}),
+        grants=GrantSet(),
+        grant_sources=("bootstrap_admin",) if admin else (),
+    )
+    return DashboardGovernanceContext(subject=access.subject, access=access)
+
+
+def test_reassign_changes_only_the_owner_and_is_audited(owned_job):
+    from cron.jobs import reassign_job_owner
+
+    result = reassign_job_owner(
+        owned_job["id"], " Bob@Example.Test ", actor="os:tester", reason="handover"
+    )
+
+    assert result["changed"] is True
+    assert result["previous_owner"] == "alice@example.test"
+    assert result["new_owner"] == "bob@example.test"
+    stored = _stored(owned_job["id"])
+    assert stored["owner_email"] == "bob@example.test"
+    assert stored["origin"] == ORIGIN
+    assert stored["created_at"] == owned_job["created_at"]
+    rows = _audit_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event"] == "cron_owner_reassigned"
+    assert row["job_id"] == owned_job["id"]
+    assert row["job_name"] == "inbox summary"
+    assert row["previous_owner"] == "alice@example.test"
+    assert row["new_owner"] == "bob@example.test"
+    assert row["actor"] == "os:tester"
+    assert row["reason"] == "handover"
+    assert row["source"] == "cli"
+    assert row["ts"]
+
+
+def test_reassign_accepts_a_job_name(owned_job):
+    from cron.jobs import reassign_job_owner
+
+    result = reassign_job_owner("inbox summary", "bob@example.test", actor="os:tester")
+    assert result["job"]["id"] == owned_job["id"]
+    assert _stored(owned_job["id"])["owner_email"] == "bob@example.test"
+
+
+@pytest.mark.parametrize("owner", ["", "   ", None, "not-an-address", "a b@example.test", "a@b@c"])
+def test_reassign_refuses_an_invalid_or_empty_owner(owned_job, owner):
+    """There is no admin path to an ownerless job either: a job is re-owned,
+    never un-owned."""
+    from cron.jobs import reassign_job_owner
+
+    with pytest.raises(ValueError):
+        reassign_job_owner(owned_job["id"], owner, actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+    assert _audit_rows() == []
+
+
+def test_reassign_requires_an_actor(owned_job):
+    from cron.jobs import reassign_job_owner
+
+    with pytest.raises(ValueError):
+        reassign_job_owner(owned_job["id"], "bob@example.test", actor="  ")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+def test_reassign_of_a_missing_job_returns_none():
+    from cron.jobs import reassign_job_owner
+
+    assert reassign_job_owner("nope", "bob@example.test", actor="os:tester") is None
+    assert _audit_rows() == []
+
+
+def test_reassign_to_the_same_owner_is_a_no_op(owned_job):
+    from cron.jobs import reassign_job_owner
+
+    result = reassign_job_owner(owned_job["id"], "ALICE@example.test", actor="os:tester")
+    assert result["changed"] is False
+    assert _audit_rows() == []
+
+
+def test_reassign_with_a_stale_expected_owner_changes_nothing(owned_job):
+    from cron.jobs import reassign_job_owner
+
+    with pytest.raises(ValueError, match="owner"):
+        reassign_job_owner(
+            owned_job["id"], "bob@example.test", actor="os:tester", expected_owner=""
+        )
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+    assert _audit_rows() == []
+
+
+def test_reassign_gives_an_ownerless_job_an_owner():
+    from cron.jobs import create_job, reassign_job_owner
+
+    job = create_job(prompt="legacy", schedule="every 1h")
+    assert job["owner_email"] == ""
+
+    result = reassign_job_owner(job["id"], "ops@example.test", actor="os:tester", expected_owner="")
+    assert result["changed"] is True
+    assert _stored(job["id"])["owner_email"] == "ops@example.test"
+
+
+def test_reassign_is_refused_from_a_governed_shell(owned_job, monkeypatch):
+    """A governed, non-admin person's terminal carries HERMES_DWD_IDENTITY.
+    They must not be able to re-own a job (to themselves or anyone else)."""
+    from cron.jobs import reassign_job_owner
+
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", "mallory@example.test")
+    with pytest.raises(PermissionError):
+        reassign_job_owner(owned_job["id"], "mallory@example.test", actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+    assert _audit_rows() == []
+
+
+def test_reassign_is_refused_in_a_governed_non_admin_session(owned_job):
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    from cron.jobs import reassign_job_owner
+
+    with governance_context(_governed("mallory@example.test")):
+        with pytest.raises(PermissionError):
+            reassign_job_owner(owned_job["id"], "mallory@example.test", actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+def test_reassign_is_allowed_in_a_governed_admin_session(owned_job):
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    from cron.jobs import reassign_job_owner
+
+    with governance_context(_governed("root@example.test", admin=True)):
+        result = reassign_job_owner(owned_job["id"], "bob@example.test", actor="root@example.test")
+    assert result["changed"] is True
+
+
+def test_a_failed_audit_write_leaves_no_unaudited_change(owned_job, monkeypatch):
+    import cron.jobs as jobs_mod
+
+    def _boom(_row):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(jobs_mod, "_append_owner_audit", _boom)
+    with pytest.raises(OSError):
+        jobs_mod.reassign_job_owner(owned_job["id"], "bob@example.test", actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+def test_the_owner_audit_log_is_private(owned_job):
+    import stat
+
+    from cron.jobs import owner_audit_file, reassign_job_owner
+
+    reassign_job_owner(owned_job["id"], "bob@example.test", actor="os:tester")
+    assert stat.S_IMODE(owner_audit_file().stat().st_mode) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# CLI: hermes cron reassign-owner
+# ---------------------------------------------------------------------------
+
+
+def _sentinel_cmd_cron(args):  # pragma: no cover - must never be reached
+    raise AssertionError("reassign-owner must not dispatch through cmd_cron")
+
+
+def _parse(argv):
+    import argparse
+
+    from hermes_cli.subcommands.cron import build_cron_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_cron_parser(subparsers, cmd_cron=_sentinel_cmd_cron)
+    return parser.parse_args(argv)
+
+
+def _write_config(text):
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "config.yaml").write_text(text, encoding="utf-8")
+
+
+def test_cli_reassign_owner(owned_job, capsys):
+    args = _parse(["cron", "reassign-owner", owned_job["id"], "bob@example.test", "--reason", "handover"])
+
+    assert args.func(args) == 0
+    assert _stored(owned_job["id"])["owner_email"] == "bob@example.test"
+    out = capsys.readouterr().out
+    assert "alice@example.test" in out and "bob@example.test" in out
+    rows = _audit_rows()
+    assert rows[-1]["reason"] == "handover"
+    assert rows[-1]["source"] == "cli"
+    assert rows[-1]["actor"].startswith("os:")
+
+
+def test_cli_reassign_owner_to_the_system_principal(owned_job):
+    _write_config("cron:\n  system_principal: Cron-System@Example.Test\n")
+    args = _parse(["cron", "reassign-owner", owned_job["id"], "--system-principal"])
+
+    assert args.func(args) == 0
+    assert _stored(owned_job["id"])["owner_email"] == "cron-system@example.test"
+
+
+def test_cli_reassign_owner_without_a_configured_system_principal(owned_job, capsys):
+    args = _parse(["cron", "reassign-owner", owned_job["id"], "--system-principal"])
+
+    assert args.func(args) == 1
+    assert "system_principal" in capsys.readouterr().out
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [[], ["bob@example.test", "--system-principal"]],
+)
+def test_cli_reassign_owner_needs_exactly_one_owner(owned_job, extra):
+    args = _parse(["cron", "reassign-owner", owned_job["id"], *extra])
+
+    assert args.func(args) == 2
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+def test_cli_reassign_owner_reports_errors(owned_job, capsys, monkeypatch):
+    args = _parse(["cron", "reassign-owner", "no-such-job", "bob@example.test"])
+    assert args.func(args) == 1
+    assert "not found" in capsys.readouterr().out.lower()
+
+    args = _parse(["cron", "reassign-owner", owned_job["id"], "not-an-address"])
+    assert args.func(args) == 1
+
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", "mallory@example.test")
+    args = _parse(["cron", "reassign-owner", owned_job["id"], "mallory@example.test"])
+    assert args.func(args) == 1
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+def test_cli_reassign_owner_reports_an_ambiguous_name(capsys):
+    from cron.jobs import create_job
+
+    create_job(prompt="a", schedule="every 1h", name="twin", owner_email="alice@example.test")
+    create_job(prompt="b", schedule="every 1h", name="twin", owner_email="alice@example.test")
+    args = _parse(["cron", "reassign-owner", "twin", "bob@example.test"])
+
+    assert args.func(args) == 1
+    assert "ambiguous" in capsys.readouterr().out.lower()

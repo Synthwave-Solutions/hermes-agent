@@ -12,6 +12,74 @@ from typing import Callable
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
 
 
+def _cli_actor() -> str:
+    """Who is running this command, for the owner audit log."""
+    try:
+        import getpass
+
+        user = getpass.getuser()
+    except Exception:
+        user = ""
+    return f"os:{user or 'unknown'}"
+
+
+def cmd_cron_reassign_owner(args) -> int:
+    """``hermes cron reassign-owner``: the audited admin path for owner changes.
+
+    Exit codes: 0 done (or already owned by that address), 1 refused or
+    failed, 2 usage error.
+    """
+    from cron.jobs import (
+        AmbiguousJobReference,
+        cron_system_principal,
+        owner_audit_file,
+        reassign_job_owner,
+    )
+    from hermes_cli.colors import Colors, color
+
+    owner = str(getattr(args, "owner", None) or "").strip()
+    use_principal = bool(getattr(args, "system_principal", False))
+    if bool(owner) == use_principal:
+        print(color("Give exactly one new owner: an email address or --system-principal.", Colors.RED))
+        return 2
+    if use_principal:
+        owner = cron_system_principal()
+        if not owner:
+            print(color(
+                "cron.system_principal is not set in config.yaml (or is not a valid address).",
+                Colors.RED,
+            ))
+            return 1
+    try:
+        result = reassign_job_owner(
+            args.job_id,
+            owner,
+            actor=_cli_actor(),
+            reason=str(getattr(args, "reason", "") or ""),
+            source="cli",
+        )
+    except AmbiguousJobReference as exc:
+        print(color(str(exc), Colors.RED))
+        for match in exc.matches:
+            print(f"  {match['id']}  (name: {match.get('name')!r})")
+        return 1
+    except (PermissionError, ValueError) as exc:
+        print(color(f"Failed to reassign owner: {exc}", Colors.RED))
+        return 1
+    if result is None:
+        print(color(f"Job not found: {args.job_id}", Colors.RED))
+        return 1
+    job = result["job"]
+    label = f"{job.get('name') or job['id']} ({job['id']})"
+    if not result["changed"]:
+        print(f"Owner unchanged: {label} already belongs to {result['new_owner']}")
+        return 0
+    print(color(f"Reassigned job: {label}", Colors.GREEN))
+    print(f"  Owner: {result['previous_owner'] or '(none)'} -> {result['new_owner']}")
+    print(f"  Audit: {owner_audit_file()}")
+    return 0
+
+
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     """Attach the ``cron`` subcommand (and its sub-actions) to ``subparsers``."""
     cron_parser = subparsers.add_parser(
@@ -320,6 +388,35 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_notepad.add_argument("key", nargs="?", help="Notepad key (get/set/delete)")
     cron_notepad.add_argument("value", nargs="?", help="Value to store (set)")
+
+    # cron reassign-owner: the only way to change who a job runs as. Editing a
+    # job cannot touch its owner (cron.jobs refuses the identity fields), so
+    # this admin path is dispatched directly, not through ``cmd_cron``.
+    cron_reassign = cron_subparsers.add_parser(
+        "reassign-owner",
+        help="Give a scheduled job a new owner (administrators only; audited)",
+        description=(
+            "Change the person a scheduled job runs as. The owner of a job "
+            "cannot be changed by editing it; this command is the only way. "
+            "It is refused inside a governed session, and every change is "
+            "appended to cron/owner-audit.jsonl."
+        ),
+    )
+    cron_reassign.add_argument("job_id", help="Job ID or name")
+    cron_reassign.add_argument(
+        "owner", nargs="?", help="Email address of the new owner"
+    )
+    cron_reassign.add_argument(
+        "--system-principal",
+        dest="system_principal",
+        action="store_true",
+        default=False,
+        help="Give the job to cron.system_principal from config.yaml",
+    )
+    cron_reassign.add_argument(
+        "--reason", default="", help="Why the owner changes (kept in the audit log)"
+    )
+    cron_reassign.set_defaults(func=cmd_cron_reassign_owner)
 
     # cron doctor
     cron_subparsers.add_parser("doctor", help="Check scheduled jobs for common health issues")
