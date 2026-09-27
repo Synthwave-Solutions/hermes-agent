@@ -573,6 +573,21 @@ def test_cli_reassign_owner_reports_an_ambiguous_name(capsys):
     assert "ambiguous" in capsys.readouterr().out.lower()
 
 
+def test_cli_reassign_owner_is_refused_in_a_session_marked_shell(owned_job, capsys, monkeypatch):
+    """A WebUI terminal under report_only carries session markers but no
+    HERMES_DWD_IDENTITY; unsetting that one variable in a governed terminal
+    gives the same shell. Neither is the operator at the host shell."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260927_101010_abcdef")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+    args = _parse(["cron", "reassign-owner", owned_job["id"], "--system-principal"])
+    _write_config("cron:\n  system_principal: cron-system@example.test\n")
+
+    assert args.func(args) == 1
+    assert "administrator" in capsys.readouterr().out
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+    assert _audit_rows() == []
+
+
 # ---------------------------------------------------------------------------
 # Only the owner or an administrator acts on a job
 #
@@ -942,3 +957,60 @@ def test_an_in_process_governed_person_cannot_create_a_job_for_someone_else(as_m
         create_job(prompt="p", schedule="every 1h", owner_email=PRINCIPAL)
     assert create_job(prompt="p", schedule="every 1h", owner_email="Mallory@Example.Test")["owner_email"] == MALLORY
     assert [j["owner_email"] for j in list_jobs(include_disabled=True)] == [MALLORY]
+
+
+# ---------------------------------------------------------------------------
+# reassign_job_owner: administrators only, in every governance mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["enforce", "report_only", "off"])
+def test_reassign_is_refused_for_a_governed_non_admin_in_any_mode(owned_job, mode):
+    """An owner change made under report_only persists once enforce is on."""
+    from cron.jobs import reassign_job_owner
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    with governance_context(_governed(MALLORY, mode=mode)):
+        with pytest.raises(PermissionError):
+            reassign_job_owner(owned_job["id"], MALLORY, actor="os:tester")
+        with pytest.raises(PermissionError):
+            reassign_job_owner(owned_job["id"], PRINCIPAL, actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+    assert _audit_rows() == []
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        {"HERMES_SESSION_ID": "20260927_101010_abcdef", "HERMES_SESSION_PLATFORM": "webui"},
+        {"HERMES_SESSION_USER_ID": MALLORY},
+        {"HERMES_CRON_JOB_ID": "abc123"},
+    ],
+)
+def test_reassign_outside_an_admin_context_needs_the_operator_shell(owned_job, monkeypatch, markers):
+    from cron.jobs import reassign_job_owner
+
+    for name, value in markers.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(PermissionError):
+        reassign_job_owner(owned_job["id"], PRINCIPAL, actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"
+
+
+def test_reassign_is_refused_for_an_admin_behind_a_bot_ceiling(owned_job):
+    from dataclasses import replace
+
+    from cron.jobs import reassign_job_owner
+    from hermes_cli.dashboard_governance.context import governance_context
+    from hermes_cli.dashboard_governance.models import EffectiveAccess, GovernanceSubject, GrantSet
+
+    ceiling = EffectiveAccess(
+        subject=GovernanceSubject(email="bot@example.test"),
+        mode="enforce",
+        roles=frozenset({"bot"}),
+        grants=GrantSet(),
+    )
+    ctx = replace(_governed("root@example.test", admin=True), bot_access_ceiling=ceiling, bot_access_check=lambda: True)
+    with governance_context(ctx), pytest.raises(PermissionError):
+        reassign_job_owner(owned_job["id"], PRINCIPAL, actor="os:tester")
+    assert _stored(owned_job["id"])["owner_email"] == "alice@example.test"

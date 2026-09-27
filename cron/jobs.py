@@ -2243,6 +2243,11 @@ _FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR = (
     "it cannot be given to another account."
 )
 
+_OWNER_ADMIN_OUTSIDE_OPERATOR_SHELL_ERROR = (
+    "Changing the owner of a scheduled task is an administrator action: run it "
+    "from the host shell, outside any agent session."
+)
+
 _FOREIGN_JOB_ERROR = (
     "This scheduled task belongs to another account. Only its owner or an "
     "administrator can change, run or remove it."
@@ -2477,32 +2482,51 @@ def load_cron_governance_policy(
 
 
 def ensure_owner_admin_caller() -> None:
-    """Refuse the owner admin path inside a governed, non-admin session.
+    """Refuse the owner admin path to anyone but an administrator.
 
-    Changing who a job runs as is an administrator action. A governed
-    person's shell carries ``HERMES_DWD_IDENTITY`` (set for their child
-    processes by ``tools/environments/local.py``) and an in-process governed
-    turn has its governance context bound; both are refused, so nobody can
-    re-own a job (to themselves or to anyone else) from inside their own
-    session. The operator at the host shell and governed administrators pass.
+    Changing who a job runs as is an administrator action, and an owner set
+    now still holds once ``enforce`` is switched on, so this does not depend
+    on the governance mode:
+
+    - a governed person's shell (``HERMES_DWD_IDENTITY``, set for their child
+      processes by ``tools/environments/local.py``) is refused;
+    - an in-process governance context passes only when every envelope in it
+      (``policy_contexts``: the current access and any continuation it
+      carries) is an administrator's and no bot ceiling narrows it, in any
+      mode, report_only included;
+    - without a governance context the caller must be the operator at the
+      host shell (``_is_operator_shell``: no session marker), the same rule
+      the system principal is stamped by. A WebUI terminal under report_only,
+      or a governed terminal with ``HERMES_DWD_IDENTITY`` unset, is not.
+
+    Anything unreadable is refused.
     """
     if str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip():
         raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
     try:
-        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
         from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
     except ImportError:
-        return
-    try:
-        ctx = current_governance_context()
-    except Exception as exc:
-        # A governance payload is present but unreadable: fail closed.
-        raise PermissionError(_OWNER_ADMIN_ONLY_ERROR) from exc
-    if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
-        return
-    if dwd_identity_for(ctx.access) is not None:  # None means administrator
-        raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
-
+        ctx = None
+    else:
+        try:
+            ctx = current_governance_context()
+            envelopes = policy_contexts(ctx)
+        except Exception as exc:
+            # A governance payload is present but unreadable: fail closed.
+            raise PermissionError(_OWNER_ADMIN_ONLY_ERROR) from exc
+        if ctx is not None:
+            for bound in envelopes:
+                if getattr(bound, "bot_access_ceiling", None) is not None:
+                    raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+                if dwd_identity_for(bound.access) is not None:  # None means administrator
+                    raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+            return
+    if not _is_operator_shell():
+        raise PermissionError(_OWNER_ADMIN_OUTSIDE_OPERATOR_SHELL_ERROR)
 
 
 class CronJobAccessDenied(PermissionError, ValueError):
