@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Give every ownerless cron job to the configured system principal.
+"""Give every ownerless cron job an owner: the system principal, or the person.
 
 Under governance ``enforce`` an agent cron job without an owner is refused at
 fire time (``cron.scheduler._governed_as_job_owner``). Jobs made before owners
 were recorded, and jobs an administrator or the CLI made, are ownerless. This
 script assigns ``cron.system_principal`` to them so they keep running, under
 that principal's governance.
+
+A governed person's own profile never gets the principal: that would run
+their jobs with administrator rights. When the governance policy gives a
+named profile, by name, to exactly one person who is not an administrator,
+its ownerless jobs go to that person. When it gives it to several, they are
+left ownerless and listed for an administrator to decide
+(``hermes cron reassign-owner``).
 
 DRY RUN BY DEFAULT. Without ``--apply`` it only reads (config.yaml, the
 governance policy and cron/jobs.json of each store) and writes nothing at all:
@@ -16,17 +23,25 @@ With ``--apply`` each job is changed through ``cron.jobs.reassign_job_owner``:
 only while the job is still ownerless (compare and set), refused inside a
 governed non-admin session, and audited in ``cron/owner-audit.jsonl``.
 
+Only the selected stores are changed: ``--hermes-home`` (default
+``$HERMES_HOME`` or ``~/.hermes``), plus every named profile store with
+``--all-profiles``. Every other store of the same platform (its root and all
+its named profiles) is still read, and ownerless agent jobs there are
+reported: the script never says all clear while any store has one.
+
 Go-live order (see the program plan, runbook step 3): create the principal's
 policy entry, set ``cron.system_principal`` in config.yaml, run this script
 without ``--apply`` and read the report, then run it with ``--apply`` before
-the restart, and check that no agent job is left without an owner. Use
-``--all-profiles`` so named profile stores are covered too: a profile that
-sets no ``cron.system_principal`` and no governance policy of its own uses the
+the restart, and check that it ends with "All clear". Use ``--all-profiles``
+so named profile stores are covered too: a profile that sets no
+``cron.system_principal`` and no governance policy of its own uses the
 platform root's, the same rule its fires follow.
 
-Exit codes: 0 nothing blocks (dry run) or everything was assigned (apply);
-1 a store has a blocking problem, or ownerless agent jobs are left after
-apply; 2 usage error.
+Exit codes: 0 nothing blocks and no agent job would be left, or is left,
+without an owner in any store of the platform (dry run and apply alike);
+1 a store has a blocking problem, or an ownerless agent job would be left
+or is left somewhere (a store that was not selected, or a profile shared by
+several people); 2 usage error.
 """
 
 from __future__ import annotations
@@ -44,6 +59,7 @@ from typing import Any, Dict, List, Optional
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_REASON = "Assign the system principal to an ownerless job (go-live migration)"
+PERSON_REASON = "Assign the person whose own profile holds this ownerless job (go-live migration)"
 SOURCE = "cron_assign_system_owner"
 
 
@@ -99,21 +115,51 @@ def _read_jobs(home: Path) -> List[Dict[str, Any]]:
     return [job for job in jobs if isinstance(job, dict) and job.get("id")]
 
 
-def _stores(args: argparse.Namespace, default_home: Path) -> List[Path]:
-    homes = [Path(h).expanduser() for h in (args.hermes_home or [])] or [default_home]
-    if args.all_profiles:
-        for home in list(homes):
-            profiles_root = home / "profiles"
-            if profiles_root.is_dir():
-                for profile in sorted(profiles_root.iterdir()):
-                    if (profile / "cron" / "jobs.json").is_file():
-                        homes.append(profile)
+def _profile_stores(root: Path) -> List[Path]:
+    """The named profile stores under ``root`` that have cron jobs."""
+    profiles_root = root / "profiles"
+    if not profiles_root.is_dir():
+        return []
+    return [
+        profile
+        for profile in sorted(profiles_root.iterdir())
+        if not profile.name.startswith(".") and (profile / "cron" / "jobs.json").is_file()
+    ]
+
+
+def _unique(homes: List[Path]) -> List[Path]:
     unique: List[Path] = []
     for home in homes:
         resolved = home.resolve()
         if resolved not in unique:
             unique.append(resolved)
     return unique
+
+
+def _stores(args: argparse.Namespace, default_home: Path) -> List[Path]:
+    """The stores this run may change."""
+    homes = [Path(h).expanduser() for h in (args.hermes_home or [])] or [default_home]
+    if args.all_profiles:
+        for home in list(homes):
+            homes.extend(_profile_stores(home))
+    return _unique(homes)
+
+
+def _other_platform_stores(selected: List[Path]) -> List[Path]:
+    """Every store of the selected stores' platforms that was not selected.
+
+    The platform of a store is its root home and all of the root's named
+    profiles; the root of a named profile is found the way its fires find it
+    (``cron.jobs.platform_root_for``).
+    """
+    from cron.jobs import platform_root_for
+
+    candidates: List[Path] = []
+    for home in selected:
+        root = platform_root_for(home) or home
+        candidates.append(root)
+        candidates.extend(_profile_stores(root))
+    return [home for home in _unique(candidates) if home not in selected]
 
 
 def _principal_policy_entry(policy: Any, principal: str) -> str:
@@ -128,12 +174,38 @@ def _principal_policy_entry(policy: Any, principal: str) -> str:
     return "admin" if dwd_identity_for(access) is None else "restricted"
 
 
+def _profile_people(policy: Any, profile: str) -> List[str]:
+    """The governed people the policy gives ``profile`` to, by its name.
+
+    Only people who are not administrators count (an administrator's jobs
+    may run with administrator rights anyway), and only a grant of this
+    exact profile name: a wildcard or a pattern gives many profiles and makes
+    none of them anyone's own.
+    """
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+    from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+    people: List[str] = []
+    for email in sorted(policy.users):
+        access = resolve_effective_access(policy, GovernanceSubject(email=email))
+        if dwd_identity_for(access) is None:  # None means administrator
+            continue
+        if profile in access.profiles and access.is_profile_allowed(profile):
+            people.append(email)
+    return people
+
+
 def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> Dict[str, Any]:
     """Read one store and decide what ``--apply`` would do. Writes nothing.
 
     A named profile store that sets neither a principal nor a policy of its
     own follows the platform root's (``cron.jobs.cron_system_principal`` and
     ``cron.jobs.resolve_cron_policy_path``), exactly as its fires do.
+
+    In a named profile the policy gives to governed people by name
+    (``_profile_people``) the principal is never assigned: one person gets
+    the jobs, several leave them ownerless ("left").
     """
     from cron.jobs import (
         load_cron_governance_policy,
@@ -152,10 +224,13 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
         "policy_file": "",
         "policy_source": "",
         "principal_policy_entry": "",
+        "profile_people": [],
         "jobs": [],
         "errors": [],
         "warnings": [],
     }
+    # Problems with the principal block only a store that would assign it.
+    principal_errors: List[str] = []
     root = platform_root_for(home)
     try:
         config = _read_yaml(home / "config.yaml")
@@ -174,7 +249,7 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
     report["principal"] = principal
     report["principal_source"] = "--principal" if principal_override else configured_source
     if not principal:
-        report["errors"].append(
+        principal_errors.append(
             "No system principal: set cron.system_principal in config.yaml or pass --principal."
         )
     elif not configured:
@@ -201,7 +276,7 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
             entry = _principal_policy_entry(policy, principal)
             report["principal_policy_entry"] = entry
             if entry == "missing" and policy.mode == "enforce":
-                report["errors"].append(
+                principal_errors.append(
                     f"{principal} has no entry in the governance policy. Create it before "
                     "--apply, or every assigned job is refused everything it tries."
                 )
@@ -216,10 +291,11 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
                     "unrestricted access, and delegated mailbox commands in their scripts "
                     "act as the principal only."
                 )
+    platform_policy = policy if report["policy_source"] == "platform" else None
     if policy is not None and root is not None and report["policy_source"] == "store":
-        # A profile with a policy of its own. Say so when it is weaker than
-        # the platform's, and block when that is only because the file it
-        # names does not exist (the loader reads a missing file as "off").
+        # A profile with a policy of its own: say so when it is weaker than
+        # the platform's. (A policy file it names that does not exist already
+        # failed above: its fires refuse, cron.jobs.resolve_cron_policy_path.)
         try:
             platform_policy = load_cron_governance_policy(
                 hermes_home=root, config=read_config_file(root / "config.yaml")
@@ -228,23 +304,40 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
             report["errors"].append(f"The platform governance policy could not be read: {exc}")
         else:
             if platform_policy.mode == "enforce" and policy.mode != "enforce":
-                if policy_path is not None and not policy_path.exists():
-                    report["errors"].append(
-                        f"This profile names the policy file {policy_path}, which does not exist, "
-                        "while the platform policy is enforced: its ownerless agent jobs would run "
-                        "unchecked. Fix dashboard.governance.policy_file in its config.yaml."
-                    )
-                else:
-                    report["warnings"].append(
-                        f"This profile has its own policy in mode {policy.mode} while the "
-                        "platform policy is enforced."
-                    )
+                report["warnings"].append(
+                    f"This profile has its own policy in mode {policy.mode} while the "
+                    "platform policy is enforced."
+                )
+
+    # Whose own profile this is: the people are defined in the platform
+    # policy, and a profile with a policy of its own may name them too.
+    people: List[str] = []
+    if policy is not None and root is not None:
+        try:
+            for known in (policy, platform_policy):
+                if known is not None:
+                    people.extend(p for p in _profile_people(known, home.name) if p not in people)
+        except Exception as exc:
+            report["errors"].append(f"Who this profile belongs to could not be read: {exc}")
+    people.sort()
+    report["profile_people"] = people
 
     try:
         jobs = _read_jobs(home)
     except Exception as exc:
         report["errors"].append(f"cron/jobs.json could not be read: {exc}")
         jobs = []
+    if len(people) == 1:
+        new_owner, action, detail = people[0], "would_assign", ""
+    elif people:
+        new_owner, action = "", "left"
+        detail = (
+            "this profile belongs to several people ("
+            + ", ".join(people)
+            + "): an administrator must choose with hermes cron reassign-owner"
+        )
+    else:
+        new_owner, action, detail = principal, "would_assign", ""
     for job in jobs:
         if str(job.get("owner_email") or "").strip():
             continue
@@ -257,15 +350,42 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
                 "name": str(job.get("name") or ""),
                 "kind": kind,
                 "enabled": job.get("enabled", True) is not False,
-                "action": "would_assign",
-                "detail": "",
+                "action": action,
+                "new_owner": new_owner,
+                "detail": detail,
             }
         )
+    if people:
+        report["warnings"].extend(principal_errors)
+        if len(people) > 1:
+            report["warnings"].append(
+                f"The policy gives this profile to several people ({', '.join(people)}); "
+                "its ownerless jobs are left for an administrator to assign."
+            )
+    elif report["jobs"]:
+        report["errors"].extend(principal_errors)
+    else:
+        report["warnings"].extend(principal_errors)
+    return report
+
+
+def inspect_other_store(home: Path) -> Dict[str, Any]:
+    """Read a store this run does not change: its ownerless agent jobs."""
+    report: Dict[str, Any] = {"home": str(home), "ownerless_agent_jobs": [], "errors": []}
+    try:
+        report["ownerless_agent_jobs"] = _left_ownerless_agent_jobs(home)
+    except Exception as exc:
+        report["errors"].append(f"cron/jobs.json could not be read: {exc}")
     return report
 
 
 def apply_store(report: Dict[str, Any], *, actor: str, reason: str) -> None:
-    """Assign the principal to every job in ``report`` (compare and set)."""
+    """Give every job in ``report`` its new owner (compare and set).
+
+    ``reason`` is kept for jobs that go to the principal; a job that goes to
+    the person whose profile holds it keeps ``PERSON_REASON`` unless the
+    operator passed a reason of their own. Jobs ``left`` are not touched.
+    """
     from cron.jobs import reassign_job_owner, use_cron_store
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -274,12 +394,15 @@ def apply_store(report: Dict[str, Any], *, actor: str, reason: str) -> None:
     try:
         with use_cron_store(home):
             for item in report["jobs"]:
+                if item["action"] != "would_assign" or not item.get("new_owner"):
+                    continue
+                to_person = item["new_owner"] != report["principal"]
                 try:
                     result = reassign_job_owner(
                         item["id"],
-                        report["principal"],
+                        item["new_owner"],
                         actor=actor,
-                        reason=reason,
+                        reason=PERSON_REASON if to_person and reason == DEFAULT_REASON else reason,
                         source=SOURCE,
                         expected_owner="",
                     )
@@ -312,11 +435,14 @@ def _print_report(report: Dict[str, Any], *, apply: bool) -> None:
     if report["governance_mode"]:
         entry = report["principal_policy_entry"] or "n/a"
         print(f"  Governance mode: {report['governance_mode']}; principal policy entry: {entry}")
+    if report.get("profile_people"):
+        print(f"  Profile of: {', '.join(report['profile_people'])}")
     print(f"  Ownerless jobs: {len(report['jobs'])}")
     for item in report["jobs"]:
         state = "" if item["enabled"] else " (paused)"
+        owner = f" to {item['new_owner']}" if item.get("new_owner") else ""
         detail = f": {item['detail']}" if item["detail"] else ""
-        print(f"    {item['id']}  {item['kind']:<6}  {item['name']!r}{state}  [{item['action']}{detail}]")
+        print(f"    {item['id']}  {item['kind']:<6}  {item['name']!r}{state}  [{item['action']}{owner}{detail}]")
     for warning in report["warnings"]:
         print(f"  Warning: {warning}")
     for error in report["errors"]:
@@ -370,6 +496,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
+def _agent_jobs_left_behind(reports: List[Dict[str, Any]], others: List[Dict[str, Any]]) -> List[str]:
+    """Where agent jobs without an owner remain, or would remain after apply.
+
+    After an apply that ran: what the store holds now. Otherwise (a dry run,
+    or an apply that blocking problems stopped): every ownerless agent job
+    that apply would not, or could not, give an owner.
+    """
+    places: List[str] = []
+    for report in reports:
+        if "left_ownerless_agent_jobs" in report:
+            ids = report["left_ownerless_agent_jobs"]
+        else:
+            ids = [
+                item["id"]
+                for item in report["jobs"]
+                if item["kind"] == "agent"
+                and (report["errors"] or item["action"] != "would_assign" or not item.get("new_owner"))
+            ]
+        if ids:
+            places.append(f"{report['home']}: {', '.join(ids)}")
+    for other in others:
+        if other["ownerless_agent_jobs"]:
+            places.append(
+                f"{other['home']} (not selected; use --all-profiles or --hermes-home): "
+                + ", ".join(other["ownerless_agent_jobs"])
+            )
+    return places
+
+
 def _run(args: argparse.Namespace, default_home: Path) -> int:
     from cron.jobs import ensure_owner_admin_caller, normalize_owner_identity
 
@@ -381,9 +536,10 @@ def _run(args: argparse.Namespace, default_home: Path) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
+    selected = _stores(args, default_home)
     reports = [
         inspect_store(home, principal_override=principal_override, agent_only=args.agent_only)
-        for home in _stores(args, default_home)
+        for home in selected
     ]
     blocked = any(report["errors"] for report in reports)
 
@@ -402,20 +558,63 @@ def _run(args: argparse.Namespace, default_home: Path) -> int:
                 apply_store(report, actor=actor, reason=str(args.reason or DEFAULT_REASON))
                 report["left_ownerless_agent_jobs"] = _left_ownerless_agent_jobs(Path(report["home"]))
 
-    left = any(report.get("left_ownerless_agent_jobs") for report in reports)
-    ok = not blocked and not left
+    # Read the other stores of the platform last, so a store that apply just
+    # changed is never reported from before the change.
+    others = [inspect_other_store(home) for home in _other_platform_stores(selected)]
+    uncovered = [other for other in others if other["ownerless_agent_jobs"] or other["errors"]]
+    left_behind = _agent_jobs_left_behind(reports, uncovered)
+    unreadable = any(other["errors"] for other in uncovered)
+    ok = not blocked and not left_behind and not unreadable
     if args.json:
-        print(json.dumps({"mode": "apply" if args.apply else "dry_run", "ok": ok, "stores": reports}, indent=2))
+        print(json.dumps(
+            {
+                "mode": "apply" if args.apply else "dry_run",
+                "ok": ok,
+                "stores": reports,
+                "uncovered_stores": uncovered,
+            },
+            indent=2,
+        ))
+        return 0 if ok else 1
+
+    for report in reports:
+        _print_report(report, apply=args.apply)
+    for other in uncovered:
+        print(f"Store not selected: {other['home']}")
+        for error in other["errors"]:
+            print(f"  Blocking: {error}")
+        if other["ownerless_agent_jobs"]:
+            print(
+                f"  Agent jobs without an owner: {', '.join(other['ownerless_agent_jobs'])} "
+                "(run with --all-profiles, or --hermes-home for this store)"
+            )
+    if not args.apply:
+        print("Dry run: nothing was changed. Run again with --apply to assign the owner.")
+    elif blocked:
+        print("Nothing was changed.")
     else:
-        for report in reports:
-            _print_report(report, apply=args.apply)
-        if not args.apply:
-            print("Dry run: nothing was changed. Run again with --apply to assign the owner.")
-        elif blocked:
-            print("Nothing was changed.")
+        assigned = [(r, item) for r in reports for item in r["jobs"] if item["action"] == "assigned"]
+        to_principal = sum(1 for r, item in assigned if item["new_owner"] == r["principal"])
+        to_person = len(assigned) - to_principal
+        people = f" and the person of a personal profile to {to_person} job(s)" if to_person else ""
+        print(
+            f"Assigned the system principal to {to_principal} job(s){people}. "
+            "Audit: cron/owner-audit.jsonl"
+        )
+    if ok:
+        if args.apply:
+            print("All clear: no agent job is left without an owner in any store.")
         else:
-            assigned = sum(1 for r in reports for item in r["jobs"] if item["action"] == "assigned")
-            print(f"Assigned the system principal to {assigned} job(s). Audit: cron/owner-audit.jsonl")
+            print("Nothing blocks: --apply would leave no agent job without an owner in any store.")
+    else:
+        if args.apply:
+            print("Not all clear: agent jobs without an owner remain:")
+        else:
+            print("Not all clear: --apply would leave agent jobs without an owner:")
+        for place in left_behind:
+            print(f"  {place}")
+        if blocked:
+            print("  (and a store has a blocking problem, see above)")
     return 0 if ok else 1
 
 

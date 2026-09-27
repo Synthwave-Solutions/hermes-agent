@@ -1532,3 +1532,150 @@ def test_the_migration_never_overwrites_an_owner_set_meanwhile():
     (item,) = report["jobs"]
     assert item["action"] == "skipped"
     assert _owners(_home())[job["id"]] == "alice@example.test"
+
+
+# ---------------------------------------------------------------------------
+# The migration never reports all clear while a store has ownerless agent jobs
+# and never gives a person's own profile to the administrator principal
+# ---------------------------------------------------------------------------
+
+
+def test_the_migration_reports_profile_stores_even_without_all_profiles(capsys):
+    """The root store is clean, a profile store is not: without
+    --all-profiles the script must say so and must not exit 0."""
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    create_job(prompt="owned", schedule="every 1h", owner_email="alice@example.test")
+    profile = _make_store(
+        _home() / "profiles" / "worker",
+        [_raw_job("agent2"), _raw_job("script2", no_agent=True), _raw_job("owned2", owner="alice@example.test")],
+    )
+
+    assert script.main([]) == 1
+    out = capsys.readouterr().out
+    assert str(profile) in out and "agent2" in out and "--all-profiles" in out
+    assert "script2" not in out, "a script job is not refused, so it does not hold up the all clear"
+    assert "All clear" not in out
+
+    assert script.main(["--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False
+    assert [s_["home"] for s_ in report["stores"]] == [str(_home().resolve())]
+    (uncovered,) = report["uncovered_stores"]
+    assert uncovered["home"] == str(profile.resolve())
+    assert uncovered["ownerless_agent_jobs"] == ["agent2"]
+
+    assert script.main(["--apply"]) == 1
+    out = capsys.readouterr().out
+    assert "Not all clear" in out and "All clear" not in out
+    assert _owners(profile)["agent2"] == "", "a store that was not selected is not changed"
+
+    assert script.main(["--apply", "--all-profiles"]) == 0
+    assert "All clear" in capsys.readouterr().out
+    assert _owners(profile)["agent2"] == PRINCIPAL
+
+
+def test_the_migration_checks_the_whole_platform_when_given_one_profile(capsys):
+    from cron.jobs import create_job
+
+    script = _load_script()
+    _write_config(PRINCIPAL)
+    _write_policy("enforce")
+    left = create_job(prompt="root legacy", schedule="every 1h")
+    profile = _make_store(_home() / "profiles" / "worker", [_raw_job("agent2")])
+
+    assert script.main(["--apply", "--hermes-home", str(profile)]) == 1
+    out = capsys.readouterr().out
+    assert _owners(profile)["agent2"] == PRINCIPAL
+    assert left["id"] in out and "Not all clear" in out
+
+
+def _personal_platform(people):
+    """The platform policy gives the profile "mallory" to ``people``."""
+    root = _platform()
+    policy = yaml.safe_load((root / "dashboard-governance.yaml").read_text(encoding="utf-8"))
+    policy["users"] = {
+        email: {"roles": ["tech_lead"], "grants": {"profiles": ["mallory"]}} for email in people
+    }
+    policy["users"]["alice@example.test"] = {"roles": ["tech_lead"], "grants": {"profiles": ["*"]}}
+    (root / "dashboard-governance.yaml").write_text(yaml.safe_dump(policy), encoding="utf-8")
+    profile = _Profile(root, "mallory").home
+    (profile / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [_raw_job("agent3"), _raw_job("script3", no_agent=True)]}), encoding="utf-8"
+    )
+    return root, profile
+
+
+def test_the_migration_gives_a_personal_profile_job_to_its_person(capsys):
+    """The administrator principal in a governed person's own profile would
+    run their jobs with administrator rights. The person owns them instead."""
+    from cron.jobs import OWNER_AUDIT_FILE_NAME
+
+    script = _load_script()
+    _root, profile = _personal_platform([MALLORY])
+
+    assert script.main(["--json", "--all-profiles"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    (store,) = [s_ for s_ in report["stores"] if s_["home"] == str(profile.resolve())]
+    assert store["profile_people"] == [MALLORY]
+    assert {(j["id"], j["action"], j["new_owner"]) for j in store["jobs"]} == {
+        ("agent3", "would_assign", MALLORY),
+        ("script3", "would_assign", MALLORY),
+    }
+
+    assert script.main(["--apply", "--all-profiles"]) == 0
+    assert "All clear" in capsys.readouterr().out
+    assert _owners(profile) == {"agent3": MALLORY, "script3": MALLORY}
+    rows = [json.loads(line) for line in (profile / "cron" / OWNER_AUDIT_FILE_NAME).read_text().splitlines()]
+    assert {r["new_owner"] for r in rows} == {MALLORY}
+    assert all(r["new_owner"] != PRINCIPAL for r in rows)
+
+
+def test_the_migration_leaves_a_profile_that_maps_to_several_people(capsys):
+    script = _load_script()
+    _root, profile = _personal_platform([MALLORY, "bob@example.test"])
+
+    assert script.main(["--all-profiles"]) == 1
+    out = capsys.readouterr().out
+    assert "agent3" in out and "several people" in out
+
+    assert script.main(["--apply", "--all-profiles"]) == 1
+    out = capsys.readouterr().out
+    assert "Not all clear" in out and "All clear" not in out
+    assert _owners(profile) == {"agent3": "", "script3": ""}
+
+
+def test_a_profile_named_only_for_administrators_gets_the_principal(capsys):
+    script = _load_script()
+    root, profile = _personal_platform([])
+    policy = yaml.safe_load((root / "dashboard-governance.yaml").read_text(encoding="utf-8"))
+    policy["users"]["root@example.test"] = {"roles": ["admin"], "grants": {"profiles": ["mallory"]}}
+    policy["bootstrap_admins"] = [PRINCIPAL, "root@example.test"]
+    (root / "dashboard-governance.yaml").write_text(yaml.safe_dump(policy), encoding="utf-8")
+
+    assert script.main(["--apply", "--all-profiles"]) == 0
+    assert _owners(profile) == {"agent3": PRINCIPAL, "script3": PRINCIPAL}
+
+
+def test_the_explicit_principal_never_overrides_a_personal_profile(capsys):
+    script = _load_script()
+    _root, profile = _personal_platform([MALLORY])
+
+    assert script.main(["--apply", "--all-profiles", "--principal", PRINCIPAL]) == 0
+    assert _owners(profile) == {"agent3": MALLORY, "script3": MALLORY}
+
+
+def test_a_profile_with_its_own_policy_still_belongs_to_its_person(capsys):
+    """The people are defined in the platform policy; a profile's own policy
+    (here "off", with nobody in it) does not hide whose profile it is."""
+    script = _load_script()
+    _root, profile = _personal_platform([MALLORY])
+    (profile / "dashboard-governance.yaml").write_text(
+        yaml.safe_dump({"version": 1, "mode": "off", "default_effect": "deny"}), encoding="utf-8"
+    )
+
+    assert script.main(["--apply", "--all-profiles"]) == 0
+    assert _owners(profile) == {"agent3": MALLORY, "script3": MALLORY}
