@@ -3413,7 +3413,6 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
-    counts_toward_repeat: bool = True,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3425,8 +3424,86 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
-            counts_toward_repeat=counts_toward_repeat,
         )
+
+
+def mark_job_refused(
+    job_id: str,
+    reason: str,
+    *,
+    consume_occurrence: bool = True,
+    expected_fire_owner: Optional[str] = None,
+) -> bool:
+    """Record a fire that governance refused before anything ran.
+
+    A refusal is not a run. It is recorded like a failed one (``last_status``
+    ``blocked_config``, ``reason`` in ``last_error``, one more
+    ``failure_streak``), but it never uses up a repeat limit and never
+    completes a one-shot, so the job still has every run it had once an
+    administrator has given it an owner.
+
+    ``consume_occurrence=True`` is for a scheduled fire (the ticker, a
+    provider fire, a claimed manual run through ``run_one_job``): its claims
+    are released and the job moves on. A recurring job goes to its next
+    occurrence. A one-shot is paused with ``reason`` and keeps no
+    ``last_run_at``: left due it would be refused on every tick until it aged
+    out of its grace window and was removed. After an owner is assigned, run
+    it (``hermes cron run``) or resume it.
+
+    ``consume_occurrence=False`` is for a run someone asked for outside the
+    schedule (``cron.scheduler.run_job_governed``): only the outcome is
+    recorded; schedule, state, repeat count and claims are left alone.
+
+    ``expected_fire_owner`` fences the write to the fire claim's owner, like
+    ``mark_job_run``. Returns True when the job was found and updated.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                schedule = job.get("schedule")
+                kind = schedule.get("kind") if isinstance(schedule, dict) else None
+                if consume_occurrence and kind != "once":
+                    # The lock is re-entrant: one critical section throughout.
+                    return _mark_job_run_locked(
+                        job_id,
+                        False,
+                        reason,
+                        status="blocked_config",
+                        expected_fire_owner=expected_fire_owner,
+                        counts_toward_repeat=False,
+                    )
+                if expected_fire_owner is not None:
+                    claim = job.get("fire_claim")
+                    if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
+                        logger.warning(
+                            "mark_job_refused: job_id %s fire claim owner changed; "
+                            "discarding stale refusal",
+                            job_id,
+                        )
+                        return False
+                job["last_status"] = "blocked_config"
+                job["last_error"] = reason
+                job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+                if consume_occurrence:
+                    now = _hermes_now().isoformat()
+                    job.pop("manual_run_at", None)
+                    job.pop("manual_run_prompt", None)
+                    job["fire_claim"] = None
+                    if job.get("run_claim") is not None:
+                        job["run_claim"] = None
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now
+                    job["paused_reason"] = reason
+                save_jobs(jobs)
+                return True
+        logger.warning("mark_job_refused: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
@@ -3538,9 +3615,8 @@ def _mark_job_run_locked(
     "the run itself failed".
 
     ``counts_toward_repeat=False`` records the outcome without using up a
-    repeat limit, for a fire that was refused before anything ran (a job
-    without an owner under governance ``enforce``). The job still moves to
-    its next occurrence, and a one-shot still ends (it has no next one).
+    repeat limit. Only ``mark_job_refused`` passes it, and only for a
+    recurring job (a refused one-shot never comes here: it would end).
     """
     with _jobs_lock():
         jobs = load_jobs()

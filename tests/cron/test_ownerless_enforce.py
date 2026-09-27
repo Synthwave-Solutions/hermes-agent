@@ -145,11 +145,9 @@ def test_the_refusal_text_is_plain_and_names_no_internals(monkeypatch):
     _write_policy("enforce")
     _patch_run(monkeypatch)
     job = _job()
-    with pytest.raises(s.CronJobOwnerRefused) as exc:
-        with s.governed_as_job_owner(_get(job["id"])):
-            pass
-    text = str(exc.value)
-    assert text == _get(job["id"])["last_error"]
+    result = s.run_job_governed(_get(job["id"]), reason="manual")
+    text = result.refusal
+    assert text and text == _get(job["id"])["last_error"]
     for word in ("hermes", "Hermes", "governance.yaml", chr(0x2013), chr(0x2014)):
         assert word not in text
 
@@ -259,15 +257,173 @@ def test_an_unreadable_policy_refuses_an_owned_job_and_records_it(monkeypatch):
     assert "policy" in _get(job["id"])["last_error"]
 
 
-def test_the_public_gate_still_raises_for_callers_that_run_jobs_themselves(monkeypatch):
-    """The WebUI "Run now" path wraps ``run_job`` in ``governed_as_job_owner``
-    and needs the raise to stop; only ``run_one_job`` swallows it."""
+# ---------------------------------------------------------------------------
+# run_job_governed: the one entry point for running a job on demand
+#
+# The WebUI "Run now" path runs a job itself instead of through the ticker.
+# It must get the same gate as a scheduled fire, and a refusal must come back
+# as a result, never as an exception or an ERROR traceback.
+# ---------------------------------------------------------------------------
+
+
+def test_run_job_governed_runs_the_job_under_its_owner(monkeypatch):
     _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
+    job = _job(owner_email="alice@example.test")
+
+    result = s.run_job_governed(_get(job["id"]), reason="manual")
+
+    assert calls == [(job["id"], "alice@example.test")]
+    assert result.outcome == "ran" and result.ran and not result.refused
+    assert result.success is True
+    assert result.as_run_job_tuple() == (True, "output", "final response", None)
+    assert result.reason == "manual"
+    assert result.owner_email == "alice@example.test"
+    assert result.refusal is None and result.refusal_recorded is False
+    from hermes_cli.dashboard_governance.context import current_governance_context
+
+    assert current_governance_context() is None, "the owner is unbound afterwards"
+
+
+def test_run_job_governed_refuses_an_ownerless_agent_job_without_raising(monkeypatch, caplog):
+    import logging
+
+    _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
     job = _job()
-    with pytest.raises(s.CronJobOwnerRefused):
-        with s.governed_as_job_owner(_get(job["id"])):
-            pytest.fail("the body must not run")
-    assert _get(job["id"])["last_status"] == "blocked_config"
+
+    with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+        result = s.run_job_governed(_get(job["id"]), reason="manual")
+
+    assert calls == [], "the agent must not run"
+    assert result.outcome == "refused" and result.refused and not result.ran
+    assert result.success is False
+    assert "no owner" in result.refusal and result.error == result.refusal
+    assert result.output == "" and result.final_response == ""
+    assert result.refusal_recorded is True
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [r for r in caplog.records if r.exc_info], "no traceback for a refusal"
+    stored = _get(job["id"])
+    assert stored["last_status"] == "blocked_config"
+    assert stored["last_error"] == result.refusal
+    assert stored["failure_streak"] == 1
+
+    from cron.executions import list_executions
+    from cron.incidents import list_incidents
+
+    assert [e["status"] for e in list_executions(job_id=job["id"])] == ["failed"]
+    assert [i["job_id"] for i in list_incidents()] == [job["id"]]
+
+
+@pytest.mark.parametrize("schedule", ["every 1h", "in 30m"])
+def test_an_on_demand_refusal_leaves_the_schedule_alone(monkeypatch, schedule):
+    """Only the outcome is recorded: a run someone asked for now does not move,
+    pause or complete the job's own schedule, or use up a repeat."""
+    _write_policy("enforce")
+    _patch_run(monkeypatch)
+    job = _job(schedule=schedule, repeat=3)
+    before = _get(job["id"])
+
+    assert s.run_job_governed(before, reason="manual").refused
+    stored = _get(job["id"])
+    for field in ("enabled", "state", "next_run_at", "repeat", "last_run_at", "fire_claim", "run_claim"):
+        assert stored.get(field) == before.get(field), field
+    assert stored["last_status"] == "blocked_config"
+
+
+def test_run_job_governed_can_leave_the_record_to_the_caller(monkeypatch):
+    """A caller whose active store does not hold the job records the refusal
+    in the store that does, with ``cron.jobs.mark_job_refused``."""
+    from cron.executions import list_executions
+    from cron.jobs import mark_job_refused
+
+    _write_policy("enforce")
+    _patch_run(monkeypatch)
+    job = _job()
+    before = _get(job["id"])
+
+    result = s.run_job_governed(before, reason="manual", record_refusal=False)
+
+    assert result.refused and result.refusal_recorded is False
+    assert _get(job["id"]) == before, "nothing was written"
+    assert list_executions(job_id=job["id"]) == []
+
+    assert mark_job_refused(job["id"], result.refusal, consume_occurrence=False) is True
+    stored = _get(job["id"])
+    assert stored["last_status"] == "blocked_config"
+    assert stored["next_run_at"] == before["next_run_at"]
+
+
+@pytest.mark.parametrize("mode", ["off", "report_only"])
+def test_run_job_governed_runs_ownerless_jobs_as_before_without_enforce(monkeypatch, mode):
+    _write_policy(mode)
+    calls = _patch_run(monkeypatch)
+    job = _job()
+
+    result = s.run_job_governed(_get(job["id"]), reason="api")
+    assert result.ran and result.success
+    assert calls == [(job["id"], None)]
+
+
+def test_run_job_governed_refuses_an_owner_whose_governance_cannot_be_resolved(monkeypatch):
+    _write_policy(raw_text="mode: [enforce\n")
+    calls = _patch_run(monkeypatch)
+    job = _job(owner_email="alice@example.test")
+
+    result = s.run_job_governed(_get(job["id"]), reason="manual")
+    assert calls == []
+    assert result.refused and "policy" in result.refusal
+
+
+def test_run_job_governed_returns_a_failed_run_instead_of_raising(monkeypatch):
+    _write_policy("enforce")
+
+    def exploding_run_job(job, **_kw):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(s, "run_job", exploding_run_job)
+    job = _job(owner_email="alice@example.test")
+
+    result = s.run_job_governed(_get(job["id"]), reason="manual")
+    assert result.outcome == "failed" and not result.ran and not result.refused
+    assert result.success is False
+    assert "provider exploded" in result.error
+    from hermes_cli.dashboard_governance.context import current_governance_context
+
+    assert current_governance_context() is None
+
+
+def test_run_job_governed_passes_run_job_arguments_through(monkeypatch):
+    seen = {}
+
+    def fake_run_job(job, **kw):
+        seen.update(kw)
+        return (True, "doc", "final", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    job = _job(owner_email="alice@example.test")
+
+    s.run_job_governed(_get(job["id"]), reason="manual", extra_prompt="only this time")
+    assert seen == {"extra_prompt": "only this time"}
+
+
+def test_the_run_result_travels_as_plain_data(monkeypatch):
+    """The WebUI runs the job in a child process and sends the result back."""
+    import pickle
+
+    _write_policy("enforce")
+    _patch_run(monkeypatch)
+    refused = s.run_job_governed(_get(_job()["id"]), reason="manual")
+
+    data = refused.to_dict()
+    assert json.loads(json.dumps(data)) == data
+    assert data["outcome"] == "refused" and data["refusal"] == refused.refusal
+    assert pickle.loads(pickle.dumps(refused)) == refused
+
+
+def test_there_is_one_public_governed_entry_point():
+    assert not hasattr(s, "governed_as_job_owner")
+    assert callable(s.run_job_governed)
 
 
 def test_a_refused_fire_is_not_logged_as_a_failed_future(monkeypatch, caplog):
@@ -282,10 +438,13 @@ def test_a_refused_fire_is_not_logged_as_a_failed_future(monkeypatch, caplog):
     job = _job()
     update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(minutes=1)).isoformat()})
 
-    with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+    with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
         assert s.tick(verbose=False, sync=True) == 1
 
     assert not [r for r in caplog.records if "future failed" in r.getMessage()]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    refusals = [r for r in caplog.records if "no owner" in r.getMessage()]
+    assert refusals and all(r.levelno == logging.WARNING and not r.exc_info for r in refusals)
     assert _get(job["id"])["last_status"] == "blocked_config"
 
 
@@ -331,9 +490,27 @@ def test_a_refused_fire_does_not_use_up_a_repeat_limit(monkeypatch):
     assert _get(job["id"])["repeat"]["completed"] == 1
 
 
+def test_a_refused_recurring_fire_through_the_ticker_keeps_its_repeats(monkeypatch):
+    from cron.jobs import _hermes_now, update_job
+
+    _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
+    job = _job(repeat=2)
+    for _ in range(3):
+        update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(minutes=1)).isoformat()})
+        assert s.tick(verbose=False, sync=True) == 1
+
+    stored = _get(job["id"])
+    assert calls == []
+    assert stored["repeat"]["completed"] == 0
+    assert stored["enabled"] is True and stored["state"] == "scheduled"
+    assert stored["failure_streak"] == 3
+
+
 def test_a_refused_one_shot_is_not_counted_as_a_run(monkeypatch):
-    """A one-shot has no next occurrence, so it still ends, but the record
-    does not claim that it used its run."""
+    """A refused one-shot keeps its run: not counted, not completed, and not
+    left due (it would be refused every tick until it aged out and vanished).
+    It is paused with the reason instead."""
     _write_policy("enforce")
     calls = _patch_run(monkeypatch)
     job = _job(schedule="in 30m")
@@ -344,6 +521,72 @@ def test_a_refused_one_shot_is_not_counted_as_a_run(monkeypatch):
     assert calls == []
     assert stored["repeat"]["completed"] == 0
     assert stored["last_status"] == "blocked_config"
+    assert stored["state"] == "paused" and stored["enabled"] is False
+    assert stored["paused_reason"] == stored["last_error"]
+    assert stored.get("last_run_at") is None, "a one-shot that never ran must stay runnable"
+
+
+def _make_one_shot_due(job_id, *, seconds_ago=30):
+    """Put a one-shot's run time just inside its grace window, as the ticker
+    sees it on the minute it is due."""
+    from cron.jobs import _hermes_now, load_jobs, save_jobs
+
+    due_at = (_hermes_now() - timedelta(seconds=seconds_ago)).isoformat()
+    jobs = load_jobs()
+    for record in jobs:
+        if record["id"] == job_id:
+            record["schedule"]["run_at"] = due_at
+            record["next_run_at"] = due_at
+    save_jobs(jobs)
+
+
+def test_a_refused_one_shot_through_the_ticker_keeps_its_run(monkeypatch):
+    """Through the real ticker path (due scan, run claim, fire claim,
+    run_one_job): the gate refuses before the pre-run dispatch claim, so
+    ``repeat.completed`` is never pre-incremented, the one-shot is neither
+    completed nor removed as a wedged dispatch, and once an administrator has
+    given it an owner it runs exactly once."""
+    from cron.jobs import get_due_jobs, reassign_job_owner, trigger_job
+
+    _write_policy("enforce")
+    calls = _patch_run(monkeypatch)
+    dispatch_claims = []
+    real_claim_dispatch = s.claim_dispatch
+
+    def recording_claim_dispatch(job_id):
+        dispatch_claims.append(job_id)
+        return real_claim_dispatch(job_id)
+
+    monkeypatch.setattr(s, "claim_dispatch", recording_claim_dispatch)
+    job = _job(schedule="in 30m")
+    assert job["repeat"] == {"times": 1, "completed": 0}
+    _make_one_shot_due(job["id"])
+
+    assert s.tick(verbose=False, sync=True) == 1
+
+    assert calls == [] and dispatch_claims == []
+    stored = _get(job["id"])
+    assert stored is not None, "not removed as a wedged dispatch"
+    assert stored["repeat"]["completed"] == 0
+    assert stored["state"] == "paused" and stored["enabled"] is False
+    assert stored.get("last_run_at") is None
+    assert stored["last_status"] == "blocked_config"
+    assert stored.get("fire_claim") is None and stored.get("run_claim") is None
+    assert get_due_jobs() == []
+
+    # The next ticks leave it alone instead of refusing it every minute.
+    assert s.tick(verbose=False, sync=True) == 0
+    assert _get(job["id"])["failure_streak"] == 1
+
+    reassign_job_owner(job["id"], PRINCIPAL, actor="os:test")
+    trigger_job(job["id"])
+    assert s.tick(verbose=False, sync=True) == 1
+
+    assert calls == [(job["id"], PRINCIPAL)]
+    assert dispatch_claims == [job["id"]]
+    stored = _get(job["id"])
+    assert stored["repeat"]["completed"] == 1
+    assert stored["state"] == "completed" and stored["last_status"] == "ok"
 
 
 def test_the_gate_unbinds_after_the_run(monkeypatch):
