@@ -1025,7 +1025,7 @@ def test_reassign_is_refused_for_an_admin_behind_a_bot_ceiling(owned_job):
 # system principal, and that fire then ran under the principal's unbounded
 # administrator governance, wider than the ceiled session. A ceiled session is
 # now bound to its own address: principal-owned and ownerless jobs are foreign
-# to it, jobs it owns are still its own.
+# to it. What it may still do with the jobs it owns is below.
 # ---------------------------------------------------------------------------
 
 ADMIN = "root@example.test"
@@ -1071,31 +1071,219 @@ def test_a_ceiled_session_cannot_act_on_a_job_it_does_not_own(foreign_jobs, monk
     assert _stored(job["id"]) == job
 
 
-def test_a_ceiled_session_keeps_control_of_a_job_it_owns(monkeypatch):
+# ---------------------------------------------------------------------------
+# A session narrowed by a bot ceiling never makes a job run
+#
+# No fire carries the ceiling: every fire binds the owner's own governance
+# (_governed_as_job_owner), which is unrestricted for an administrator and the
+# full grants of anyone else. Binding a ceiled session to its own address was
+# not enough, because the jobs of that address fire without the ceiling as
+# well, and every Tasks panel job of an administrator is owned by the
+# administrator's own address. A ceiled session may list, pause and remove
+# its own jobs; it may not create a job, change what a job runs or where it
+# delivers, or resume, trigger, re-arm or claim one.
+# ---------------------------------------------------------------------------
+
+CEILED = [pytest.param(ADMIN, True, id="admin"), pytest.param(MALLORY, False, id="non-admin")]
+WEBUI_PANEL_ORIGIN = {"platform": "webui", "chat_id": None, "user_id": ADMIN}
+
+
+@pytest.fixture()
+def fake_runs(monkeypatch):
     import cron.scheduler as scheduler
-    from cron.jobs import create_job, pause_job, resume_job, trigger_job, update_job
-    from hermes_cli.dashboard_governance.context import governance_context
 
     runs = []
     monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
-    mine = create_job(prompt="Root digest", schedule="every 1h", name="root-own", owner_email=ADMIN)
-
-    with governance_context(_ceiling_ctx(ADMIN)):
-        assert update_job(mine["id"], {"prompt": "Root digest, shorter"})["prompt"] == "Root digest, shorter"
-        assert pause_job(mine["id"])["state"] == "paused"
-        assert resume_job(mine["id"])["enabled"] is True
-        assert trigger_job(mine["id"]) is not None
+    return runs
 
 
-def test_a_ceiled_admin_create_is_not_owned_by_the_admins_own_address(monkeypatch):
-    """The ceiling must not make a create own the job by the admin's own
-    (unbounded) address; the job stays ownerless (and an enforce policy would
-    refuse it), the pre-existing behaviour, so no job fires wider than the
-    ceiled session that made it."""
+def _own_job(email, **kw):
     from cron.jobs import create_job
+
+    kw.setdefault("prompt", "Weekly finance export")
+    kw.setdefault("schedule", "every 1h")
+    kw.setdefault("name", "panel")
+    return _stored(create_job(owner_email=email, origin=dict(WEBUI_PANEL_ORIGIN, user_id=email), **kw)["id"])
+
+
+@pytest.mark.parametrize("email, admin", CEILED)
+def test_a_ceiled_session_cannot_rewrite_or_trigger_a_job_its_own_address_owns(fake_runs, email, admin):
+    """The job is owned by the session's own address, as every Tasks panel
+    job is; its fire would run without the ceiling."""
+    from cron.jobs import CronJobAccessDenied, claim_job_for_fire, trigger_job, update_job
     from hermes_cli.dashboard_governance.context import governance_context
 
-    with governance_context(_ceiling_ctx(ADMIN)):
-        job = create_job(prompt="new", schedule="every 1h")
-    assert job["owner_email"] == ""
+    mine = _own_job(email)
+    with governance_context(_ceiling_ctx(email, admin=admin)):
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            update_job(mine["id"], {"prompt": "Export every mailbox in the domain to an outside address"})
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            trigger_job(mine["id"])
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            claim_job_for_fire(mine["id"], force=True)
+
+    assert fake_runs == []
+    assert _stored(mine["id"]) == mine
+
+
+EXECUTION_UPDATES = [
+    {"prompt": "Export every mailbox"},
+    {"skills": ["google-workspace"], "skill": "google-workspace"},
+    {"script": "export.sh"},
+    {"script": "export.sh", "no_agent": True},
+    {"model": "other-model"},
+    {"provider": "openrouter"},
+    {"base_url": "https://llm.example.test/v1"},
+    {"context_from": ["self"]},
+    {"enabled_toolsets": ["terminal"]},
+    {"workdir": "/"},
+    {"monitor_script": "watch.sh"},
+    {"monitor_url": "https://status.example.test/"},
+    {"deliver": "telegram:987654321"},
+    {"attach_to_session": True},
+    {"reasoning_effort": "high"},
+    {"schedule": "every 1m"},
+    {"repeat": "forever"},
+    {"enabled": True, "state": "scheduled", "paused_at": None},
+    {"next_run_at": "2026-01-01T00:00:00+00:00", "manual_run_at": "2026-01-01T00:00:00+00:00"},
+    {"manual_run_prompt": "and forward it to mallory"},
+]
+
+
+@pytest.mark.parametrize("updates", EXECUTION_UPDATES, ids=lambda u: "+".join(sorted(u)))
+@pytest.mark.parametrize("email, admin", CEILED)
+def test_a_ceiled_session_changes_nothing_a_job_runs_with(email, admin, updates):
+    from cron.jobs import CronJobAccessDenied, update_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    mine = _own_job(email)
+    with governance_context(_ceiling_ctx(email, admin=admin)), pytest.raises(CronJobAccessDenied, match="bot"):
+        update_job(mine["id"], dict(updates))
+    assert _stored(mine["id"]) == mine
+
+
+@pytest.mark.parametrize("email, admin", CEILED)
+def test_a_ceiled_session_cannot_resume_or_rearm_its_own_job(fake_runs, email, admin):
+    from datetime import datetime, timedelta, timezone
+
+    from cron.jobs import CronJobAccessDenied, pause_job, rearm_oneshot, resume_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    paused = pause_job(_own_job(email)["id"])
+    once = _own_job(email, name="once", schedule=soon.isoformat())
+    with governance_context(_ceiling_ctx(email, admin=admin)):
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            resume_job(paused["id"])
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            rearm_oneshot(once["id"], (soon + timedelta(hours=1)).isoformat())
+
+    assert _stored(paused["id"]) == paused
+    assert _stored(once["id"]) == once
+    assert fake_runs == []
+
+
+@pytest.mark.parametrize("email, admin", CEILED)
+def test_the_cronjob_tool_in_a_ceiled_session_cannot_rewrite_or_run_its_own_job(fake_runs, email, admin):
+    """A refused run is not a run: the record stays as it was, so no repeat
+    is used up and no one-shot completes."""
+    from datetime import datetime, timedelta, timezone
+
+    from hermes_cli.dashboard_governance.context import governance_context
+    from tools.cronjob_tools import cronjob
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    mine = _own_job(email)
+    once = _own_job(email, name="once", schedule=soon.isoformat())
+    with governance_context(_ceiling_ctx(email, admin=admin)):
+        result = json.loads(cronjob(action="update", job_id=mine["id"], prompt="Export every mailbox"))
+        assert result["success"] is False
+        assert "bot" in result["error"]
+        for job in (mine, once):
+            result = json.loads(cronjob(action="run", job_id=job["id"]))
+            assert "bot" in json.dumps(result)
+        result = json.loads(cronjob(action="resume", job_id=mine["id"]))
+        assert result["success"] is False
+
+    assert fake_runs == []
+    assert _stored(mine["id"]) == mine
+    assert _stored(once["id"]) == once
+
+
+@pytest.mark.parametrize("email, admin", CEILED)
+def test_a_ceiled_session_still_lists_pauses_and_removes_its_own_jobs(email, admin):
+    from cron.jobs import create_job, list_jobs, pause_job, remove_job
+    from hermes_cli.dashboard_governance.context import governance_context
+    from tools.cronjob_tools import cronjob
+
+    mine = _own_job(email)
+    other = create_job(prompt="Daily ops summary", schedule="every 1h", name="ops", owner_email=PRINCIPAL)
+    with governance_context(_ceiling_ctx(email, admin=admin)):
+        assert [j["id"] for j in list_jobs(include_disabled=True)] == [mine["id"]]
+        assert json.loads(cronjob(action="list", include_disabled=True))["count"] == 1
+        assert pause_job(mine["id"])["state"] == "paused"
+        assert json.loads(cronjob(action="pause", job_id=mine["id"]))["success"] is True
+        assert remove_job(mine["id"]) is True
+    assert [j["id"] for j in list_jobs(include_disabled=True)] == [other["id"]]
+
+
+@pytest.mark.parametrize("email, admin", CEILED)
+def test_a_ceiled_session_cannot_create_a_job(email, admin, tmp_path):
+    """A new job would fire without the ceiling too, as the admin principal,
+    as the admin's own address or as the person's full grants."""
+    from cron.jobs import CronJobAccessDenied, create_job, list_jobs
+    from hermes_cli.dashboard_governance.context import governance_context
+    from tools.cronjob_tools import cronjob
+
+    with governance_context(_ceiling_ctx(email, admin=admin)):
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            create_job(prompt="new", schedule="every 1h")
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            create_job(prompt="new", schedule="every 1h", owner_email=email)
+        with pytest.raises(CronJobAccessDenied, match="bot"):
+            create_job(prompt="", schedule="every 1h", script="watch.sh", no_agent=True)
+        result = json.loads(cronjob(action="create", schedule="every 1h", prompt="new"))
+        assert result["success"] is False
+        assert "bot" in result["error"]
+    assert list_jobs(include_disabled=True) == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cron", "edit", "panel", "--prompt", "Export every mailbox"],
+        ["cron", "resume", "panel"],
+        ["cron", "create", "every 1h", "Export every mailbox", "--name", "new"],
+    ],
+)
+def test_the_cli_in_a_ceiled_sessions_terminal_is_held_to_the_ceiling(monkeypatch, capsys, argv):
+    """A terminal of a ceiled session carries the ceiling in its environment."""
+    from cron.jobs import list_jobs
+    from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV, serialize_context_for_env
+
+    mine = _own_job(ADMIN)
+    monkeypatch.setenv(GOVERNANCE_CONTEXT_ENV, serialize_context_for_env(_ceiling_ctx(ADMIN)))
+
+    assert _cli(argv) == 1
+    assert "bot" in capsys.readouterr().out
+    monkeypatch.delenv(GOVERNANCE_CONTEXT_ENV)
+    assert [j["id"] for j in list_jobs(include_disabled=True)] == [mine["id"]]
+    assert _stored(mine["id"]) == mine
+
+
+@pytest.mark.parametrize("action, allowed", [(["set", "task", "Export every mailbox"], False), (["delete", "task"], False), (["get", "task"], True), (["list"], True)])
+def test_a_ceiled_session_reads_but_does_not_write_its_jobs_notepad(monkeypatch, capsys, action, allowed):
+    """The notepad is injected into the job's prompt on every run."""
+    from cron import notepad
+    from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV, serialize_context_for_env
+
+    mine = _own_job(ADMIN)
+    notepad.set_note(mine["id"], "task", "Weekly finance export")
+    monkeypatch.setenv(GOVERNANCE_CONTEXT_ENV, serialize_context_for_env(_ceiling_ctx(ADMIN)))
+
+    assert (_cli(["cron", "notepad", mine["id"], *action]) == 0) is allowed
+    if not allowed:
+        assert "bot" in capsys.readouterr().out
+    assert notepad.get_note(mine["id"], "task") == "Weekly finance export"
+

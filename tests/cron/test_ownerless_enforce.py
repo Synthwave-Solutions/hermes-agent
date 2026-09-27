@@ -700,6 +700,44 @@ def test_a_governed_tick_leaves_other_peoples_due_jobs_untouched(monkeypatch, go
     assert {owner for _jid, owner in calls} == {"alice@example.test"}
 
 
+def test_a_tick_under_a_bot_ceiling_dispatches_nothing(monkeypatch):
+    """No fire carries a bot ceiling, so a ceiled session claims no job, not
+    even its own (cron.jobs.bot_ceiling_applies). Its due scan must then find
+    nothing due, or it would fast-forward the job and lose the occurrence."""
+    from dataclasses import replace
+
+    from cron.jobs import create_job, get_job
+    from hermes_cli.dashboard_governance.context import governance_context
+    from hermes_cli.dashboard_governance.models import EffectiveAccess, GovernanceSubject, GrantSet
+
+    root = "root@example.test"
+    _write_policy("enforce", bootstrap_admins=(PRINCIPAL, root))
+    _write_config()
+    calls = _patch_run(monkeypatch)
+    recurring = create_job(prompt="Root digest", schedule="every 1h", owner_email=root, name="root-recurring")
+    one_shot = create_job(prompt="Root reminder", schedule="in 30m", owner_email=root, name="root-once")
+    _make_recurring_due(recurring["id"])
+    _make_one_shot_due(one_shot["id"])
+    before_next = get_job(recurring["id"])["next_run_at"]
+    ceiling = EffectiveAccess(
+        subject=GovernanceSubject(email="bot@example.test"),
+        mode="enforce",
+        roles=frozenset({"bot"}),
+        grants=GrantSet(tools=frozenset({"cronjob"})),
+    )
+    ctx = replace(_governed(root, admin=True), bot_access_ceiling=ceiling, bot_access_check=lambda: True)
+
+    with governance_context(ctx):
+        assert s.tick(verbose=False, sync=True) == 0
+
+    assert calls == []
+    assert get_job(recurring["id"])["next_run_at"] == before_next
+    assert get_job(one_shot["id"]).get("run_claim") is None
+    assert get_job(one_shot["id"]).get("fire_claim") is None
+    assert s.tick(verbose=False, sync=True) == 2
+    assert {owner for _jid, owner in calls} == {root}
+
+
 def test_a_refused_fire_claim_in_the_ticker_releases_the_one_shot_run_claim(monkeypatch):
     """Defense in depth in the tick worker: if the fire claim is refused after
     the due scan (the job was reassigned away between scan and claim), the
@@ -850,10 +888,11 @@ def test_hermes_cron_create_without_a_principal_stays_ownerless():
 
 def test_an_admin_behind_a_bot_ceiling_does_not_get_the_principal():
     """A principal-owned job runs as an administrator, without the bot's
-    ceiling. The session was narrower than that, so the job stays ownerless
-    (and enforce refuses it) instead of widening to the principal."""
+    ceiling. The session was narrower than that, so it creates no job at all
+    (no fire carries a ceiling) instead of widening to the principal."""
     from dataclasses import replace
 
+    from cron.jobs import CronJobAccessDenied, list_jobs
     from hermes_cli.dashboard_governance.context import governance_context
     from hermes_cli.dashboard_governance.models import (
         EffectiveAccess,
@@ -873,9 +912,9 @@ def test_an_admin_behind_a_bot_ceiling_does_not_get_the_principal():
         bot_access_ceiling=ceiling,
         bot_access_check=lambda: True,
     )
-    with governance_context(ctx):
-        job = _job()
-    assert job["owner_email"] == ""
+    with governance_context(ctx), pytest.raises(CronJobAccessDenied):
+        _job()
+    assert list_jobs(include_disabled=True) == []
 
 
 def test_an_admin_turn_continuing_a_non_admin_envelope_does_not_get_the_principal():

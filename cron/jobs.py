@@ -2258,6 +2258,12 @@ _FOREIGN_CONTEXT_SOURCE_ERROR = (
     "'{ref}' is not one of them."
 )
 
+_BOT_CEILING_ERROR = (
+    "A managed bot session cannot schedule, change, resume or run a scheduled "
+    "task, because the task would run without the bot's limits. It can list, "
+    "pause and remove its own tasks."
+)
+
 _OWNERLESS_CREATE_REFUSAL = (
     "Cannot schedule this task: access control is enforced and the task would "
     "have no owner to run as, so it would never run. Ask your admin."
@@ -2561,15 +2567,16 @@ def _governed_caller_identities(*, include_ceiling: bool = True) -> Optional[fro
     administrator's own address, not treated as a full administrator: a
     ceiling caps what the session may do, so acting on a principal-owned or
     ownerless job (which the resolver would run under unbounded administrator
-    rights) is a widening the ceiling exists to prevent. The ceiled session
-    keeps full control of jobs it owns. Owner changes are refused for such a
-    session separately (``ensure_owner_admin_caller``).
+    rights) is a widening the ceiling exists to prevent. Even on the jobs it
+    owns a ceiled session may only list, pause and remove: no fire carries
+    the ceiling, so everything that makes a job run or changes what it runs
+    is refused as well (``bot_ceiling_applies``). Owner changes are refused
+    for such a session separately (``ensure_owner_admin_caller``).
 
-    Creating a job passes ``include_ceiling=False``: a ceiled administrator's
-    create must not be given the admin's own (unbounded) address as owner,
-    because the fire would then run wider than the ceiled session that made
-    it. It stays ownerless there (``_creating_session_is_enforced_admin``
-    refuses it under enforce), the pre-existing behaviour.
+    Creating a job passes ``include_ceiling=False`` so that a ceiled
+    administrator's create is never given the admin's own (unbounded)
+    address as owner; ``create_job`` then refuses the create for any ceiled
+    session.
 
     An address that cannot be used, or a context that cannot be read, is
     "" and matches no job, so the caller acts on nothing (fail closed).
@@ -2654,6 +2661,60 @@ def _check_context_sources(refs: Any, jobs: List[Dict[str, Any]], identities: Op
             continue
         if text not in owned:
             raise CronJobAccessDenied(_FOREIGN_CONTEXT_SOURCE_ERROR.format(ref=text))
+
+
+# ---------------------------------------------------------------------------
+# A session narrowed by a bot access ceiling never makes a job run
+# ---------------------------------------------------------------------------
+
+
+def bot_ceiling_applies() -> bool:
+    """True when a bot access ceiling narrows the calling session under enforce.
+
+    No fire carries a ceiling: every fire binds the governance of the job's
+    owner (``cron.scheduler._governed_as_job_owner``), which is unrestricted
+    for an administrator and the full grants of anyone else. So a ceiled
+    session (a managed bot turn, or a terminal below one, which carries the
+    ceiling in its environment) may list, pause and remove the jobs it owns
+    and nothing else: it creates no job, changes nothing a job runs with or
+    delivers to, and resumes, triggers, re-arms or claims no job. A
+    governance context that cannot be read counts as ceiled (fail closed).
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
+    except ImportError:
+        return False
+    try:
+        envelopes = policy_contexts(current_governance_context())
+    except Exception:
+        logger.debug("cron: unreadable governance context; treating it as ceiled", exc_info=True)
+        return True
+    return any(
+        getattr(bound, "bot_access_ceiling", None) is not None
+        and getattr(getattr(bound, "access", None), "mode", "") == "enforce"
+        for bound in envelopes
+    )
+
+
+def _ensure_no_bot_ceiling() -> None:
+    if bot_ceiling_applies():
+        raise CronJobAccessDenied(_BOT_CEILING_ERROR)
+
+
+def _update_only_pauses(updates: Dict[str, Any]) -> bool:
+    """Whether ``updates`` only stops the job (what ``pause_job`` writes)."""
+    for key, value in (updates or {}).items():
+        if key in ("paused_at", "paused_reason"):
+            continue
+        if key == "enabled" and value is False:
+            continue
+        if key == "state" and value == "paused":
+            continue
+        return False
+    return True
 
 
 def _ownerless_create_refusal() -> Optional[str]:
@@ -3089,6 +3150,8 @@ def create_job(
     # creation (see _IMMUTABLE_JOB_FIELDS). Under enforce an agent job without
     # an owner would be refused on every fire, so it is not created at all.
     job_owner = _resolve_creating_owner(owner_email)
+    # No fire carries a bot ceiling, so a ceiled session creates no job.
+    _ensure_no_bot_ceiling()
     if not job_owner and not normalized_no_agent:
         refusal = _ownerless_create_refusal()
         if refusal:
@@ -3263,6 +3326,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         )
     # Only the owner or an administrator changes a job (caller_may_act_on_job).
     governed = _governed_caller_identities()
+    # A session under a bot ceiling may only stop a job (bot_ceiling_applies).
+    ceiled = bot_ceiling_applies()
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -3270,6 +3335,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if job["id"] != job_id:
                 continue
             _ensure_owned_by_caller(job, governed)
+            if ceiled and not _update_only_pauses(updates):
+                raise CronJobAccessDenied(_BOT_CEILING_ERROR)
             if "context_from" in (updates or {}):
                 _check_context_sources(updates.get("context_from"), jobs, governed)
 
@@ -3572,6 +3639,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
     _ensure_owned_by_caller(job, _governed_caller_identities())
+    _ensure_no_bot_ceiling()
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -3608,6 +3676,7 @@ def trigger_job(
     if not job:
         return None
     _ensure_owned_by_caller(job, _governed_caller_identities())
+    _ensure_no_bot_ceiling()
     if is_terminal_job(job):
         state = job.get("state")
         name = job.get("name", job_id)
@@ -3667,12 +3736,15 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
         )
 
     governed = _governed_caller_identities()
+    ceiled = bot_ceiling_applies()
     with _jobs_lock():
         jobs = load_jobs()
         for index, job in enumerate(jobs):
             if job.get("id") != job_ref["id"]:
                 continue
             _ensure_owned_by_caller(job, governed)
+            if ceiled:
+                raise CronJobAccessDenied(_BOT_CEILING_ERROR)
             now = _hermes_now()
             if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
@@ -3753,6 +3825,13 @@ def mark_job_run(
     *,
     expected_fire_owner: Optional[str] = None,
 ) -> bool:
+    # A session under a bot ceiling runs no job (bot_ceiling_applies), so it
+    # has no run to record. The cronjob tool records a refused fire claim as
+    # a failed run; that must not use up a repeat or complete a one-shot.
+    # Every real fire records under its owner's context or none.
+    if bot_ceiling_applies():
+        logger.info("cron: not recording a run of job %s from a session under a bot ceiling", job_id)
+        return False
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -4430,17 +4509,21 @@ def _claim_job_for_fire_locked(
     reclaim it.
 
     A governed person who is not an administrator claims (and so runs) only
-    their own jobs: anything else raises ``CronJobAccessDenied`` before the
-    record is touched. The ticker and the providers claim outside any
-    governed context.
+    their own jobs, and a session under a bot ceiling claims none
+    (``bot_ceiling_applies``): anything else raises ``CronJobAccessDenied``
+    before the record is touched. The ticker and the providers claim outside
+    any governed context.
     """
     governed = _governed_caller_identities()
+    ceiled = bot_ceiling_applies()
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] != job_id:
                 continue
             _ensure_owned_by_caller(job, governed)
+            if ceiled:
+                raise CronJobAccessDenied(_BOT_CEILING_ERROR)
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 return False
             # enabled + pause markers must both clear — a half-paused record
@@ -4740,8 +4823,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # in-process context): another person's due job must never be fast-forwarded,
     # run_claim-stamped or returned here, because the fire claim would then be
     # refused by ``_claim_job_for_fire_locked`` and the occurrence lost. It is
-    # simply not due for this caller.
+    # simply not due for this caller. A session under a bot ceiling claims no
+    # job at all (bot_ceiling_applies), so nothing is due for it.
     governed = _governed_caller_identities()
+    ceiled = bot_ceiling_applies()
 
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
@@ -4751,7 +4836,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # job this tick" so healthy siblings still run and their recovered
         # state still reaches save_jobs() below.
         try:
-            if governed is not None and not _owned_by(job, governed):
+            if ceiled or (governed is not None and not _owned_by(job, governed)):
                 continue
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 continue

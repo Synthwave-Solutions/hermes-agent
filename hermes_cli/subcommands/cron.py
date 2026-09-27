@@ -51,17 +51,22 @@ def _owner_checked_notepad(cmd_cron: Callable) -> Callable:
     it is editing the job, and reading it reads the job's state. In a
     governed person's shell (``HERMES_DWD_IDENTITY``) or under their
     governance context the job must be theirs
-    (``cron.jobs.caller_may_act_on_job_id``); anywhere else the command runs
-    as before.
+    (``cron.jobs.caller_may_act_on_job_id``); below a session under a bot
+    ceiling the notepad is read-only, because no fire carries the ceiling
+    (``cron.jobs.bot_ceiling_applies``); anywhere else the command runs as
+    before.
     """
 
     def _notepad_for_the_owner(args):
-        from cron.jobs import caller_may_act_on_job_id
+        from cron.jobs import _BOT_CEILING_ERROR, bot_ceiling_applies, caller_may_act_on_job_id
         from hermes_cli.colors import Colors, color
 
         job_id = str(getattr(args, "job_id", "") or "")
         if job_id and not caller_may_act_on_job_id(job_id):
             print(color(f"Job not found: {job_id}", Colors.RED))
+            return 1
+        if getattr(args, "notepad_action", None) in ("set", "delete") and bot_ceiling_applies():
+            print(color(f"Notepad error: {_BOT_CEILING_ERROR}", Colors.RED))
             return 1
         return cmd_cron(args)
 
