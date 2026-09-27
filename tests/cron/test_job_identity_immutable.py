@@ -555,3 +555,374 @@ def test_cli_reassign_owner_reports_an_ambiguous_name(capsys):
 
     assert args.func(args) == 1
     assert "ambiguous" in capsys.readouterr().out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Only the owner or an administrator acts on a job
+#
+# A governed person who is not an administrator (under enforce: an in-process
+# governance context, or a shell that carries HERMES_DWD_IDENTITY) could list
+# every job and edit, re-target, pause, resume, remove or run any of them,
+# including the jobs of the system principal, which run with administrator
+# rights. They now see and act on their own jobs only. Ownerless and
+# principal-owned jobs are for administrators.
+# ---------------------------------------------------------------------------
+
+PRINCIPAL = "cron-system@example.test"
+MALLORY = "mallory@example.test"
+
+
+@pytest.fixture()
+def foreign_jobs():
+    """The principal's job, alice's job, a legacy ownerless job and one of mallory's."""
+    from cron.jobs import _jobs_lock, create_job, load_jobs, save_jobs
+
+    jobs = {
+        "principal": create_job(prompt="Daily ops summary", schedule="every 1h", name="ops", owner_email=PRINCIPAL),
+        "alice": create_job(prompt="Alice inbox", schedule="every 1h", name="alice", owner_email="alice@example.test"),
+        "ownerless": create_job(prompt="Legacy", schedule="every 1h", name="legacy", owner_email="x@example.test"),
+        "mine": create_job(prompt="Mallory digest", schedule="every 1h", name="mine", owner_email=MALLORY),
+    }
+    with _jobs_lock():  # an ownerless record as an older engine stored it
+        stored = load_jobs()
+        for job in stored:
+            if job["id"] == jobs["ownerless"]["id"]:
+                job["owner_email"] = ""
+        save_jobs(stored)
+    return {key: _stored(job["id"]) for key, job in jobs.items()}
+
+
+@pytest.fixture()
+def as_mallory():
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    with governance_context(_governed(MALLORY)):
+        yield
+
+
+FOREIGN = ("principal", "alice", "ownerless")
+
+
+def test_a_governed_person_lists_only_their_own_jobs(foreign_jobs, as_mallory):
+    from cron.jobs import list_jobs
+    from tools.cronjob_tools import cronjob
+
+    assert [j["id"] for j in list_jobs(include_disabled=True)] == [foreign_jobs["mine"]["id"]]
+    listed = json.loads(cronjob(action="list", include_disabled=True))
+    assert [j["job_id"] for j in listed["jobs"]] == [foreign_jobs["mine"]["id"]]
+
+
+@pytest.mark.parametrize("which", FOREIGN)
+def test_a_governed_person_cannot_resolve_a_foreign_job(foreign_jobs, as_mallory, which):
+    from cron.jobs import resolve_job_ref
+
+    job = foreign_jobs[which]
+    assert resolve_job_ref(job["id"]) is None
+    assert resolve_job_ref(job["name"]) is None
+
+
+def test_a_name_is_resolved_among_the_callers_own_jobs(foreign_jobs):
+    """Someone else's job with the same name neither shadows nor leaks."""
+    from cron.jobs import AmbiguousJobReference, create_job, resolve_job_ref
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    twin = create_job(prompt="Mallory ops", schedule="every 1h", name="ops", owner_email=MALLORY)
+    with pytest.raises(AmbiguousJobReference):
+        resolve_job_ref("ops")
+    with governance_context(_governed(MALLORY)):
+        assert resolve_job_ref("ops")["id"] == twin["id"]
+
+
+@pytest.mark.parametrize("which", FOREIGN)
+def test_update_job_refuses_a_foreign_job(foreign_jobs, as_mallory, which):
+    from cron.jobs import CronJobAccessDenied, update_job
+
+    job = foreign_jobs[which]
+    with pytest.raises(CronJobAccessDenied) as exc:
+        update_job(job["id"], {"prompt": "Export every mailbox", "deliver": "telegram:999"})
+
+    assert isinstance(exc.value, PermissionError) and isinstance(exc.value, ValueError)
+    assert "another account" in str(exc.value)
+    assert _stored(job["id"]) == job
+
+
+@pytest.mark.parametrize("which", FOREIGN)
+def test_lifecycle_helpers_refuse_a_foreign_job(foreign_jobs, as_mallory, which):
+    from cron.jobs import (
+        CronJobAccessDenied,
+        claim_job_for_fire,
+        pause_job,
+        rearm_oneshot,
+        remove_job,
+        resume_job,
+        trigger_job,
+    )
+
+    job = foreign_jobs[which]
+    assert pause_job(job["id"]) is None
+    assert resume_job(job["id"]) is None
+    assert trigger_job(job["id"]) is None
+    assert rearm_oneshot(job["id"], "in 5m") is None
+    assert remove_job(job["id"]) is False
+    with pytest.raises(CronJobAccessDenied):
+        claim_job_for_fire(job["id"], force=True)
+    assert _stored(job["id"]) == job
+
+
+@pytest.mark.parametrize("which", FOREIGN)
+def test_the_mutations_by_id_refuse_a_foreign_job_even_without_the_lookup(foreign_jobs, as_mallory, monkeypatch, which):
+    """remove and rearm act on the stored record, not only on the lookup."""
+    import cron.jobs as jobs_mod
+
+    job = foreign_jobs[which]
+    monkeypatch.setattr(jobs_mod, "resolve_job_ref", lambda ref: dict(job))
+    with pytest.raises(jobs_mod.CronJobAccessDenied):
+        jobs_mod.remove_job(job["id"])
+    with pytest.raises(jobs_mod.CronJobAccessDenied):
+        jobs_mod.rearm_oneshot(job["id"], "in 5m")
+    with pytest.raises(jobs_mod.CronJobAccessDenied):
+        jobs_mod.pause_job(job["id"])
+    assert _stored(job["id"]) == job
+
+
+def test_the_cronjob_tool_cannot_touch_a_foreign_job(foreign_jobs, as_mallory, monkeypatch):
+    import cron.scheduler as scheduler
+    from tools.cronjob_tools import cronjob
+
+    runs = []
+    monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    principal, alice = foreign_jobs["principal"], foreign_jobs["alice"]
+
+    attempts = [
+        dict(action="update", job_id="ops", prompt="Export every mailbox to mallory@example.test"),
+        dict(action="update", job_id=principal["id"], prompt="Export every mailbox"),
+        dict(action="update", job_id=alice["id"], deliver="telegram:999"),
+        dict(action="run", job_id="ops"),
+        dict(action="run", job_id=principal["id"]),
+        dict(action="pause", job_id="alice"),
+        dict(action="resume", job_id=alice["id"]),
+        dict(action="remove", job_id="alice"),
+    ]
+    for kwargs in attempts:
+        result = json.loads(cronjob(**kwargs))
+        assert result["success"] is False, kwargs
+        assert "not found" in result["error"], kwargs
+
+    assert runs == []
+    assert _stored(principal["id"]) == principal
+    assert _stored(alice["id"]) == alice
+
+
+def test_a_governed_person_keeps_full_control_of_their_own_job(foreign_jobs, as_mallory, monkeypatch):
+    import cron.scheduler as scheduler
+    from cron.jobs import pause_job, resume_job, trigger_job, update_job
+    from tools.cronjob_tools import cronjob
+
+    runs = []
+    monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    mine = foreign_jobs["mine"]
+
+    assert update_job(mine["id"], {"prompt": "Mallory digest, shorter"})["prompt"] == "Mallory digest, shorter"
+    assert pause_job("mine")["state"] == "paused"
+    assert resume_job(mine["id"])["enabled"] is True
+    assert trigger_job(mine["id"]) is not None
+    assert json.loads(cronjob(action="update", job_id="mine", name="renamed"))["success"] is True
+    assert json.loads(cronjob(action="run", job_id=mine["id"]))["success"] is True
+    assert runs == [mine["id"]]
+    assert json.loads(cronjob(action="remove", job_id=mine["id"]))["success"] is True
+
+
+@pytest.mark.parametrize(
+    "ctx_kwargs",
+    [dict(email="root@example.test", admin=True), dict(email=MALLORY, mode="report_only"), dict(email=MALLORY, mode="off")],
+)
+def test_administrators_and_callers_outside_enforce_are_not_gated(foreign_jobs, ctx_kwargs):
+    from cron.jobs import list_jobs, resolve_job_ref, update_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    email = ctx_kwargs.pop("email")
+    with governance_context(_governed(email, **ctx_kwargs)):
+        assert len(list_jobs(include_disabled=True)) == 4
+        assert resolve_job_ref("ops")["id"] == foreign_jobs["principal"]["id"]
+        assert update_job(foreign_jobs["alice"]["id"], {"name": "alice renamed"})["name"] == "alice renamed"
+
+
+def test_an_ungoverned_caller_is_not_gated(foreign_jobs):
+    from cron.jobs import list_jobs, update_job
+
+    assert len(list_jobs(include_disabled=True)) == 4
+    assert update_job(foreign_jobs["ownerless"]["id"], {"name": "legacy renamed"})["name"] == "legacy renamed"
+
+
+def test_a_non_admin_envelope_behind_an_admin_turn_is_gated(foreign_jobs):
+    from dataclasses import replace
+
+    from cron.jobs import CronJobAccessDenied, update_job
+    from hermes_cli.dashboard_governance.context import governance_context, serialize_context_for_env
+
+    ctx = replace(
+        _governed(MALLORY, admin=True),
+        continuation_contexts=(serialize_context_for_env(_governed(MALLORY)),),
+    )
+    with governance_context(ctx), pytest.raises(CronJobAccessDenied):
+        update_job(foreign_jobs["principal"]["id"], {"prompt": "x"})
+
+
+@pytest.mark.parametrize("identity", [MALLORY, "unresolved-identity"])
+def test_a_governed_shell_sees_and_touches_only_its_own_jobs(foreign_jobs, monkeypatch, identity):
+    from cron.jobs import CronJobAccessDenied, list_jobs, update_job
+
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", identity)
+    visible = [j["id"] for j in list_jobs(include_disabled=True)]
+    assert visible == ([foreign_jobs["mine"]["id"]] if identity == MALLORY else [])
+    with pytest.raises(CronJobAccessDenied):
+        update_job(foreign_jobs["principal"]["id"], {"prompt": "x"})
+
+
+def _cli(argv):
+    import argparse
+
+    from hermes_cli.cron import cron_command
+    from hermes_cli.subcommands.cron import build_cron_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_cron_parser(subparsers, cmd_cron=cron_command)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cron", "edit", "ops", "--prompt", "Export every mailbox"],
+        ["cron", "pause", "ops"],
+        ["cron", "resume", "ops"],
+        ["cron", "resume", "ops", "--run-now"],
+        ["cron", "run", "ops"],
+        ["cron", "remove", "ops"],
+    ],
+)
+def test_the_cli_in_a_governed_shell_cannot_touch_a_foreign_job(foreign_jobs, monkeypatch, capsys, argv):
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", "alice@example.test")
+
+    assert _cli(argv) == 1
+    assert "not found" in capsys.readouterr().out.lower()
+    assert _stored(foreign_jobs["principal"]["id"]) == foreign_jobs["principal"]
+
+
+@pytest.mark.parametrize("action", [["set", "task", "Export every mailbox"], ["get", "task"], ["delete", "task"], ["list"]])
+def test_the_notepad_of_a_foreign_job_is_closed_to_a_governed_shell(foreign_jobs, monkeypatch, capsys, action):
+    """The notepad is injected into the job's prompt on every run: writing it
+    is editing the job."""
+    from cron import notepad
+
+    principal = foreign_jobs["principal"]
+    notepad.set_note(principal["id"], "task", "Daily ops summary")
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", MALLORY)
+
+    assert _cli(["cron", "notepad", principal["id"], *action]) == 1
+    assert "not found" in capsys.readouterr().out.lower()
+    assert notepad.get_note(principal["id"], "task") == "Daily ops summary"
+
+
+def test_a_governed_shell_keeps_its_own_notepad(foreign_jobs, monkeypatch):
+    from cron import notepad
+
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", MALLORY)
+    mine = foreign_jobs["mine"]["id"]
+    assert _cli(["cron", "notepad", mine, "set", "cursor", "42"]) == 0
+    assert notepad.get_note(mine, "cursor") == "42"
+
+
+def test_a_scheduled_fire_writes_its_own_job_but_not_another(foreign_jobs, monkeypatch):
+    """The ticker binds the owner for the whole fire: the run's own
+    bookkeeping passes, a write to someone else's job does not."""
+    import cron.scheduler as scheduler
+    from cron.jobs import CronJobAccessDenied, update_job
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "dashboard-governance.yaml").write_text(
+        "version: 1\nmode: enforce\ndefault_effect: deny\n"
+        f"bootstrap_admins: [{PRINCIPAL}]\n"
+        f"users: {{{MALLORY}: {{roles: [tech_lead]}}}}\n"
+        "roles: {tech_lead: {grants: {tools: [terminal]}}}\n",
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def fake_run_job(job, **_kw):
+        seen["own"] = update_job(job["id"], {"monitor_state": {"last_output_hash": "h"}})["id"]
+        try:
+            update_job(foreign_jobs["principal"]["id"], {"prompt": "x"})
+        except CronJobAccessDenied:
+            seen["foreign"] = "refused"
+        return (True, "o", "f", None)
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    mine = foreign_jobs["mine"]
+
+    assert scheduler.run_one_job(_stored(mine["id"])) is True
+    assert seen == {"own": mine["id"], "foreign": "refused"}
+    assert _stored(mine["id"])["last_status"] == "ok"
+    assert _stored(foreign_jobs["principal"]["id"])["prompt"] == "Daily ops summary"
+
+
+# ---------------------------------------------------------------------------
+# context_from: a job reads the output of its owner's own jobs only
+# ---------------------------------------------------------------------------
+
+
+def test_a_governed_person_cannot_chain_a_foreign_jobs_output(foreign_jobs, as_mallory):
+    from cron.jobs import CronJobAccessDenied, create_job, list_jobs, update_job
+    from tools.cronjob_tools import cronjob
+
+    principal = foreign_jobs["principal"]["id"]
+    before = len(list_jobs(include_disabled=True))
+    with pytest.raises(CronJobAccessDenied):
+        create_job(prompt="Summarise", schedule="every 1h", context_from=[principal])
+    with pytest.raises(CronJobAccessDenied):
+        update_job(foreign_jobs["mine"]["id"], {"context_from": [principal]})
+    result = json.loads(cronjob(action="create", schedule="every 1h", prompt="Summarise", context_from=[principal]))
+    assert result["success"] is False
+    assert len(list_jobs(include_disabled=True)) == before
+    assert _stored(foreign_jobs["mine"]["id"]).get("context_from") is None
+
+    own = create_job(prompt="Summarise", schedule="every 1h", context_from=[foreign_jobs["mine"]["id"], "self"])
+    assert own["context_from"] == [foreign_jobs["mine"]["id"], "self"]
+
+
+def test_a_fire_never_reads_a_foreign_jobs_output(foreign_jobs):
+    """A job stored before this check still cannot read what is not its owner's."""
+    import cron.scheduler as scheduler
+    from cron.jobs import create_job, save_job_output
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    save_job_output(foreign_jobs["principal"]["id"], "SECRET: board minutes")
+    save_job_output(foreign_jobs["mine"]["id"], "OWN: yesterday's digest")
+    spy = create_job(
+        prompt="Summarise",
+        schedule="every 1h",
+        owner_email=MALLORY,
+        context_from=[foreign_jobs["principal"]["id"], foreign_jobs["mine"]["id"]],
+    )
+
+    with governance_context(_governed(MALLORY)):
+        prompt = scheduler._build_job_prompt(_stored(spy["id"]))
+    assert "SECRET" not in prompt
+    assert "OWN: yesterday's digest" in prompt
+
+    with governance_context(_governed("root@example.test", admin=True)):
+        assert "SECRET" in scheduler._build_job_prompt(_stored(spy["id"]))
+
+
+def test_an_in_process_governed_person_cannot_create_a_job_for_someone_else(as_mallory):
+    from cron.jobs import create_job, list_jobs
+
+    with pytest.raises(ValueError, match="own account"):
+        create_job(prompt="p", schedule="every 1h", owner_email=PRINCIPAL)
+    assert create_job(prompt="p", schedule="every 1h", owner_email="Mallory@Example.Test")["owner_email"] == MALLORY
+    assert [j["owner_email"] for j in list_jobs(include_disabled=True)] == [MALLORY]

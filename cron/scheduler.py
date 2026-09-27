@@ -4624,7 +4624,7 @@ def _build_job_prompt(
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
-        from cron.jobs import get_cron_output_dir
+        from cron.jobs import caller_may_act_on_job_id, get_cron_output_dir
         output_dir = get_cron_output_dir()
         if isinstance(context_from, str):
             context_from = [context_from]
@@ -4643,6 +4643,19 @@ def _build_job_prompt(
             if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
                 logger.warning(
                     "context_from: skipping invalid job_id %r for job_id=%r name=%r%s",
+                    source_job_id,
+                    job.get("id"),
+                    job.get("name"),
+                    _cron_job_origin_log_suffix(job),
+                )
+                continue
+            # A fire runs bound to its owner: a governed owner who is not an
+            # administrator reads only the output of their own jobs, whatever
+            # was stored in context_from (cron.jobs.caller_may_act_on_job).
+            if not is_self and not caller_may_act_on_job_id(source_job_id):
+                logger.warning(
+                    "context_from: skipping job_id %r for job_id=%r name=%r: "
+                    "it is not a job of this job's owner%s",
                     source_job_id,
                     job.get("id"),
                     job.get("name"),

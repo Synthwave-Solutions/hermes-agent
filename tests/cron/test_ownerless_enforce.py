@@ -769,7 +769,7 @@ def test_an_admin_turn_continuing_a_non_admin_envelope_does_not_get_the_principa
     )
     with governance_context(ctx):
         job = _job()
-    assert job["owner_email"] == ""
+    assert job["owner_email"] == "root@example.test", "the person the narrower envelope governs"
 
 
 # ---------------------------------------------------------------------------

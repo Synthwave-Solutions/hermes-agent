@@ -44,6 +44,31 @@ def _stamping_system_principal(cmd_cron: Callable) -> Callable:
     return _create_as_system_principal
 
 
+def _owner_checked_notepad(cmd_cron: Callable) -> Callable:
+    """Wrap ``hermes cron notepad`` so a governed person reaches only their own jobs.
+
+    The notepad is injected into the job's prompt on every run, so writing
+    it is editing the job, and reading it reads the job's state. In a
+    governed person's shell (``HERMES_DWD_IDENTITY``) or under their
+    governance context the job must be theirs
+    (``cron.jobs.caller_may_act_on_job_id``); anywhere else the command runs
+    as before.
+    """
+
+    def _notepad_for_the_owner(args):
+        from cron.jobs import caller_may_act_on_job_id
+        from hermes_cli.colors import Colors, color
+
+        job_id = str(getattr(args, "job_id", "") or "")
+        if job_id and not caller_may_act_on_job_id(job_id):
+            print(color(f"Job not found: {job_id}", Colors.RED))
+            return 1
+        return cmd_cron(args)
+
+    _notepad_for_the_owner.__wrapped__ = cmd_cron
+    return _notepad_for_the_owner
+
+
 def cmd_cron_reassign_owner(args) -> int:
     """``hermes cron reassign-owner``: the audited admin path for owner changes.
 
@@ -412,6 +437,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_notepad.add_argument("key", nargs="?", help="Notepad key (get/set/delete)")
     cron_notepad.add_argument("value", nargs="?", help="Value to store (set)")
+    cron_notepad.set_defaults(func=_owner_checked_notepad(cmd_cron))
 
     # cron reassign-owner: the only way to change who a job runs as. Editing a
     # job cannot touch its owner (cron.jobs refuses the identity fields), so

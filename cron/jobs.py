@@ -2243,6 +2243,16 @@ _FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR = (
     "it cannot be given to another account."
 )
 
+_FOREIGN_JOB_ERROR = (
+    "This scheduled task belongs to another account. Only its owner or an "
+    "administrator can change, run or remove it."
+)
+
+_FOREIGN_CONTEXT_SOURCE_ERROR = (
+    "A scheduled task can only use the output of your own scheduled tasks; "
+    "'{ref}' is not one of them."
+)
+
 # Set by tools/environments/local.py (``_inject_dwd_identity_env``) on every
 # child process of a governed non-admin session under ``enforce``: their
 # terminal, and the scripts of their cron jobs. It carries the person's
@@ -2461,6 +2471,114 @@ def ensure_owner_admin_caller() -> None:
         raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
 
 
+
+class CronJobAccessDenied(PermissionError, ValueError):
+    """A governed person acted on a scheduled task that is not theirs.
+
+    Also a ValueError (like ``io.UnsupportedOperation`` is both an OSError
+    and a ValueError), so every surface that already turns a ValueError from
+    ``cron.jobs`` into a plain refusal (the CLI, the cronjob tool, the engine
+    dashboard's 400) shows it instead of a traceback.
+    """
+
+
+def _owner_or_blank(value: Any) -> str:
+    try:
+        return normalize_owner_identity(value)
+    except ValueError:
+        return ""
+
+
+def _governed_caller_identities() -> Optional[frozenset]:
+    """Who a governed caller who is not an administrator is, or None.
+
+    None means the caller is not held to their own jobs: the operator, an
+    administrator, an ungoverned process, or a governed person outside
+    ``enforce``. Otherwise the addresses the caller is bound to, from a
+    governed shell (``HERMES_DWD_IDENTITY``, only ever set for a governed
+    non-admin under enforce) and from every envelope of an in-process
+    governance context that is in ``enforce`` and not an administrator's.
+    An address that cannot be used, or a context that cannot be read, is
+    "" and matches no job, so the caller acts on nothing (fail closed).
+    """
+    identities: Set[str] = set()
+    raw = str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip()
+    if raw:
+        identities.add(_owner_or_blank(raw))
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+    except ImportError:
+        return frozenset(identities) if identities else None
+    try:
+        envelopes = policy_contexts(current_governance_context())
+    except Exception:
+        logger.debug("cron: unreadable governance context; the caller acts on no job", exc_info=True)
+        identities.add("")
+        return frozenset(identities)
+    for bound in envelopes:
+        access = getattr(bound, "access", None)
+        if getattr(access, "mode", "") != "enforce":
+            continue
+        identity = dwd_identity_for(access)
+        if identity is not None:  # None means administrator
+            identities.add(_owner_or_blank(identity))
+    return frozenset(identities) if identities else None
+
+
+def _owned_by(job: Any, identities: frozenset) -> bool:
+    owner = str((job or {}).get("owner_email") or "").strip().lower() if isinstance(job, dict) else ""
+    return bool(owner) and all(identity == owner for identity in identities)
+
+
+def caller_may_act_on_job(job: Any) -> bool:
+    """Whether the caller may see, change, run or remove ``job``.
+
+    Always True for the operator, administrators, ungoverned processes and
+    governed people outside ``enforce``. A governed person who is not an
+    administrator (``_governed_caller_identities``) may act on their own
+    jobs only; ownerless jobs and jobs of the system principal are for
+    administrators. The scheduler binds a job's owner for every fire, so a
+    fire's own bookkeeping on its job passes.
+    """
+    identities = _governed_caller_identities()
+    return identities is None or _owned_by(job, identities)
+
+
+def caller_may_act_on_job_id(job_id: Any) -> bool:
+    """``caller_may_act_on_job`` for a job ID in the active store.
+
+    For a governed person the job must exist and be theirs; for everyone
+    else this is True without reading the store.
+    """
+    identities = _governed_caller_identities()
+    if identities is None:
+        return True
+    wanted = str(job_id or "")
+    return any(job.get("id") == wanted and _owned_by(job, identities) for job in load_jobs())
+
+
+def _ensure_owned_by_caller(job: Any, identities: Optional[frozenset]) -> None:
+    if identities is not None and not _owned_by(job, identities):
+        raise CronJobAccessDenied(_FOREIGN_JOB_ERROR)
+
+
+def _check_context_sources(refs: Any, jobs: List[Dict[str, Any]], identities: Optional[frozenset]) -> None:
+    """A governed person may chain only the output of their own jobs."""
+    if identities is None or not refs:
+        return
+    owned = {job.get("id") for job in jobs if _owned_by(job, identities)}
+    for ref in [refs] if isinstance(refs, str) else list(refs):
+        text = str(ref or "").strip()
+        if not text or text.lower() == "self":
+            continue
+        if text not in owned:
+            raise CronJobAccessDenied(_FOREIGN_CONTEXT_SOURCE_ERROR.format(ref=text))
+
+
 _SYSTEM_PRINCIPAL_CREATE_SCOPE: ContextVar[bool] = ContextVar(
     "cron_system_principal_create_scope",
     default=False,
@@ -2484,25 +2602,6 @@ def system_principal_create_scope():
         yield
     finally:
         _SYSTEM_PRINCIPAL_CREATE_SCOPE.reset(token)
-
-
-def _governed_shell_identity() -> Optional[str]:
-    """The governed person whose shell (or cron script) this process is.
-
-    None when ``HERMES_DWD_IDENTITY`` is unset or blank: the operator at the
-    host shell, an administrator's shell, or an ungoverned process. A set
-    value is a governed non-admin under ``enforce`` (see
-    ``_GOVERNED_SHELL_IDENTITY_ENV``); when it is not a usable address
-    ("unresolved-identity") the caller is governed but we cannot tell as
-    whom, so ValueError refuses the create instead of guessing.
-    """
-    raw = str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip()
-    if not raw:
-        return None
-    try:
-        return normalize_owner_identity(raw)
-    except ValueError:
-        raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR) from None
 
 
 # Set in the environment of a process that runs inside, or descends from, an
@@ -2617,13 +2716,15 @@ def _creating_session_is_enforced_admin() -> bool:
 def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     """The owner stamped on a new job.
 
-    A governed shell (``_governed_shell_identity``) always owns what it
-    creates: an explicit owner or an in-process governed person that differs
-    from it is refused, and the system principal is never stamped for it.
-    Otherwise, in order: an explicit ``owner_email``; the governed person
-    creating it (``_creating_owner_email``); the configured system principal
-    when the creator is the CLI (``system_principal_create_scope``) run by
-    the operator at the host shell (``_is_operator_shell``: no session
+    A governed person who is not an administrator
+    (``_governed_caller_identities``: their shell, which carries
+    ``HERMES_DWD_IDENTITY``, or an in-process governance context under
+    ``enforce``) always owns what they create: an explicit owner that differs,
+    or two different governed identities, are refused, an unusable address
+    refuses the create, and the system principal is never stamped for them.
+    Otherwise, in order: an explicit ``owner_email``; the configured system
+    principal when the creator is the CLI (``system_principal_create_scope``)
+    run by the operator at the host shell (``_is_operator_shell``: no session
     marker, no governance context), or, outside the CLI, a governed
     administrator under ``enforce`` with nothing narrower applied. Anyone
     else (the CLI below an agent session, an ungoverned gateway sender, a
@@ -2632,17 +2733,15 @@ def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     assigns an owner.
     """
     explicit = str(owner_email).strip().lower() if owner_email else ""
-    shell_owner = _governed_shell_identity()
-    if shell_owner is not None:
-        for claimed in (explicit, _creating_owner_email()):
-            if claimed and claimed != shell_owner:
-                raise ValueError(_FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR)
-        return shell_owner
+    governed = _governed_caller_identities()
+    if governed is not None:
+        if "" in governed:
+            raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR)
+        if len(governed) > 1 or (explicit and explicit not in governed):
+            raise ValueError(_FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR)
+        return next(iter(governed))
     if explicit:
         return explicit
-    owner = _creating_owner_email()
-    if owner:
-        return owner
     if _SYSTEM_PRINCIPAL_CREATE_SCOPE.get():
         return cron_system_principal() if _is_operator_shell() else ""
     if _creating_session_is_enforced_admin():
@@ -2854,6 +2953,10 @@ def create_job(
         context_from = [str(j).strip() for j in context_from if str(j).strip()] or None
     else:
         context_from = None
+    # A governed person chains only the output of their own jobs.
+    governed = _governed_caller_identities()
+    if governed is not None and context_from:
+        _check_context_sources(context_from, load_jobs(), governed)
 
     prompt_text = _coerce_job_text(prompt).strip()
 
@@ -2987,10 +3090,16 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     - Otherwise, case-insensitive name match.
     - If a name matches more than one job, raises AmbiguousJobReference so the
       caller can surface the matching IDs rather than silently picking one.
+    - A governed person who is not an administrator finds only their own
+      jobs, by ID or by name (``caller_may_act_on_job``): someone else's job
+      is "not found" and never makes a name ambiguous.
     """
     if not ref:
         return None
     jobs = load_jobs()
+    governed = _governed_caller_identities()
+    if governed is not None:
+        jobs = [job for job in jobs if _owned_by(job, governed)]
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -3006,8 +3115,16 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
-    """List all jobs, optionally including disabled ones."""
-    jobs = [_normalize_job_record(j) for j in load_jobs()]
+    """List all jobs, optionally including disabled ones.
+
+    A governed person who is not an administrator sees only their own jobs
+    (``caller_may_act_on_job``).
+    """
+    stored = load_jobs()
+    governed = _governed_caller_identities()
+    if governed is not None:
+        stored = [job for job in stored if _owned_by(job, governed)]
+    jobs = [_normalize_job_record(j) for j in stored]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     try:
@@ -3032,12 +3149,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+    # Only the owner or an administrator changes a job (caller_may_act_on_job).
+    governed = _governed_caller_identities()
 
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            _ensure_owned_by_caller(job, governed)
+            if "context_from" in (updates or {}):
+                _check_context_sources(updates.get("context_from"), jobs, governed)
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -3320,6 +3442,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _ensure_owned_by_caller(job, _governed_caller_identities())
     return update_job(
         job["id"],
         {
@@ -3336,6 +3459,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _ensure_owned_by_caller(job, _governed_caller_identities())
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -3371,6 +3495,7 @@ def trigger_job(
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _ensure_owned_by_caller(job, _governed_caller_identities())
     if is_terminal_job(job):
         state = job.get("state")
         name = job.get("name", job_id)
@@ -3429,11 +3554,13 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
         )
 
+    governed = _governed_caller_identities()
     with _jobs_lock():
         jobs = load_jobs()
         for index, job in enumerate(jobs):
             if job.get("id") != job_ref["id"]:
                 continue
+            _ensure_owned_by_caller(job, governed)
             now = _hermes_now()
             if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
@@ -3468,8 +3595,12 @@ def remove_job(job_id: str) -> bool:
     if not job:
         return False
     canonical_id = job["id"]
+    governed = _governed_caller_identities()
     with _jobs_lock():
         jobs = load_jobs()
+        for stored in jobs:
+            if stored.get("id") == canonical_id:
+                _ensure_owned_by_caller(stored, governed)
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
@@ -4182,12 +4313,19 @@ def _claim_job_for_fire_locked(
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
+
+    A governed person who is not an administrator claims (and so runs) only
+    their own jobs: anything else raises ``CronJobAccessDenied`` before the
+    record is touched. The ticker and the providers claim outside any
+    governed context.
     """
+    governed = _governed_caller_identities()
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] != job_id:
                 continue
+            _ensure_owned_by_caller(job, governed)
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 return False
             # enabled + pause markers must both clear — a half-paused record
