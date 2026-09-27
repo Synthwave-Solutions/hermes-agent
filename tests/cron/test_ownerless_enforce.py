@@ -1230,7 +1230,7 @@ def _load_script():
     return module
 
 
-def _raw_job(job_id, *, owner="", no_agent=False, name=None):
+def _raw_job(job_id, *, owner="", no_agent=False, name=None, origin=None):
     return {
         "id": job_id,
         "name": name or f"job {job_id}",
@@ -1245,7 +1245,7 @@ def _raw_job(job_id, *, owner="", no_agent=False, name=None):
         "created_at": "2026-09-01T09:00:00+00:00",
         "next_run_at": "2026-09-27T10:00:00+00:00",
         "deliver": "local",
-        "origin": None,
+        "origin": origin,
         "owner_email": owner,
     }
 
@@ -1938,3 +1938,68 @@ def test_an_unreadable_platform_policy_refuses_a_profile_with_its_own(monkeypatc
         assert s.run_one_job(_get(job["id"])) is True
         assert "policy" in _get(job["id"])["last_error"]
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# The migration gives a job to the governed person who created it
+#
+# WebUI Tasks-panel jobs carry origin {platform: webui, user_id: <creator>}.
+# Giving such a job the administrator principal would run a governed
+# person's job with administrator rights.
+# ---------------------------------------------------------------------------
+
+
+def _webui_origin(creator):
+    return {"platform": "webui", "chat_id": None, "user_id": creator}
+
+
+def _root_store(jobs, *, users):
+    _write_config(PRINCIPAL)
+    _write_policy("enforce", bootstrap_admins=(PRINCIPAL, "root@example.test"), users=users)
+    (_home() / "cron").mkdir(parents=True, exist_ok=True)
+    (_home() / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+
+
+def test_the_migration_gives_a_job_to_the_governed_person_who_created_it(capsys):
+    from cron.jobs import owner_audit_file
+
+    script = _load_script()
+    _root_store(
+        [
+            _raw_job("tasks1", origin=_webui_origin("Mallory@Example.Test")),
+            _raw_job("legacy1"),
+            _raw_job("admin1", origin=_webui_origin("root@example.test")),
+            _raw_job("chat1", origin={"platform": "telegram", "chat_id": "42", "user_id": "12345"}),
+        ],
+        users={MALLORY: {"roles": ["tech_lead"]}},
+    )
+
+    assert script.main(["--json"]) == 0
+    (store,) = json.loads(capsys.readouterr().out)["stores"]
+    assert {(j["id"], j["action"], j["new_owner"]) for j in store["jobs"]} == {
+        ("tasks1", "would_assign", MALLORY),
+        ("legacy1", "would_assign", PRINCIPAL),
+        ("admin1", "would_assign", PRINCIPAL),
+        ("chat1", "would_assign", PRINCIPAL),
+    }
+
+    assert script.main(["--apply"]) == 0
+    assert "All clear" in capsys.readouterr().out
+    assert _owners(_home()) == {"tasks1": MALLORY, "legacy1": PRINCIPAL, "admin1": PRINCIPAL, "chat1": PRINCIPAL}
+    rows = {r["job_id"]: r for r in map(json.loads, owner_audit_file().read_text().splitlines())}
+    assert "created" in rows["tasks1"]["reason"]
+
+
+def test_the_migration_leaves_a_job_whose_creator_has_no_policy_entry(capsys):
+    script = _load_script()
+    _root_store(
+        [_raw_job("tasks2", origin=_webui_origin("former@example.test"))],
+        users={MALLORY: {"roles": ["tech_lead"]}},
+    )
+
+    assert script.main([]) == 1
+    out = capsys.readouterr().out
+    assert "tasks2" in out and "former@example.test" in out and "Not all clear" in out
+
+    assert script.main(["--apply"]) == 1
+    assert _owners(_home()) == {"tasks2": ""}

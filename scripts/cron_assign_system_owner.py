@@ -7,12 +7,15 @@ were recorded, and jobs an administrator or the CLI made, are ownerless. This
 script assigns ``cron.system_principal`` to them so they keep running, under
 that principal's governance.
 
-A governed person's own profile never gets the principal: that would run
-their jobs with administrator rights. When the governance policy gives a
-named profile, by name, to exactly one person who is not an administrator,
-its ownerless jobs go to that person. When it gives it to several, they are
-left ownerless and listed for an administrator to decide
-(``hermes cron reassign-owner``).
+A governed person's job never gets the principal: that would run it with
+administrator rights. A job whose origin names who created it (WebUI Tasks
+panel jobs carry ``origin.user_id``) goes to that person when the policy
+knows them and they are not an administrator; when the policy has no entry
+for them it is left ownerless and listed for an administrator to decide
+(``hermes cron reassign-owner``). When the governance policy gives a named
+profile, by name, to exactly one person who is not an administrator, its
+other ownerless jobs go to that person. When it gives it to several, they
+are left ownerless and listed for an administrator to decide.
 
 DRY RUN BY DEFAULT. Without ``--apply`` it only reads (config.yaml, the
 governance policy and cron/jobs.json of each store) and writes nothing at all:
@@ -60,6 +63,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_REASON = "Assign the system principal to an ownerless job (go-live migration)"
 PERSON_REASON = "Assign the person whose own profile holds this ownerless job (go-live migration)"
+CREATOR_REASON = "Assign the governed person who created this ownerless job (go-live migration)"
 SOURCE = "cron_assign_system_owner"
 
 
@@ -196,6 +200,42 @@ def _profile_people(policy: Any, profile: str) -> List[str]:
     return people
 
 
+def _job_creator(job: Dict[str, Any]) -> str:
+    """The address the job's origin names as its creator, or ""."""
+    from cron.jobs import normalize_owner_identity
+
+    origin = job.get("origin")
+    raw = origin.get("user_id") if isinstance(origin, dict) else None
+    try:
+        return normalize_owner_identity(raw)
+    except ValueError:
+        return ""
+
+
+def _creator_standing(policies: List[Any], creator: str) -> str:
+    """How the policies know a job's creator.
+
+    "admin" when every policy makes them an administrator (their job may
+    run with administrator rights, so the store's owner applies); "person"
+    when a policy gives them an entry and they are not an administrator
+    (the job becomes theirs); "unknown" when they are governed but no
+    policy has an entry for them (left for an administrator).
+    """
+    from hermes_cli.dashboard_governance.models import GovernanceSubject
+    from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+    from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+    governed = any(
+        dwd_identity_for(resolve_effective_access(policy, GovernanceSubject(email=creator))) is not None
+        for policy in policies
+    )
+    if not governed:
+        return "admin"
+    if any(creator in policy.users for policy in policies):
+        return "person"
+    return "unknown"
+
+
 def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> Dict[str, Any]:
     """Read one store and decide what ``--apply`` would do. Writes nothing.
 
@@ -206,6 +246,12 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
     In a named profile the policy gives to governed people by name
     (``_profile_people``) the principal is never assigned: one person gets
     the jobs, several leave them ownerless ("left").
+
+    A job whose origin names a governed creator who is not an administrator
+    (``_job_creator``, ``_creator_standing``) never gets the principal
+    either: it goes to that person, or is left when the policy has no entry
+    for them. Each job reports ``assign_as``: "principal", "profile_person",
+    "creator" or "" (left).
     """
     from cron.jobs import (
         load_cron_governance_policy,
@@ -329,44 +375,67 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
         report["errors"].append(f"cron/jobs.json could not be read: {exc}")
         jobs = []
     if len(people) == 1:
-        new_owner, action, detail = people[0], "would_assign", ""
+        new_owner, action, detail, assign_as = people[0], "would_assign", "", "profile_person"
     elif people:
-        new_owner, action = "", "left"
+        new_owner, action, assign_as = "", "left", ""
         detail = (
             "this profile belongs to several people ("
             + ", ".join(people)
             + "): an administrator must choose with hermes cron reassign-owner"
         )
     else:
-        new_owner, action, detail = principal, "would_assign", ""
+        new_owner, action, detail, assign_as = principal, "would_assign", "", "principal"
+    known_policies = [known for known in (policy, platform_policy) if known is not None]
     for job in jobs:
         if str(job.get("owner_email") or "").strip():
             continue
         kind = "script" if job.get("no_agent") else "agent"
         if agent_only and kind == "script":
             continue
-        report["jobs"].append(
-            {
-                "id": str(job["id"]),
-                "name": str(job.get("name") or ""),
-                "kind": kind,
-                "enabled": job.get("enabled", True) is not False,
-                "action": action,
-                "new_owner": new_owner,
-                "detail": detail,
-            }
-        )
-    if people:
-        report["warnings"].extend(principal_errors)
-        if len(people) > 1:
-            report["warnings"].append(
-                f"The policy gives this profile to several people ({', '.join(people)}); "
-                "its ownerless jobs are left for an administrator to assign."
-            )
-    elif report["jobs"]:
+        item = {
+            "id": str(job["id"]),
+            "name": str(job.get("name") or ""),
+            "kind": kind,
+            "enabled": job.get("enabled", True) is not False,
+            "action": action,
+            "new_owner": new_owner,
+            "detail": detail,
+            "assign_as": assign_as,
+        }
+        creator = _job_creator(job)
+        if creator and known_policies:
+            try:
+                standing = _creator_standing(known_policies, creator)
+            except Exception as exc:
+                report["errors"].append(f"The creator of job {item['id']} could not be checked: {exc}")
+                standing = "unknown"
+            if standing == "person":
+                item.update(
+                    action="would_assign",
+                    new_owner=creator,
+                    detail=f"created by {creator}",
+                    assign_as="creator",
+                )
+            elif standing == "unknown":
+                item.update(
+                    action="left",
+                    new_owner="",
+                    detail=(
+                        f"created by {creator}, who has no entry in the governance policy: "
+                        "an administrator must choose with hermes cron reassign-owner"
+                    ),
+                    assign_as="",
+                )
+        report["jobs"].append(item)
+    if any(item["assign_as"] == "principal" for item in report["jobs"]):
         report["errors"].extend(principal_errors)
     else:
         report["warnings"].extend(principal_errors)
+    if len(people) > 1:
+        report["warnings"].append(
+            f"The policy gives this profile to several people ({', '.join(people)}); "
+            "its ownerless jobs are left for an administrator to assign."
+        )
     return report
 
 
@@ -384,7 +453,8 @@ def apply_store(report: Dict[str, Any], *, actor: str, reason: str) -> None:
     """Give every job in ``report`` its new owner (compare and set).
 
     ``reason`` is kept for jobs that go to the principal; a job that goes to
-    the person whose profile holds it keeps ``PERSON_REASON`` unless the
+    the person whose profile holds it keeps ``PERSON_REASON``, and one that
+    goes to the person who created it ``CREATOR_REASON``, unless the
     operator passed a reason of their own. Jobs ``left`` are not touched.
     """
     from cron.jobs import reassign_job_owner, use_cron_store
@@ -397,13 +467,15 @@ def apply_store(report: Dict[str, Any], *, actor: str, reason: str) -> None:
             for item in report["jobs"]:
                 if item["action"] != "would_assign" or not item.get("new_owner"):
                     continue
-                to_person = item["new_owner"] != report["principal"]
+                default_reason = {"profile_person": PERSON_REASON, "creator": CREATOR_REASON}.get(
+                    item.get("assign_as"), reason
+                )
                 try:
                     result = reassign_job_owner(
                         item["id"],
                         item["new_owner"],
                         actor=actor,
-                        reason=PERSON_REASON if to_person and reason == DEFAULT_REASON else reason,
+                        reason=default_reason if reason == DEFAULT_REASON else reason,
                         source=SOURCE,
                         expected_owner="",
                     )
@@ -595,9 +667,9 @@ def _run(args: argparse.Namespace, default_home: Path) -> int:
         print("Nothing was changed.")
     else:
         assigned = [(r, item) for r in reports for item in r["jobs"] if item["action"] == "assigned"]
-        to_principal = sum(1 for r, item in assigned if item["new_owner"] == r["principal"])
+        to_principal = sum(1 for _r, item in assigned if item.get("assign_as") == "principal")
         to_person = len(assigned) - to_principal
-        people = f" and the person of a personal profile to {to_person} job(s)" if to_person else ""
+        people = f" and their own person to {to_person} job(s)" if to_person else ""
         print(
             f"Assigned the system principal to {to_principal} job(s){people}. "
             "Audit: cron/owner-audit.jsonl"
