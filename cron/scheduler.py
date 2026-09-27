@@ -7086,16 +7086,20 @@ def _ownerless_fire_refusal(job: dict) -> Optional[str]:
 
     Only agent jobs under governance ``enforce`` are refused: a ``no_agent``
     script has no agent turn to govern, and outside ``enforce`` ownerless jobs
-    keep running as before. A policy that cannot be read fails closed.
+    keep running as before. The policy is the store's own, or for a named
+    profile without one the platform root's (``load_cron_governance_policy``).
+    A policy that cannot be read fails closed.
     """
     if job.get("no_agent"):
         return None
     try:
-        from hermes_cli.dashboard_governance.loader import load_governance_policy
+        import hermes_cli.dashboard_governance.loader  # noqa: F401 (governance installed?)
     except ImportError:
         return None
+    from cron.jobs import load_cron_governance_policy
+
     try:
-        policy = load_governance_policy()
+        policy = load_cron_governance_policy()
     except Exception:
         logger.warning(
             "Job '%s': governance policy unreadable; refusing the ownerless fire",
@@ -7154,6 +7158,10 @@ def _governed_as_job_owner(job: dict):
     ``scripts/cron_assign_system_owner.py``; the principal then governs them
     like any other owner.
 
+    The policy is the store's own; a named profile that has none follows the
+    platform root's policy (``cron.jobs.load_cron_governance_policy``), so a
+    profile store is governed like the root store and the WebUI.
+
     An owner whose grants cannot be resolved stops the run rather than
     falling back to unrestricted. Every refusal is recorded on the job, its
     execution and the incident store (visible, where a silent fallback would
@@ -7172,12 +7180,12 @@ def _governed_as_job_owner(job: dict):
         bind_governance_context,
         reset_governance_context,
     )
-    from hermes_cli.dashboard_governance.loader import load_governance_policy
     from hermes_cli.dashboard_governance.models import GovernanceSubject
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+    from cron.jobs import load_cron_governance_policy
 
     try:
-        policy = load_governance_policy()
+        policy = load_cron_governance_policy()
         access = resolve_effective_access(policy, GovernanceSubject(email=owner))
     except Exception as exc:
         logger.warning(
@@ -7199,6 +7207,13 @@ def _governed_as_job_owner(job: dict):
         yield
     finally:
         reset_governance_context(token)
+
+
+# Public name for callers outside the scheduler that run a job themselves
+# (the WebUI "Run now" path calls ``run_job`` directly): wrap the run in it so
+# the fire gets the owner's governance and an ownerless agent job is refused
+# under enforce. It raises ``CronJobOwnerRefused`` after recording a refusal.
+governed_as_job_owner = _governed_as_job_owner
 
 
 def run_one_job(

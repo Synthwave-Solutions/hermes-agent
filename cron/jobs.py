@@ -2286,15 +2286,135 @@ def system_principal_from_config(config: Any) -> str:
 
 
 def cron_system_principal() -> str:
-    """The configured ``cron.system_principal`` of the active profile, or ""."""
+    """The configured ``cron.system_principal`` for the active store, or "".
+
+    The active profile's own setting wins. A named profile that sets none
+    uses the platform root's (``platform_root_for``), so one setting in the
+    root config.yaml covers every profile store.
+    """
     try:
         from hermes_cli.config import load_config
 
         config = load_config() or {}
     except Exception:
         logger.debug("cron: config unavailable, no system principal", exc_info=True)
+        config = {}
+    principal = system_principal_from_config(config)
+    if principal:
+        return principal
+    root = platform_root_for(get_hermes_home())
+    if root is None:
         return ""
-    return system_principal_from_config(config)
+    try:
+        return system_principal_from_config(read_config_file(root / "config.yaml"))
+    except ValueError:
+        logger.warning("cron: the platform config.yaml is unreadable; no system principal")
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# The governance policy a cron store is governed by
+# ---------------------------------------------------------------------------
+
+
+def platform_root_for(home: Union[str, Path]) -> Optional[Path]:
+    """The platform root home that ``home`` is a named profile of, or None.
+
+    ``<root>/profiles/<name>`` gives ``<root>``. A root home (or any path
+    that is not exactly a named profile home) gives None.
+    """
+    try:
+        from hermes_constants import named_profile_home
+
+        resolved = Path(home).expanduser().resolve(strict=False)
+        profile = named_profile_home(resolved)
+    except Exception:
+        logger.debug("cron: could not tell whether %s is a named profile", home, exc_info=True)
+        return None
+    if profile is None or profile.resolve(strict=False) != resolved:
+        return None
+    return profile.parent.parent
+
+
+def read_config_file(path: Path) -> Dict[str, Any]:
+    """Read a config.yaml as a plain mapping; {} when it does not exist.
+
+    Raises ValueError when the file exists but cannot be read or is not a
+    mapping, so a caller deciding governance can fail closed.
+    """
+    try:
+        if not path.exists():
+            return {}
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise ValueError(f"{path} could not be read: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} is not a mapping")
+    return loaded
+
+
+def _configured_policy_file(config: Any) -> str:
+    dash = config.get("dashboard") if isinstance(config, dict) else None
+    gov = dash.get("governance") if isinstance(dash, dict) else None
+    raw = gov.get("policy_file") if isinstance(gov, dict) else None
+    return str(raw).strip() if raw else ""
+
+
+def resolve_cron_policy_path(
+    *,
+    hermes_home: Optional[Union[str, Path]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, str]:
+    """Where the governance policy of a cron store lives, and why.
+
+    Returns ``(path, source)``. ``source`` is ``"store"`` when the store
+    decides its own policy: its config.yaml names a ``policy_file``, or it has
+    a ``dashboard-governance.yaml`` of its own, or it is a root home. A named
+    profile that does neither follows the platform root's policy
+    (``source == "platform"``), the same policy the root store and the WebUI
+    enforce. Without this a profile store read as "governance off" while the
+    platform was in ``enforce``, so its ownerless agent jobs ran unbound and
+    its owned jobs ran without their owner's restrictions.
+
+    ``hermes_home`` and ``config`` default to the active store. Raises
+    ValueError when the platform config.yaml cannot be read (fail closed).
+    """
+    from hermes_cli.dashboard_governance.loader import resolve_policy_path
+
+    home = Path(hermes_home).expanduser() if hermes_home is not None else get_hermes_home()
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+        except Exception:
+            config = {}
+    own = resolve_policy_path(config=config, hermes_home=home)
+    if _configured_policy_file(config) or own.exists():
+        return own, "store"
+    root = platform_root_for(home)
+    if root is None:
+        return own, "store"
+    root_config = read_config_file(root / "config.yaml")
+    return resolve_policy_path(config=root_config, hermes_home=root), "platform"
+
+
+def load_cron_governance_policy(
+    *,
+    hermes_home: Optional[Union[str, Path]] = None,
+    config: Optional[Dict[str, Any]] = None,
+):
+    """The governance policy a cron store's fires run under.
+
+    See ``resolve_cron_policy_path``. A missing policy file reads as mode
+    ``off`` (the loader's rule); an unreadable one raises.
+    """
+    from hermes_cli.dashboard_governance.loader import load_governance_policy
+
+    path, _source = resolve_cron_policy_path(hermes_home=hermes_home, config=config)
+    return load_governance_policy(path=path)
 
 
 def ensure_owner_admin_caller() -> None:

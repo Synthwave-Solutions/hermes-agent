@@ -19,7 +19,10 @@ governed non-admin session, and audited in ``cron/owner-audit.jsonl``.
 Go-live order (see the program plan, runbook step 3): create the principal's
 policy entry, set ``cron.system_principal`` in config.yaml, run this script
 without ``--apply`` and read the report, then run it with ``--apply`` before
-the restart, and check that no agent job is left without an owner.
+the restart, and check that no agent job is left without an owner. Use
+``--all-profiles`` so named profile stores are covered too: a profile that
+sets no ``cron.system_principal`` and no governance policy of its own uses the
+platform root's, the same rule its fires follow.
 
 Exit codes: 0 nothing blocks (dry run) or everything was assigned (apply);
 1 a store has a blocking problem, or ownerless agent jobs are left after
@@ -126,8 +129,19 @@ def _principal_policy_entry(policy: Any, principal: str) -> str:
 
 
 def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> Dict[str, Any]:
-    """Read one store and decide what ``--apply`` would do. Writes nothing."""
-    from cron.jobs import system_principal_from_config
+    """Read one store and decide what ``--apply`` would do. Writes nothing.
+
+    A named profile store that sets neither a principal nor a policy of its
+    own follows the platform root's (``cron.jobs.cron_system_principal`` and
+    ``cron.jobs.resolve_cron_policy_path``), exactly as its fires do.
+    """
+    from cron.jobs import (
+        load_cron_governance_policy,
+        platform_root_for,
+        read_config_file,
+        resolve_cron_policy_path,
+        system_principal_from_config,
+    )
     from hermes_cli.dashboard_governance.loader import load_governance_policy
 
     report: Dict[str, Any] = {
@@ -135,20 +149,30 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
         "principal": "",
         "principal_source": "",
         "governance_mode": "",
+        "policy_file": "",
+        "policy_source": "",
         "principal_policy_entry": "",
         "jobs": [],
         "errors": [],
         "warnings": [],
     }
+    root = platform_root_for(home)
     try:
         config = _read_yaml(home / "config.yaml")
     except Exception as exc:
         report["errors"].append(f"config.yaml could not be read: {exc}")
         config = {}
     configured = system_principal_from_config(config)
+    configured_source = "config.yaml" if configured else ""
+    if not configured and root is not None:
+        try:
+            configured = system_principal_from_config(read_config_file(root / "config.yaml"))
+        except ValueError as exc:
+            report["errors"].append(f"The platform config.yaml could not be read: {exc}")
+        configured_source = "platform config.yaml" if configured else ""
     principal = principal_override or configured
     report["principal"] = principal
-    report["principal_source"] = "--principal" if principal_override else ("config.yaml" if configured else "")
+    report["principal_source"] = "--principal" if principal_override else configured_source
     if not principal:
         report["errors"].append(
             "No system principal: set cron.system_principal in config.yaml or pass --principal."
@@ -163,10 +187,13 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
             f"--principal {principal} differs from cron.system_principal {configured}."
         )
 
+    policy = None
+    policy_path: Optional[Path] = None
     try:
-        policy = load_governance_policy(config=config, hermes_home=home)
+        policy_path, report["policy_source"] = resolve_cron_policy_path(hermes_home=home, config=config)
+        report["policy_file"] = str(policy_path)
+        policy = load_governance_policy(path=policy_path)
     except Exception as exc:
-        policy = None
         report["errors"].append(f"The governance policy could not be read: {exc}")
     if policy is not None:
         report["governance_mode"] = policy.mode
@@ -189,6 +216,29 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
                     "unrestricted access, and delegated mailbox commands in their scripts "
                     "act as the principal only."
                 )
+    if policy is not None and root is not None and report["policy_source"] == "store":
+        # A profile with a policy of its own. Say so when it is weaker than
+        # the platform's, and block when that is only because the file it
+        # names does not exist (the loader reads a missing file as "off").
+        try:
+            platform_policy = load_cron_governance_policy(
+                hermes_home=root, config=read_config_file(root / "config.yaml")
+            )
+        except Exception as exc:
+            report["errors"].append(f"The platform governance policy could not be read: {exc}")
+        else:
+            if platform_policy.mode == "enforce" and policy.mode != "enforce":
+                if policy_path is not None and not policy_path.exists():
+                    report["errors"].append(
+                        f"This profile names the policy file {policy_path}, which does not exist, "
+                        "while the platform policy is enforced: its ownerless agent jobs would run "
+                        "unchecked. Fix dashboard.governance.policy_file in its config.yaml."
+                    )
+                else:
+                    report["warnings"].append(
+                        f"This profile has its own policy in mode {policy.mode} while the "
+                        "platform policy is enforced."
+                    )
 
     try:
         jobs = _read_jobs(home)
@@ -256,6 +306,9 @@ def _print_report(report: Dict[str, Any], *, apply: bool) -> None:
     print(f"Store: {report['home']}")
     source = f" (from {report['principal_source']})" if report["principal_source"] else ""
     print(f"  System principal: {report['principal'] or '(none)'}{source}")
+    if report["policy_file"]:
+        origin = " (platform policy)" if report["policy_source"] == "platform" else ""
+        print(f"  Governance policy: {report['policy_file']}{origin}")
     if report["governance_mode"]:
         entry = report["principal_policy_entry"] or "n/a"
         print(f"  Governance mode: {report['governance_mode']}; principal policy entry: {entry}")

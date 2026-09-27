@@ -8,7 +8,8 @@ incident store. Jobs owned by the configured system principal
 (``cron.system_principal``) run under that principal's governance like any
 other owner. Jobs made at the CLI, or by a governed administrator, are stamped
 with the system principal so they do not end up ownerless; a job made in a
-governed person's shell is theirs and never the principal's.
+governed person's shell is theirs and never the principal's. A named profile
+store without a policy of its own follows the platform root's policy.
 """
 
 from __future__ import annotations
@@ -558,6 +559,172 @@ def test_a_job_made_in_a_governed_shell_fires_as_that_person(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Named profiles follow the platform policy
+#
+# Only the root config.yaml points at the platform policy. A named profile
+# that sets no policy of its own must not read as "governance off", or its
+# ownerless agent jobs run unbound while the platform is in enforce.
+# ---------------------------------------------------------------------------
+
+
+def _platform(tmp_policy_location="configured", *, mode="enforce", principal=PRINCIPAL):
+    """The root home as production has it: config.yaml points at the policy."""
+    root = _home()
+    policy = root / "dashboard-governance.yaml"
+    data = {
+        "version": 1,
+        "mode": mode,
+        "default_effect": "deny",
+        "bootstrap_admins": [PRINCIPAL],
+        "roles": {"tech_lead": {"grants": {"tools": ["terminal"]}}},
+        "users": {"alice@example.test": {"roles": ["tech_lead"]}},
+    }
+    policy.write_text(yaml.safe_dump(data), encoding="utf-8")
+    cfg = {"model": "test-model"}
+    if principal:
+        cfg["cron"] = {"system_principal": principal}
+    if tmp_policy_location == "configured":
+        cfg["dashboard"] = {"governance": {"policy_file": str(policy)}}
+    (root / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return root
+
+
+class _Profile:
+    """Scope the active home and the cron store to a named profile."""
+
+    def __init__(self, root, name="worker", *, config=None, own_policy_mode=None):
+        self.home = root / "profiles" / name
+        (self.home / "cron").mkdir(parents=True, exist_ok=True)
+        cfg = dict(config or {"model": "test-model"})
+        if own_policy_mode is not None:
+            policy = self.home / "dashboard-governance.yaml"
+            policy.write_text(
+                yaml.safe_dump({"version": 1, "mode": own_policy_mode, "default_effect": "deny"}),
+                encoding="utf-8",
+            )
+        (self.home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    def __enter__(self):
+        from cron.jobs import use_cron_store
+        from hermes_constants import set_hermes_home_override
+
+        self._token = set_hermes_home_override(str(self.home))
+        self._store = use_cron_store(self.home)
+        self._store.__enter__()
+        return self.home
+
+    def __exit__(self, *exc):
+        from hermes_constants import reset_hermes_home_override
+
+        self._store.__exit__(*exc)
+        reset_hermes_home_override(self._token)
+        return False
+
+
+def _patch_run_with_mode(monkeypatch):
+    calls = []
+
+    def fake_run_job(job, **_kw):
+        from hermes_cli.dashboard_governance.context import current_governance_context
+
+        ctx = current_governance_context()
+        calls.append((job["id"], ctx.access.subject.email if ctx else None, ctx.access.mode if ctx else None))
+        return (True, "output", "final response", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_deliver_result", lambda *_a, **_kw: None)
+    return calls
+
+
+@pytest.mark.parametrize("location", ["configured", "default"])
+def test_a_profile_store_without_its_own_policy_follows_the_platform(monkeypatch, location):
+    root = _platform(location)
+    calls = _patch_run_with_mode(monkeypatch)
+    with _Profile(root) as profile:
+        job = _job()
+        assert job["owner_email"] == ""
+        with pytest.raises(s.CronJobOwnerRefused):
+            s.run_one_job(_get(job["id"]))
+        stored = _get(job["id"])
+    assert calls == []
+    assert stored["last_status"] == "blocked_config"
+    assert "no owner" in stored["last_error"]
+    data = json.loads((profile / "cron" / "jobs.json").read_text(encoding="utf-8"))
+    assert [j["id"] for j in data["jobs"]] == [job["id"]], "the refusal lands in the profile store"
+
+
+def test_an_owned_job_in_a_profile_store_runs_under_the_platform_policy(monkeypatch):
+    root = _platform()
+    calls = _patch_run_with_mode(monkeypatch)
+    with _Profile(root):
+        job = _job(owner_email="alice@example.test")
+        assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], "alice@example.test", "enforce")]
+
+
+def test_a_profile_with_its_own_policy_keeps_it(monkeypatch):
+    root = _platform()
+    calls = _patch_run_with_mode(monkeypatch)
+    with _Profile(root, own_policy_mode="off"):
+        job = _job()
+        assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], None, None)]
+
+
+def test_a_profile_that_names_a_policy_file_keeps_it(monkeypatch, tmp_path):
+    root = _platform()
+    own = tmp_path / "profile-policy.yaml"
+    own.write_text(yaml.safe_dump({"version": 1, "mode": "report_only", "default_effect": "deny"}), encoding="utf-8")
+    calls = _patch_run_with_mode(monkeypatch)
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(own)}}}
+    with _Profile(root, config=cfg):
+        job = _job()
+        assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], None, None)]
+
+
+def test_a_profile_store_runs_as_before_when_the_platform_has_no_policy(monkeypatch):
+    root = _home()
+    _write_config(PRINCIPAL)
+    calls = _patch_run_with_mode(monkeypatch)
+    with _Profile(root):
+        job = _job()
+        assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], None, None)]
+
+
+def test_an_unreadable_platform_config_refuses_an_ownerless_profile_job(monkeypatch):
+    root = _platform()
+    (root / "config.yaml").write_text("dashboard: [governance\n", encoding="utf-8")
+    calls = _patch_run_with_mode(monkeypatch)
+    with _Profile(root):
+        job = _job()
+        with pytest.raises(s.CronJobOwnerRefused):
+            s.run_one_job(_get(job["id"]))
+        assert "policy" in _get(job["id"])["last_error"]
+    assert calls == []
+
+
+def test_a_cli_create_in_a_profile_gets_the_platform_principal():
+    from cron.jobs import cron_system_principal, system_principal_create_scope
+
+    root = _platform()
+    with _Profile(root):
+        assert cron_system_principal() == PRINCIPAL
+        with system_principal_create_scope():
+            assert _job()["owner_email"] == PRINCIPAL
+
+
+def test_a_profile_principal_wins_over_the_platform_one():
+    from cron.jobs import cron_system_principal
+
+    root = _platform()
+    cfg = {"model": "test-model", "cron": {"system_principal": "ops@example.test"}}
+    with _Profile(root, config=cfg):
+        assert cron_system_principal() == "ops@example.test"
+
+
+# ---------------------------------------------------------------------------
 # scripts/cron_assign_system_owner.py: dry run by default, --apply at go-live
 # ---------------------------------------------------------------------------
 
@@ -810,6 +977,53 @@ def test_the_migration_refuses_to_apply_from_a_governed_shell(monkeypatch):
 
     assert script.main(["--apply"]) == 1
     assert _owners(_home())[job["id"]] == ""
+
+
+def test_the_migration_reads_the_platform_policy_for_profile_stores(capsys):
+    """Profile configs do not name the policy; the script must still see the
+    platform's enforce mode and block when the principal has no entry."""
+    script = _load_script()
+    root = _platform(principal=PRINCIPAL)
+    policy = yaml.safe_load((root / "dashboard-governance.yaml").read_text(encoding="utf-8"))
+    policy["bootstrap_admins"] = []
+    (root / "dashboard-governance.yaml").write_text(yaml.safe_dump(policy), encoding="utf-8")
+    profile = _Profile(root).home
+    (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [_raw_job("agent2")]}), encoding="utf-8")
+
+    assert script.main(["--json", "--hermes-home", str(profile)]) == 1
+    (store,) = json.loads(capsys.readouterr().out)["stores"]
+    assert store["governance_mode"] == "enforce"
+    assert store["policy_file"] == str(root / "dashboard-governance.yaml")
+    assert store["principal"] == PRINCIPAL
+    assert any("no entry" in error for error in store["errors"])
+
+    assert script.main(["--apply", "--hermes-home", str(profile)]) == 1
+    assert _owners(profile)["agent2"] == ""
+
+
+def test_the_migration_assigns_the_platform_principal_in_profile_stores(capsys):
+    script = _load_script()
+    root = _platform(principal=PRINCIPAL)
+    profile = _Profile(root).home
+    (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [_raw_job("agent2")]}), encoding="utf-8")
+
+    assert script.main(["--apply", "--all-profiles"]) == 0
+    assert _owners(profile)["agent2"] == PRINCIPAL
+
+
+def test_the_migration_blocks_a_profile_whose_named_policy_is_missing(capsys, tmp_path):
+    """A profile that points at a policy file that does not exist reads as
+    governance off. With the platform in enforce that is a hole, not a mode."""
+    script = _load_script()
+    root = _platform(principal=PRINCIPAL)
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(tmp_path / "gone.yaml")}}}
+    profile = _Profile(root, config=cfg).home
+    (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [_raw_job("agent2")]}), encoding="utf-8")
+
+    assert script.main(["--hermes-home", str(profile)]) == 1
+    assert "does not exist" in capsys.readouterr().out
+    assert script.main(["--apply", "--hermes-home", str(profile)]) == 1
+    assert _owners(profile)["agent2"] == ""
 
 
 def test_the_migration_never_overwrites_an_owner_set_meanwhile():
