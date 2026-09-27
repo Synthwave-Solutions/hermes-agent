@@ -117,6 +117,72 @@ def test_lifecycle_helpers_do_not_touch_the_identity(owned_job):
 
 
 # ---------------------------------------------------------------------------
+# The WebUI Tasks panel create flow
+#
+# These two tests pin a go-live coupling. WebUI builds before the cron write
+# fix ("fix(cron): stamp owner and origin when a task is created") create the
+# job first and then stamp the creator with
+# ``update_job(job_id, {..., "origin": {"platform": "webui", ...}})``. This
+# engine refuses that update after the job is already saved, so the Tasks
+# panel answers 400 and leaves an enabled, ownerless job on the default
+# profile. Never take this engine live before (or without) a WebUI that
+# passes ``owner_email`` and ``origin`` to ``create_job``. Do not make
+# ``origin`` writable to make the old flow pass: settable once is still a
+# way to re-target where "origin" delivery goes.
+# ---------------------------------------------------------------------------
+
+WEBUI_CREATOR = "alice@example.test"
+WEBUI_ORIGIN = {"platform": "webui", "chat_id": None, "user_id": WEBUI_CREATOR}
+
+
+def test_the_legacy_webui_post_create_origin_stamp_is_refused():
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt="Summarise the inbox", schedule="every 1h", deliver="local")
+    post_create_updates = {
+        "category": "Reporting",
+        "emoji": "\U0001F4EC",
+        "toast_notifications": False,
+        "origin": dict(WEBUI_ORIGIN),
+    }
+
+    with pytest.raises(ValueError, match="cannot be updated: origin"):
+        update_job(job["id"], post_create_updates)
+
+    stored = _stored(job["id"])
+    assert stored.get("origin") is None
+    assert stored["owner_email"] == ""
+    assert "category" not in stored, "the refused update applies nothing"
+
+
+def test_the_webui_create_shape_keeps_the_identity_through_its_follow_up_update():
+    from cron.jobs import create_job, update_job
+
+    job = create_job(
+        prompt="Summarise the inbox",
+        schedule="every 1h",
+        deliver="local",
+        origin=dict(WEBUI_ORIGIN),
+        owner_email=WEBUI_CREATOR,
+    )
+    updated = update_job(
+        job["id"],
+        {
+            "category": "Reporting",
+            "emoji": "\U0001F4EC",
+            "toast_notifications": False,
+            "diagram": "flowchart LR\n  A --> B",
+            "shared_with": ["bob@example.test"],
+        },
+    )
+
+    assert updated["owner_email"] == WEBUI_CREATOR
+    assert updated["origin"] == WEBUI_ORIGIN
+    assert updated["category"] == "Reporting"
+    assert updated["shared_with"] == ["bob@example.test"]
+
+
+# ---------------------------------------------------------------------------
 # The agent ``cronjob`` tool
 # ---------------------------------------------------------------------------
 

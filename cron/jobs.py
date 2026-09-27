@@ -488,7 +488,10 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # the owner so the job ran with nobody's governance, or re-own it. The only
 # way to change the owner afterwards is ``reassign_job_owner`` (``hermes cron
 # reassign-owner``), which is refused inside governed sessions and audited.
-# ``origin`` and ``created_at`` are set once, by ``create_job``.
+# ``origin`` and ``created_at`` are set once, by ``create_job``: a caller that
+# stamps them with a follow-up ``update_job`` (WebUI builds before its cron
+# write fix did this for tasks made in the Tasks panel) is refused after the
+# job is saved, so such a caller must pass them to ``create_job`` instead.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id", "owner_email", "origin", "created_at"})
 
 
