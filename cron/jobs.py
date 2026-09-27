@@ -2264,6 +2264,16 @@ _BOT_CEILING_ERROR = (
     "pause and remove its own tasks."
 )
 
+_ADMIN_ONLY_JOB_FIELDS_ERROR = (
+    "Only an administrator can give a scheduled task {fields}: a script, a "
+    "monitor or a script-only task runs outside your access rules."
+)
+
+_FOREIGN_DELIVERY_TARGET_ERROR = (
+    "A scheduled task of yours can deliver only to this conversation (origin), "
+    "to local, or to a platform's home channel; '{target}' is not one of them."
+)
+
 _OWNERLESS_CREATE_REFUSAL = (
     "Cannot schedule this task: access control is enforced and the task would "
     "have no owner to run as, so it would never run. Ask your admin."
@@ -2717,6 +2727,132 @@ def _update_only_pauses(updates: Dict[str, Any]) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# What a governed person may give a job: no script, only their own targets
+#
+# The WebUI Tasks panel lets only a cron admin set script or no_agent, and
+# takes a delivery target only from the caller's delivery options (local,
+# origin and the home channel of a known platform). The cronjob tool, the CLI
+# in a governed shell and the API server reach create_job and update_job
+# directly, so the same rules hold here for every caller that
+# ``_governed_caller_identities`` binds to their own jobs.
+# ---------------------------------------------------------------------------
+
+# A script (pre-run or script-only) and a monitor source run in the scheduler
+# outside the tool policy that governs the person's own session.
+_ADMIN_ONLY_JOB_FIELDS = ("script", "no_agent", "monitor_script", "monitor_url")
+
+
+def _same_job_value(stored: Any, value: Any) -> bool:
+    if isinstance(stored, str) and isinstance(value, str):
+        return stored.strip() == value.strip()
+    return stored == value
+
+
+def _ensure_no_admin_only_values(values: Dict[str, Any], stored: Optional[Dict[str, Any]]) -> None:
+    """Refuse a governed person a script, monitor or script-only job.
+
+    Clearing a field is always allowed, and so is saving back the value an
+    administrator already gave the job (``stored``).
+    """
+    refused = []
+    for field in _ADMIN_ONLY_JOB_FIELDS:
+        if field not in values:
+            continue
+        value = values[field]
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            continue
+        if stored is not None and _same_job_value(stored.get(field), value):
+            continue
+        refused.append(field)
+    if refused:
+        raise CronJobAccessDenied(_ADMIN_ONLY_JOB_FIELDS_ERROR.format(fields=", ".join(refused)))
+
+
+def _delivery_elements(deliver: Any) -> List[str]:
+    if deliver is None:
+        return []
+    raw = deliver if isinstance(deliver, (list, tuple)) else str(deliver).split(",")
+    return [str(part).strip() for part in raw if str(part).strip()]
+
+
+def _delivery_target_key(element: str) -> str:
+    platform, _, rest = element.partition(":")
+    return f"{platform.strip().lower()}:{rest.strip()}"
+
+
+def _origin_delivery_targets(origin: Any) -> Set[str]:
+    """The explicit ``platform:chat_id[:thread_id]`` forms of ``origin``."""
+    if not isinstance(origin, dict):
+        return set()
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        return set()
+    targets = {f"{platform}:{chat_id}"}
+    thread_id = str(origin.get("thread_id") or "").strip()
+    if thread_id:
+        targets.add(f"{platform}:{chat_id}:{thread_id}")
+    return targets
+
+
+def _cron_run_delivery_targets() -> Set[str]:
+    """The delivery target of the cron run this call is made from.
+
+    A job created from a cron run stores that run's own target in place of
+    "origin" (``tools.cronjob_tools._resolve_cron_context_deliver``). The
+    scheduler binds it in-process for the run (``run_job``), so only the
+    session variables bound in this context count, never the environment,
+    which a governed shell can set to anything.
+    """
+    try:
+        from gateway.session_context import _UNSET, _VAR_MAP
+    except Exception:
+        return set()
+
+    def _bound(name: str) -> str:
+        var = _VAR_MAP.get(name)
+        value = var.get() if var is not None else _UNSET
+        return "" if value is _UNSET else str(value or "").strip()
+
+    platform = _bound("HERMES_CRON_AUTO_DELIVER_PLATFORM").lower()
+    chat_id = _bound("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+    if not platform or not chat_id:
+        return set()
+    thread_id = _bound("HERMES_CRON_AUTO_DELIVER_THREAD_ID")
+    return {f"{platform}:{chat_id}:{thread_id}" if thread_id else f"{platform}:{chat_id}"}
+
+
+def _ensure_own_delivery_targets(deliver: Any, *, origin: Any, stored: Any = None) -> None:
+    """Refuse a governed person a delivery target that is not their own.
+
+    Allowed: ``local``; ``origin``; the bare name of a known delivery platform
+    (its configured home channel, the same list the WebUI offers); an explicit
+    ``platform:chat_id[:thread_id]`` that is the job's origin or the target of
+    the cron run creating it; and any target the job already has
+    (``stored``). Refused: every other explicit target (a chat, an email
+    address, a Google Chat space), ``all`` (every home channel at once), a
+    Bot Chat delivery (an agent turn outside the person's governance) and
+    unknown names.
+    """
+    from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS
+
+    own = _origin_delivery_targets(origin) | _cron_run_delivery_targets()
+    already = {_delivery_target_key(part) if ":" in part else part.lower() for part in _delivery_elements(stored)}
+    for element in _delivery_elements(deliver):
+        lowered = element.lower()
+        if lowered in ("local", "origin"):
+            continue
+        if ":" not in element:
+            if lowered in _KNOWN_DELIVERY_PLATFORMS or lowered in already:
+                continue
+        elif _delivery_target_key(element) in own or _delivery_target_key(element) in already:
+            continue
+        raise CronJobAccessDenied(_FOREIGN_DELIVERY_TARGET_ERROR.format(target=element))
+
+
 def _ownerless_create_refusal() -> Optional[str]:
     """Why an ownerless agent job may not be created here, or None.
 
@@ -3152,6 +3288,19 @@ def create_job(
     job_owner = _resolve_creating_owner(owner_email)
     # No fire carries a bot ceiling, so a ceiled session creates no job.
     _ensure_no_bot_ceiling()
+    # A governed person gets no script or monitor and delivers only to their
+    # own places (the rules the WebUI Tasks panel applies to them).
+    if governed is not None:
+        _ensure_no_admin_only_values(
+            {
+                "script": normalized_script,
+                "no_agent": normalized_no_agent,
+                "monitor_script": normalized_monitor_script,
+                "monitor_url": normalized_monitor_url,
+            },
+            None,
+        )
+        _ensure_own_delivery_targets(deliver, origin=origin)
     if not job_owner and not normalized_no_agent:
         refusal = _ownerless_create_refusal()
         if refusal:
@@ -3356,6 +3505,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            # A governed person gets no script or monitor and delivers only
+            # to their own places (see create_job); what the job already has
+            # may stay.
+            if governed is not None:
+                _ensure_no_admin_only_values(updates, job)
+                if "deliver" in updates:
+                    _ensure_own_delivery_targets(
+                        updates["deliver"], origin=job.get("origin"), stored=job.get("deliver")
+                    )
 
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or

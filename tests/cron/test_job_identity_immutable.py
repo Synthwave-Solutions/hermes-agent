@@ -1287,3 +1287,202 @@ def test_a_ceiled_session_reads_but_does_not_write_its_jobs_notepad(monkeypatch,
         assert "bot" in capsys.readouterr().out
     assert notepad.get_note(mine["id"], "task") == "Weekly finance export"
 
+
+# ---------------------------------------------------------------------------
+# A governed person's job runs no script and delivers only to their own places
+#
+# The WebUI Tasks panel lets only a cron admin set script or no_agent, and
+# takes a delivery target only from the caller's own delivery options. The
+# cronjob tool (a WebUI chat, gateway or OWUI turn), the CLI in a governed
+# shell and the API server reach create_job and update_job directly, so the
+# same rules hold here for a governed person who is not an administrator: a
+# script, a monitor source or a script-only task runs outside their access
+# rules, and a free target such as telegram:<chat id> or email:<address>
+# sends the output to anyone, past approval-first sending.
+# ---------------------------------------------------------------------------
+
+TELEGRAM_ORIGIN = {"platform": "telegram", "chat_id": "111", "user_id": "mallory"}
+
+ADMIN_ONLY_CREATES = [
+    pytest.param(dict(script="cashflow_report.sh"), id="pre-run-script"),
+    pytest.param(dict(prompt="", script="cashflow_report.sh", no_agent=True), id="no-agent-script"),
+    pytest.param(dict(monitor_script="cashflow_report.sh"), id="monitor-script"),
+    pytest.param(dict(monitor_url="https://intranet.example.test/finance"), id="monitor-url"),
+]
+
+
+def _admin_script():
+    from hermes_constants import get_hermes_home
+
+    scripts = get_hermes_home() / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    path = scripts / "cashflow_report.sh"
+    path.write_text('#!/bin/sh\necho "ADMIN-ONLY cashflow figures"\n', encoding="utf-8")
+    path.chmod(0o755)
+    return path.name
+
+
+@pytest.mark.parametrize("kwargs", ADMIN_ONLY_CREATES)
+def test_a_governed_person_cannot_create_a_script_or_monitor_job(as_mallory, kwargs):
+    from cron.jobs import CronJobAccessDenied, create_job, list_jobs
+
+    kwargs = dict(kwargs)
+    kwargs.setdefault("prompt", "Weekly figures")
+    with pytest.raises(CronJobAccessDenied, match="administrator"):
+        create_job(schedule="every 1h", **kwargs)
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_the_cronjob_tool_refuses_a_governed_persons_script_job(as_mallory, fake_runs):
+    from cron.jobs import list_jobs
+    from tools.cronjob_tools import cronjob
+
+    script = _admin_script()
+    for kwargs in (dict(script=script, no_agent=True), dict(prompt="Summarise", script=script), dict(prompt="Watch", monitor_script=script)):
+        result = json.loads(cronjob(action="create", schedule="every 1h", name="mine", deliver="local", **kwargs))
+        assert result["success"] is False, kwargs
+        assert "administrator" in result["error"], kwargs
+    assert list_jobs(include_disabled=True) == []
+    assert fake_runs == []
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"script": "cashflow_report.sh"},
+        {"script": "cashflow_report.sh", "no_agent": True},
+        {"monitor_script": "cashflow_report.sh"},
+        {"monitor_url": "https://intranet.example.test/finance"},
+    ],
+    ids=lambda u: "+".join(sorted(u)),
+)
+def test_a_governed_person_cannot_add_a_script_or_monitor_to_their_job(foreign_jobs, as_mallory, updates):
+    from cron.jobs import CronJobAccessDenied, update_job
+
+    mine = foreign_jobs["mine"]
+    with pytest.raises(CronJobAccessDenied, match="administrator"):
+        update_job(mine["id"], dict(updates))
+    assert _stored(mine["id"]) == mine
+
+
+def test_a_governed_person_keeps_or_clears_what_an_admin_gave_their_job():
+    from cron.jobs import create_job, update_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    given = create_job(
+        prompt="Summarise the figures",
+        schedule="every 1h",
+        script="cashflow_report.sh",
+        deliver="telegram:555",
+        owner_email=MALLORY,
+    )
+    with governance_context(_governed(MALLORY)):
+        kept = update_job(given["id"], {"name": "figures", "script": "cashflow_report.sh", "deliver": "telegram:555"})
+        assert (kept["script"], kept["deliver"]) == ("cashflow_report.sh", "telegram:555")
+        assert update_job(given["id"], {"deliver": "local,telegram:555"})["deliver"] == "local,telegram:555"
+        assert update_job(given["id"], {"script": None})["script"] is None
+
+
+FOREIGN_TARGETS = [
+    "telegram:987654321",
+    "googlechat:spaces/AAAAceo",
+    "email:ceo@example.test",
+    "telegram:111:9",
+    "all",
+    "bot-chat",
+    "bot-chat:ops",
+    "origin,telegram:987654321",
+    "not-a-platform",
+]
+
+
+@pytest.mark.parametrize("target", FOREIGN_TARGETS)
+def test_a_governed_person_cannot_deliver_to_someone_elses_place(foreign_jobs, as_mallory, target):
+    from cron.jobs import CronJobAccessDenied, create_job, list_jobs, update_job
+    from tools.cronjob_tools import cronjob
+
+    before = [j["id"] for j in list_jobs(include_disabled=True)]
+    with pytest.raises(CronJobAccessDenied, match="deliver"):
+        create_job(prompt="Send the weekly note", schedule="every 1h", deliver=target, origin=dict(TELEGRAM_ORIGIN))
+    result = json.loads(cronjob(action="create", prompt="Send the weekly note", schedule="every 1h", deliver=target))
+    assert result["success"] is False
+    assert [j["id"] for j in list_jobs(include_disabled=True)] == before
+
+    mine = foreign_jobs["mine"]
+    with pytest.raises(CronJobAccessDenied, match="deliver"):
+        update_job(mine["id"], {"deliver": target})
+    result = json.loads(cronjob(action="update", job_id=mine["id"], deliver=target))
+    assert result["success"] is False
+    assert _stored(mine["id"]) == mine
+
+
+@pytest.mark.parametrize("target", ["local", "origin", "telegram", "Telegram", "origin,local", "telegram:111", " telegram:111 ,local"])
+def test_a_governed_person_delivers_to_their_origin_local_or_a_home_channel(as_mallory, target):
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt="Send the weekly note", schedule="every 1h", deliver=target, origin=dict(TELEGRAM_ORIGIN))
+    assert job["owner_email"] == MALLORY
+    assert update_job(job["id"], {"deliver": target})["deliver"] == target
+
+
+def test_a_job_made_by_a_governed_run_may_deliver_where_that_run_delivers(monkeypatch):
+    """A job created from a cron run stores the run's own target for origin
+    (tools.cronjob_tools._resolve_cron_context_deliver); the scheduler set
+    that target in-process for this run. The same values from the
+    environment alone prove nothing."""
+    from cron.jobs import list_jobs
+    from gateway.session_context import _VAR_MAP
+    from hermes_cli.dashboard_governance.context import governance_context
+    from tools.cronjob_tools import cronjob
+
+    run_target = {
+        "HERMES_CRON_SESSION": "1",
+        "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
+        "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "555",
+    }
+    for name, value in run_target.items():
+        monkeypatch.setenv(name, value)
+    with governance_context(_governed(MALLORY)):
+        spoofed = json.loads(cronjob(action="create", prompt="Follow up", schedule="every 1h", deliver="origin"))
+    assert spoofed["success"] is False
+    assert list_jobs(include_disabled=True) == []
+
+    tokens = [(_VAR_MAP[name], _VAR_MAP[name].set(value)) for name, value in run_target.items()]
+    try:
+        with governance_context(_governed(MALLORY)):
+            made = json.loads(cronjob(action="create", prompt="Follow up", schedule="every 1h", deliver="origin"))
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+    assert made["success"] is True, made
+    assert _stored(made["job_id"])["deliver"] == "telegram:555"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cron", "create", "every 1h", "Send the weekly note", "--deliver", "telegram:987654321"],
+        ["cron", "create", "every 1h", "", "--script", "cashflow_report.sh", "--no-agent"],
+    ],
+)
+def test_a_governed_shell_is_held_to_the_same_rules(monkeypatch, capsys, argv):
+    from cron.jobs import list_jobs
+
+    _admin_script()
+    monkeypatch.setenv("HERMES_DWD_IDENTITY", MALLORY)
+    assert _cli(argv) == 1
+    assert "Failed to create job" in capsys.readouterr().out
+    assert list_jobs(include_disabled=True) == []
+
+
+def test_administrators_and_ungoverned_callers_keep_scripts_and_free_targets():
+    from cron.jobs import create_job, update_job
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    ungoverned = create_job(prompt="", schedule="every 1h", script="watch.sh", no_agent=True, deliver="telegram:987654321")
+    assert ungoverned["deliver"] == "telegram:987654321"
+    with governance_context(_governed(ADMIN, admin=True)):
+        job = create_job(prompt="Watch", schedule="every 1h", monitor_url="https://status.example.test/", deliver="all")
+        assert update_job(job["id"], {"deliver": "email:ceo@example.test", "monitor_url": None})["deliver"] == "email:ceo@example.test"
+    with governance_context(_governed(MALLORY, mode="report_only")):
+        assert create_job(prompt="p", schedule="every 1h", script="watch.sh", deliver="bot-chat")["script"] == "watch.sh"
