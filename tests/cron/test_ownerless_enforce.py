@@ -1129,34 +1129,14 @@ def test_an_owned_job_in_a_profile_store_runs_under_the_platform_policy(monkeypa
     assert calls == [(job["id"], "alice@example.test", "enforce")]
 
 
-def test_a_profile_with_its_own_policy_keeps_it(monkeypatch):
-    root = _platform()
-    calls = _patch_run_with_mode(monkeypatch)
-    with _Profile(root, own_policy_mode="off"):
-        job = _job()
-        assert s.run_one_job(_get(job["id"])) is True
-    assert calls == [(job["id"], None, None)]
-
-
-def test_a_profile_that_names_a_policy_file_keeps_it(monkeypatch, tmp_path):
-    root = _platform()
-    own = tmp_path / "profile-policy.yaml"
-    own.write_text(yaml.safe_dump({"version": 1, "mode": "report_only", "default_effect": "deny"}), encoding="utf-8")
-    calls = _patch_run_with_mode(monkeypatch)
-    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(own)}}}
-    with _Profile(root, config=cfg):
-        job = _job()
-        assert s.run_one_job(_get(job["id"])) is True
-    assert calls == [(job["id"], None, None)]
-
-
-@pytest.mark.parametrize("platform_mode", ["enforce", "off", None])
+@pytest.mark.parametrize("platform_mode", ["off", None])
 def test_a_profile_that_names_a_missing_policy_file_fails_closed(monkeypatch, tmp_path, platform_mode):
     """The loader reads a missing policy file as governance "off". For a
     profile that names one (a typo, a moved file) that would run its ownerless
-    agent jobs unbound, so it fails closed instead, whatever the platform's
-    mode, and an owned job is refused too because its owner's grants cannot be
-    resolved."""
+    agent jobs unbound, so it fails closed instead, and an owned job is
+    refused too because its owner's grants cannot be resolved. (With the
+    platform in enforce the platform policy governs the profile instead:
+    test_a_profile_naming_a_missing_policy_file_follows_an_enforced_platform.)"""
     from cron.jobs import resolve_cron_policy_path
 
     if platform_mode is None:
@@ -1523,10 +1503,11 @@ def test_the_migration_assigns_the_platform_principal_in_profile_stores(capsys):
 
 
 def test_the_migration_blocks_a_profile_whose_named_policy_is_missing(capsys, tmp_path):
-    """A profile that points at a policy file that does not exist reads as
-    governance off. With the platform in enforce that is a hole, not a mode."""
+    """A profile that points at a policy file that does not exist would read
+    as governance off. While the platform is not enforced the profile's own
+    policy applies, so that is a hole, not a mode."""
     script = _load_script()
-    root = _platform(principal=PRINCIPAL)
+    root = _platform(principal=PRINCIPAL, mode="report_only")
     cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(tmp_path / "gone.yaml")}}}
     profile = _Profile(root, config=cfg).home
     (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [_raw_job("agent2")]}), encoding="utf-8")
@@ -1535,6 +1516,23 @@ def test_the_migration_blocks_a_profile_whose_named_policy_is_missing(capsys, tm
     assert "does not exist" in capsys.readouterr().out
     assert script.main(["--apply", "--hermes-home", str(profile)]) == 1
     assert _owners(profile)["agent2"] == ""
+
+
+def test_the_migration_reads_an_enforced_platform_policy_over_a_profiles_own(capsys, tmp_path):
+    """With the platform enforced, the profile's fires follow the platform
+    policy whatever its config.yaml names, and so does the migration."""
+    script = _load_script()
+    root = _platform(principal=PRINCIPAL)
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(tmp_path / "gone.yaml")}}}
+    profile = _Profile(root, config=cfg).home
+    (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [_raw_job("agent2")]}), encoding="utf-8")
+
+    assert script.main(["--json", "--hermes-home", str(profile)]) == 0
+    (store,) = json.loads(capsys.readouterr().out)["stores"]
+    assert store["policy_source"] == "platform"
+    assert store["policy_file"] == str(root / "dashboard-governance.yaml")
+    assert script.main(["--apply", "--hermes-home", str(profile)]) == 0
+    assert _owners(profile)["agent2"] == PRINCIPAL
 
 
 def test_the_migration_never_overwrites_an_owner_set_meanwhile():
@@ -1807,3 +1805,136 @@ def test_owned_jobs_are_still_created_under_enforce(monkeypatch):
         assert _job()["owner_email"] == "alice@example.test"
     with governance_context(_governed("root@example.test", admin=True)):
         assert _job()["owner_email"] == PRINCIPAL
+
+
+# ---------------------------------------------------------------------------
+# An enforced platform policy is the floor for every named profile store
+#
+# A named profile's config.yaml chose its own cron policy. The loader reads
+# any YAML mapping without a mode as "off", so pointing policy_file at a file
+# that exists (even the profile's own config.yaml, which a person with
+# config:write on that profile can edit) turned governance off for its fires.
+# With the platform in enforce, every profile store now fires under the
+# platform policy; a profile's own policy only applies when the platform is
+# not enforced.
+# ---------------------------------------------------------------------------
+
+
+def _patch_run_with_access(monkeypatch):
+    calls = []
+
+    def fake_run_job(job, **_kw):
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        ctx = current_governance_context()
+        calls.append(
+            (
+                job["id"],
+                ctx.access.subject.email if ctx else None,
+                ctx.access.mode if ctx else None,
+                "admin" if ctx and dwd_identity_for(ctx.access) is None else ("person" if ctx else None),
+            )
+        )
+        return (True, "output", "final response", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_deliver_result", lambda *_a, **_kw: None)
+    return calls
+
+
+def _fire_both(**profile_kwargs):
+    """Run a legacy ownerless job and a job of alice's in a named profile."""
+    root = profile_kwargs.pop("root")
+    with _Profile(root, **profile_kwargs) as profile:
+        ownerless = _legacy_job()
+        owned = _job(owner_email="alice@example.test")
+        for job in (ownerless, owned):
+            assert s.run_one_job(_get(job["id"])) is True
+        return profile, _get(ownerless["id"]), owned
+
+
+def test_a_profile_with_its_own_policy_follows_an_enforced_platform(monkeypatch):
+    root = _platform()
+    calls = _patch_run_with_access(monkeypatch)
+    _profile, ownerless, owned = _fire_both(root=root, own_policy_mode="off")
+    assert calls == [(owned["id"], "alice@example.test", "enforce", "person")]
+    assert ownerless["last_status"] == "blocked_config"
+    assert "no owner" in ownerless["last_error"]
+
+
+def test_a_profile_that_names_a_policy_file_follows_an_enforced_platform(monkeypatch, tmp_path):
+    root = _platform()
+    own = tmp_path / "profile-policy.yaml"
+    own.write_text(yaml.safe_dump({"version": 1, "mode": "report_only", "default_effect": "deny"}), encoding="utf-8")
+    calls = _patch_run_with_access(monkeypatch)
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(own)}}}
+    _profile, ownerless, owned = _fire_both(root=root, config=cfg)
+    assert calls == [(owned["id"], "alice@example.test", "enforce", "person")]
+    assert ownerless["last_status"] == "blocked_config"
+
+
+def test_a_profile_whose_policy_is_its_own_config_is_still_governed(monkeypatch):
+    """config.yaml parses as a policy: without a mode it reads as "off", and
+    a person who can edit it can even write one that makes them an
+    administrator. Neither counts while the platform is enforced."""
+    from cron.jobs import resolve_cron_policy_path
+
+    root = _platform()
+    calls = _patch_run_with_access(monkeypatch)
+    profile_home = root / "profiles" / "worker"
+    own_config = profile_home / "config.yaml"
+    crafted = {
+        "model": "test-model",
+        "dashboard": {"governance": {"policy_file": str(own_config)}},
+        "version": 1,
+        "mode": "enforce",
+        "default_effect": "allow",
+        "bootstrap_admins": ["alice@example.test"],
+    }
+    for cfg in ({"model": "test-model", "dashboard": {"governance": {"policy_file": str(own_config)}}}, crafted):
+        calls.clear()
+        _profile, ownerless, owned = _fire_both(root=root, config=cfg)
+        with _Profile(root, config=cfg) as profile:
+            assert resolve_cron_policy_path(hermes_home=profile, config=cfg) == (
+                root / "dashboard-governance.yaml",
+                "platform",
+            )
+        assert calls == [(owned["id"], "alice@example.test", "enforce", "person")]
+        assert ownerless["last_status"] == "blocked_config"
+
+
+def test_a_profile_naming_a_missing_policy_file_follows_an_enforced_platform(monkeypatch, tmp_path):
+    root = _platform()
+    calls = _patch_run_with_access(monkeypatch)
+    cfg = {"model": "test-model", "dashboard": {"governance": {"policy_file": str(tmp_path / "gone.yaml")}}}
+    _profile, ownerless, owned = _fire_both(root=root, config=cfg)
+    assert calls == [(owned["id"], "alice@example.test", "enforce", "person")]
+    assert ownerless["last_status"] == "blocked_config"
+
+
+@pytest.mark.parametrize("platform_mode", ["off", "report_only"])
+def test_a_profile_keeps_its_own_policy_while_the_platform_is_not_enforced(monkeypatch, platform_mode):
+    root = _platform(mode=platform_mode)
+    calls = _patch_run_with_access(monkeypatch)
+    with _Profile(root, own_policy_mode="enforce"):
+        ownerless = _legacy_job()
+        assert s.run_one_job(_get(ownerless["id"])) is True
+        assert _get(ownerless["id"])["last_status"] == "blocked_config"
+    assert calls == []
+
+    with _Profile(root, name="other", own_policy_mode="off"):
+        job = _job()
+        assert s.run_one_job(_get(job["id"])) is True
+    assert calls == [(job["id"], None, None, None)]
+
+
+def test_an_unreadable_platform_policy_refuses_a_profile_with_its_own(monkeypatch):
+    root = _platform()
+    (root / "dashboard-governance.yaml").write_text("mode: [enforce\n", encoding="utf-8")
+    calls = _patch_run_with_access(monkeypatch)
+    with _Profile(root, own_policy_mode="off"):
+        job = _job(owner_email="alice@example.test")
+        assert s.run_one_job(_get(job["id"])) is True
+        assert "policy" in _get(job["id"])["last_error"]
+    assert calls == []

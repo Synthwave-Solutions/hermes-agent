@@ -293,9 +293,10 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
                 )
     platform_policy = policy if report["policy_source"] == "platform" else None
     if policy is not None and root is not None and report["policy_source"] == "store":
-        # A profile with a policy of its own: say so when it is weaker than
-        # the platform's. (A policy file it names that does not exist already
-        # failed above: its fires refuse, cron.jobs.resolve_cron_policy_path.)
+        # A profile with a policy of its own, which only applies while the
+        # platform policy is not enforced (cron.jobs.resolve_cron_policy_path;
+        # a policy file it names that does not exist already failed above).
+        # The platform policy still says who the people are.
         try:
             platform_policy = load_cron_governance_policy(
                 hermes_home=root, config=read_config_file(root / "config.yaml")
@@ -303,11 +304,11 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
         except Exception as exc:
             report["errors"].append(f"The platform governance policy could not be read: {exc}")
         else:
-            if platform_policy.mode == "enforce" and policy.mode != "enforce":
-                report["warnings"].append(
-                    f"This profile has its own policy in mode {policy.mode} while the "
-                    "platform policy is enforced."
-                )
+            report["warnings"].append(
+                f"This profile uses its own policy (mode {policy.mode}) while the platform "
+                f"policy is in mode {platform_policy.mode}; once the platform is enforced, "
+                "the platform policy governs this profile instead."
+            )
 
     # Whose own profile this is: the people are defined in the platform
     # policy, and a profile with a policy of its own may name them too.
