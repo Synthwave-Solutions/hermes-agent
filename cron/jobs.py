@@ -2476,7 +2476,8 @@ def system_principal_create_scope():
     refused under governance ``enforce``. It never applies to a governed
     person: an explicit owner, the address of a governed session and the
     address of a governed shell (``HERMES_DWD_IDENTITY``) all win over the
-    principal (see ``_resolve_creating_owner``).
+    principal, and below any other agent session (``_is_operator_shell``)
+    the job stays ownerless (see ``_resolve_creating_owner``).
     """
     token = _SYSTEM_PRINCIPAL_CREATE_SCOPE.set(True)
     try:
@@ -2502,6 +2503,83 @@ def _governed_shell_identity() -> Optional[str]:
         return normalize_owner_identity(raw)
     except ValueError:
         raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR) from None
+
+
+# Set in the environment of a process that runs inside, or descends from, an
+# agent session instead of the operator's own shell. HERMES_DWD_IDENTITY only
+# covers a governed non-admin under enforce; these cover the rest: the session
+# bridge of tools/environments/local.py (HERMES_SESSION_*, HERMES_UI_SESSION_ID,
+# HERMES_CRON_*), the WebUI turn environment (HERMES_SESSION_PLATFORM=webui,
+# HERMES_SESSION_USER_ID), gateway, cron and kanban workers, and a
+# dashboard-started run, which hands its governance to children in
+# HERMES_DASHBOARD_GOVERNANCE_CONTEXT. HERMES_CRON_JOB_ID marks the environment
+# of a cron job's script.
+_SESSION_MARKER_ENV = (
+    _GOVERNED_SHELL_IDENTITY_ENV,
+    "HERMES_DASHBOARD_GOVERNANCE_CONTEXT",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_CRON_SESSION",
+    "HERMES_CRON_JOB_ID",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_GATEWAY_SESSION",
+    "_HERMES_GATEWAY",
+    "HERMES_GATEWAY",
+    "HERMES_GATEWAY_MODE",
+    "HERMES_KANBAN_TASK",
+)
+_SESSION_MARKER_OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def _session_marker_value(name: str) -> str:
+    """A marker's value in this process: its environment, or a session
+    variable a host bound in-process (``gateway.session_context``)."""
+    values = [os.environ.get(name) or ""]
+    try:
+        from gateway.session_context import _VAR_MAP, get_session_env
+
+        if name in _VAR_MAP:
+            values.append(get_session_env(name, "") or "")
+    except Exception:
+        pass
+    for value in values:
+        text = str(value).strip()
+        if text.lower() not in _SESSION_MARKER_OFF_VALUES:
+            return text
+    return ""
+
+
+def _is_operator_shell() -> bool:
+    """True only for the operator at the host shell.
+
+    ``hermes cron create`` gives new jobs the administrator principal, so it
+    must be sure it is not running inside, or below, an agent session: a
+    WebUI terminal under ``report_only``, a gateway, cron or kanban run, or a
+    dashboard-started run carry no ``HERMES_DWD_IDENTITY`` but are not the
+    operator either. Any session marker (``_SESSION_MARKER_ENV``) or any
+    governance context, bound in-process or handed down in the environment,
+    rules it out, and so does a context that cannot be read.
+
+    This reads the environment, which a person who controls their own shell
+    can change; it keeps the principal away from everyone who does not
+    deliberately strip their session, and the command gate governs what a
+    governed shell may run.
+    """
+    if any(_session_marker_value(name) for name in _SESSION_MARKER_ENV):
+        return False
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+    except ImportError:
+        return True
+    try:
+        return current_governance_context() is None
+    except Exception:
+        return False
 
 
 def _creating_session_is_enforced_admin() -> bool:
@@ -2544,11 +2622,14 @@ def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     from it is refused, and the system principal is never stamped for it.
     Otherwise, in order: an explicit ``owner_email``; the governed person
     creating it (``_creating_owner_email``); the configured system principal
-    when the creator is the CLI operator (``system_principal_create_scope``)
-    or a governed administrator under ``enforce`` with nothing narrower
-    applied. Anyone else (an ungoverned gateway sender, a direct library
-    call) still gets an ownerless job, which runs as before outside
-    ``enforce`` and is refused under it.
+    when the creator is the CLI (``system_principal_create_scope``) run by
+    the operator at the host shell (``_is_operator_shell``: no session
+    marker, no governance context), or, outside the CLI, a governed
+    administrator under ``enforce`` with nothing narrower applied. Anyone
+    else (the CLI below an agent session, an ungoverned gateway sender, a
+    direct library call) still gets an ownerless job, which runs as before
+    outside ``enforce`` and is refused under it until an administrator
+    assigns an owner.
     """
     explicit = str(owner_email).strip().lower() if owner_email else ""
     shell_owner = _governed_shell_identity()
@@ -2562,7 +2643,9 @@ def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     owner = _creating_owner_email()
     if owner:
         return owner
-    if _SYSTEM_PRINCIPAL_CREATE_SCOPE.get() or _creating_session_is_enforced_admin():
+    if _SYSTEM_PRINCIPAL_CREATE_SCOPE.get():
+        return cron_system_principal() if _is_operator_shell() else ""
+    if _creating_session_is_enforced_admin():
         return cron_system_principal()
     return ""
 

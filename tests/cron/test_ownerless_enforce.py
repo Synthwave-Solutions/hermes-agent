@@ -6,10 +6,14 @@ rights of the platform owner. Under ``enforce`` such an agent job is now
 refused and the refusal is recorded on the job, its execution and the
 incident store. Jobs owned by the configured system principal
 (``cron.system_principal``) run under that principal's governance like any
-other owner. Jobs made at the CLI, or by a governed administrator, are stamped
-with the system principal so they do not end up ownerless; a job made in a
-governed person's shell is theirs and never the principal's. A named profile
-store without a policy of its own follows the platform root's policy.
+other owner. Jobs made by the operator at the host shell, or by a governed
+administrator, are stamped with the system principal so they do not end up
+ownerless; a job made in a governed person's shell is theirs, and one made
+below any other agent session stays ownerless, never the principal's. A named
+profile store without a policy of its own follows the platform root's policy.
+A refusal is never a run: it uses up no repeat and completes no one-shot.
+``run_job_governed`` is the one governed entry point for running a job on
+demand, and it returns a refusal instead of raising it.
 """
 
 from __future__ import annotations
@@ -886,6 +890,120 @@ def test_a_job_made_in_a_governed_shell_fires_as_that_person(monkeypatch):
 
     assert s.run_one_job(_get(job["id"])) is True
     assert calls == [(job["id"], MALLORY)]
+
+
+# ---------------------------------------------------------------------------
+# Without HERMES_DWD_IDENTITY the principal is still only for the operator
+#
+# HERMES_DWD_IDENTITY is set only for a governed non-admin under enforce. A
+# terminal of a WebUI session under report_only, of a gateway or cron run, of
+# a kanban worker or of a dashboard-started run has none, but it is still not
+# the operator's own shell: `hermes cron create` there must not produce an
+# administrator-owned job. It stays ownerless (refused under enforce) until an
+# administrator assigns an owner.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("HERMES_SESSION_PLATFORM", "webui"),
+        ("HERMES_SESSION_USER_ID", "mallory@example.test"),
+        ("HERMES_SESSION_KEY", "webui-session-1"),
+        ("HERMES_SESSION_ID", "20260927_101010_abcdef"),
+        ("HERMES_SESSION_CHAT_ID", "chat-1"),
+        ("HERMES_SESSION_SOURCE", "desktop"),
+        ("HERMES_UI_SESSION_ID", "ui-1"),
+        ("HERMES_CRON_SESSION", "1"),
+        ("HERMES_CRON_JOB_ID", "abc123"),
+        ("HERMES_GATEWAY_SESSION", "1"),
+        ("_HERMES_GATEWAY", "1"),
+        ("HERMES_KANBAN_TASK", "t_1"),
+    ],
+)
+def test_the_cli_scope_does_not_stamp_the_principal_inside_a_session(monkeypatch, name, value):
+    from cron.jobs import system_principal_create_scope
+
+    _write_config(PRINCIPAL)
+    monkeypatch.setenv(name, value)
+    with system_principal_create_scope():
+        assert _job()["owner_email"] == ""
+
+
+@pytest.mark.parametrize("value", ["", "  ", "0", "false"])
+def test_an_empty_or_off_session_flag_is_not_a_session(monkeypatch, value):
+    from cron.jobs import system_principal_create_scope
+
+    _write_config(PRINCIPAL)
+    monkeypatch.setenv("HERMES_CRON_SESSION", value)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", value)
+    with system_principal_create_scope():
+        assert _job()["owner_email"] == PRINCIPAL
+
+
+def test_the_cli_scope_does_not_stamp_the_principal_under_a_dashboard_run(monkeypatch):
+    """A dashboard-started run hands its governance to children in the
+    environment. Even an administrator's run is not the operator's shell."""
+    from cron.jobs import system_principal_create_scope
+    from hermes_cli.dashboard_governance.context import (
+        GOVERNANCE_CONTEXT_ENV,
+        serialize_context_for_env,
+    )
+
+    _write_config(PRINCIPAL)
+    monkeypatch.setenv(
+        GOVERNANCE_CONTEXT_ENV,
+        serialize_context_for_env(_governed("root@example.test", admin=True)),
+    )
+    with system_principal_create_scope():
+        assert _job()["owner_email"] == ""
+
+
+@pytest.mark.parametrize("mode", ["report_only", "enforce"])
+def test_the_cli_scope_does_not_stamp_the_principal_under_a_bound_context(mode):
+    from cron.jobs import system_principal_create_scope
+    from hermes_cli.dashboard_governance.context import governance_context
+
+    _write_config(PRINCIPAL)
+    with system_principal_create_scope(), governance_context(_governed("mallory@example.test", mode="report_only")):
+        assert _job()["owner_email"] == ""
+    with system_principal_create_scope(), governance_context(_governed("root@example.test", admin=True, mode=mode)):
+        owner = _job()["owner_email"]
+    assert owner == "", "the CLI scope is for the operator's shell only"
+
+
+def test_the_cli_scope_does_not_stamp_the_principal_for_a_bridged_session(monkeypatch):
+    """A host that binds session variables in-process (gateway, API server)
+    is not the operator's shell either."""
+    import contextvars
+
+    import gateway.session_context as session_context
+    from cron.jobs import system_principal_create_scope
+
+    _write_config(PRINCIPAL)
+    # set_session_vars flips a process-wide flag; restore it after the test.
+    monkeypatch.setattr(session_context, "_session_context_engaged", session_context._session_context_engaged)
+
+    def create_in_a_bound_session():
+        session_context.set_session_vars(platform="telegram", chat_id="42", user_id="7")
+        with system_principal_create_scope():
+            return _job()["owner_email"]
+
+    assert contextvars.copy_context().run(create_in_a_bound_session) == ""
+
+
+def test_hermes_cron_create_in_a_webui_terminal_is_not_the_principal(monkeypatch, capsys):
+    """End to end: a WebUI terminal under report_only (no DWD identity)."""
+    from cron.jobs import list_jobs
+
+    _write_config(PRINCIPAL)
+    _write_policy("report_only", users={MALLORY: {"roles": ["tech_lead"]}})
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", MALLORY)
+
+    assert _cli(["cron", "create", "every 1h", "Read every mailbox", "--name", "webui shell job"]) == 0
+    (job,) = [j for j in list_jobs(include_disabled=True) if j["name"] == "webui shell job"]
+    assert job["owner_email"] == ""
 
 
 # ---------------------------------------------------------------------------
