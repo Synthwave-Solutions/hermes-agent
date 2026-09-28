@@ -3968,6 +3968,35 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # SynthPulse model gateway contract. On a managed installation every
+    # model call goes through the installation's own gateway, and the
+    # installation renders this block (base_url, enforce, organisation,
+    # installation and module). These are inert defaults: nothing reads the
+    # block yet, and with enforce false every provider path works exactly as
+    # before. Fields:
+    #   base_url         the gateway's OpenAI-compatible base URL ("" = none)
+    #   enforce          refuse any model route that is not the gateway
+    #   org_id           organisation id stamped on traces
+    #   installation_id  installation id stamped on traces
+    #   module           the calling module's name in the key registry
+    #   user_field       how the OpenAI "user" field is filled ("pseudonym")
+    #   session_header   request header that carries the session id
+    #   realtime         true only when the gateway carries a realtime route
+    #   tool_exceptions  tool backends still allowed under enforce; rendered
+    #                    only at the operator's own installation from its
+    #                    exceptions file, never on a managed installation
+    "model_gateway": {
+        "base_url": "",
+        "enforce": False,
+        "org_id": "",
+        "installation_id": "",
+        "module": "engine",
+        "user_field": "pseudonym",
+        "session_header": "X-SP-Session",
+        "realtime": False,
+        "tool_exceptions": [],
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 39,
 }
