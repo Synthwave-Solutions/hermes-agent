@@ -8,6 +8,8 @@ in neither chain (undocumented, shifting allow-list): main provider or explicit
 ``auxiliary.<task>.provider`` only. HTTP 402 in call_llm() falls through the chain.
 """
 
+from agent import model_gateway as _model_gateway
+
 import contextlib
 import contextvars
 import functools
@@ -2173,6 +2175,8 @@ def _read_codex_singleton_token() -> Optional[str]:
 
 def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Try each API-key provider in PROVIDER_REGISTRY order; (client, model) or (None, None)."""
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("api-key")
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
     except ImportError:
@@ -2323,6 +2327,8 @@ def _warn_paid_lane_once(model: str) -> None:
 
 def _try_openrouter(explicit_api_key: Optional[Union[str, Callable[[], str]]] = None, model: str = None,
                     explicit_base_url: Optional[str] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("openrouter")
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
     if free_only and not _is_free_model(or_model):
@@ -2381,6 +2387,8 @@ def _describe_openrouter_unavailable(model: str = None) -> str:
 
 
 def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("nous")
     nous = _read_nous_auth()
     runtime = _resolve_nous_runtime_api(force_refresh=False)
     if runtime is None and not nous:
@@ -2914,6 +2922,8 @@ def _validate_base_url(base_url: str) -> None:
 
 
 def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("local/custom")
     runtime = _resolve_custom_runtime()
     custom_base, custom_key, custom_mode = (*runtime, None) if len(runtime) == 2 else runtime
     if not custom_base or not custom_key:
@@ -2956,6 +2966,8 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
 
     Caller must pass an explicit model — a pinned Grok default would rot as xAI's allowlist drifts.
     """
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("xai-oauth")
     if not model:
         logger.warning(
             "Auxiliary client: xai-oauth requested without a model; "
@@ -2985,6 +2997,8 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
 
     No auto-selected default: the Codex model allow-list is undocumented and drifts.
     """
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("openai-codex")
     if not model:
         logger.warning(
             "Auxiliary client: openai-codex requested without a model; "
@@ -3008,6 +3022,8 @@ def _try_azure_foundry(
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Azure Foundry aux client via the main agent's ``_resolve_azure_foundry_runtime`` (api_key vs Entra
     callable bearer, per-model api_mode, base_url overrides). Returns ``(client, model)`` or ``(None, None)``."""
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("azure-foundry")
     try:
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         from hermes_cli.auth import AuthError
@@ -3061,6 +3077,8 @@ def _try_azure_foundry(
 
 def _try_anthropic(explicit_api_key: Optional[Union[str, Callable[[], str]]] = None,
                    explicit_base_url: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
+    if _model_gateway.enforced():
+        return _refuse_direct_lane("anthropic")
     try:
         from agent.anthropic_adapter import build_anthropic_client
         from agent.anthropic_credentials import resolve_anthropic_token
@@ -3150,11 +3168,88 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+def _refuse_direct_lane(label: str) -> Tuple[None, None]:
+    """A direct provider lane under ``model_gateway.enforce``: never built."""
+    logger.debug("Auxiliary: %s lane refused under model_gateway.enforce", label)
+    return None, None
+
+def _try_model_gateway() -> Tuple[Optional[Any], Optional[str]]:
+    """The gateway lane of the step 3 chain (only lane under enforcement)."""
+    return _resolve_gateway_client("auto", None)
+
+def _resolve_gateway_client(
+    provider: Optional[str],
+    model: Optional[str],
+    *,
+    async_mode: bool = False,
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    is_vision: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Build the gateway client that replaces every provider under enforcement.
+
+    The model is the caller's (a task or fallback entry) or the main model;
+    the key is the caller's own gateway key, never a provider key. A gateway
+    marked unhealthy raises ``ModelGatewayUnavailable`` instead of choosing
+    another lane.
+    """
+    if _is_provider_unhealthy(_model_gateway.GATEWAY_LABEL):
+        raise _model_gateway.ModelGatewayUnavailable(
+            "the model gateway is marked unhealthy after a failed call; "
+            "direct provider lanes are disabled by model_gateway.enforce"
+        )
+    runtime = _normalize_main_runtime(main_runtime)
+    if (provider or "").strip().lower() == "moa" and model:
+        # A MoA preset name is not a wire model; its acting model is the aggregator.
+        _agg_provider, _agg_model = _resolve_moa_aggregator(model)
+        model = _agg_model or model
+    base_url = _model_gateway.gateway_base_url()
+    fallback_key = ""
+    if explicit_base_url and _model_gateway.is_gateway_url(explicit_base_url):
+        fallback_key = explicit_api_key or ""
+    runtime_key = runtime.get("api_key")
+    if (
+        not fallback_key
+        and isinstance(runtime_key, str)
+        and _model_gateway.is_gateway_url(str(runtime.get("base_url") or ""))
+    ):
+        fallback_key = runtime_key
+    if not fallback_key and _model_gateway.is_gateway_url(_read_main_base_url()):
+        main_key = _read_main_api_key()
+        fallback_key = main_key if isinstance(main_key, str) else ""
+    try:
+        base_url, api_key = _model_gateway.require_gateway(fallback_key=fallback_key)
+    except _model_gateway.ModelGatewayUnavailable:
+        if _aux_probe_active():
+            return None, None
+        raise
+    final_model = (
+        model
+        or str(runtime.get("model") or "")
+        or _read_main_model_for_aux()
+        or _read_main_model()
+    )
+    if not final_model:
+        logger.warning(
+            "Auxiliary: no model for the gateway lane (provider=%s); set "
+            "auxiliary.<task>.model or model.default", provider or "auto",
+        )
+        return None, None
+    client = _create_openai_client(api_key=api_key, base_url=base_url)
+    _tag_effective_provider(client, _model_gateway.GATEWAY_LABEL)
+    if async_mode:
+        client, final_model = _to_async_client(client, final_model, is_vision=is_vision)
+        _tag_effective_provider(client, _model_gateway.GATEWAY_LABEL)
+    return client, final_model
+
 def _get_provider_chain() -> List[tuple]:
     """Ordered provider detection chain, built at call time so ``_try_*`` patches are picked up.
 
     ``openai-codex`` is deliberately absent (shifting allow-list breaks guessed-model fallback).
     """
+    if _model_gateway.enforced():
+        return [(_model_gateway.GATEWAY_LABEL, _try_model_gateway)]
     return [
         ("openrouter", _try_openrouter), ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint), ("api-key", _resolve_api_key_provider),
@@ -3176,6 +3271,8 @@ _AUX_UNHEALTHY_LABEL_ALIASES = {
 
 def _normalize_chain_label(provider: str) -> str:
     """resolved_provider → chain label; unknown API-key providers fall back to the lowercased input."""
+    if provider and _model_gateway.enforced():
+        return _model_gateway.GATEWAY_LABEL
     if not provider:
         return ""
     p = str(provider).strip().lower()
@@ -4265,6 +4362,8 @@ def _try_payment_fallback(
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the auto-detection chain after a payment/credit or connection error, skipping the failed
     provider (and the main-provider path when it maps to the same backend). Returns (client, model, label) or (None, None, "")."""
+    if _model_gateway.enforced():
+        return None, None, ""
     skip = failed_provider.lower().strip()
     # The SESSION's provider decides whether discovery is allowed: a live `/model xai-oauth` session
     # over a persisted ``provider: auto`` is a selection, so the disk value alone is not the answer.
@@ -5460,6 +5559,11 @@ def resolve_provider_client(
     (full auto-detection chain). ``model=None`` → provider's default aux model. ``raw_codex`` → bare OpenAI
     client for ``responses.stream()`` callers. ``api_mode`` forces "codex_responses"/"chat_completions"/
     "anthropic_messages" instead of auto-detect. Returns (client, resolved_model) or (None, None)."""
+    if _model_gateway.enforced():
+        return _resolve_gateway_client(
+            provider, model, async_mode=async_mode, explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_api_key, main_runtime=main_runtime, is_vision=is_vision,
+        )
     _validate_proxy_env_urls()
     # Keep the pre-alias name so a custom_providers entry named like a built-in alias
     # (e.g. "kimi" → "kimi-coding") is still reachable via the named-custom branch.
@@ -5736,6 +5840,13 @@ def resolve_vision_provider_client(
     )
     # The raw name keeps a llama.cpp alias distinguishable from bare ``custom`` for the last resolve.
     raw_requested, requested = requested, _normalize_vision_provider(requested)
+    if _model_gateway.enforced():
+        client, final_model = resolve_provider_client(
+            requested or "auto", model=resolved_model, async_mode=async_mode,
+            explicit_base_url=resolved_base_url, explicit_api_key=resolved_api_key,
+            main_runtime=runtime, is_vision=True, task="vision",
+        )
+        return _model_gateway.GATEWAY_LABEL, client, final_model
     if resolved_base_url:
         provider_for_base_override = requested if requested and requested not in {"", "auto"} else "custom"
         client, final_model = resolve_provider_client(
@@ -5841,7 +5952,7 @@ def _client_cache_key(
     # Profile home leads the key: callers that omit api_key (pool / Nous auth.json paths) would
     # otherwise share one client across multiplex profiles holding different credentials.
     return (hermes_home_key(), provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key,
-            _borrowed_main_credential_key(provider, base_url, api_key, runtime))
+            _borrowed_main_credential_key(provider, base_url, api_key, runtime)) + _model_gateway.cache_token()
 
 
 def _borrowed_main_credential_key(provider: str, base_url: Optional[str], api_key: Any, runtime: Dict[str, Any]) -> tuple:
@@ -6061,6 +6172,10 @@ def _get_cached_client(
     previously occurred in long-running gateways where recycled worker threads created unbounded entries
     (#10200).
     """
+    if _model_gateway.enforced() and _is_provider_unhealthy(_model_gateway.GATEWAY_LABEL):
+        raise _model_gateway.ModelGatewayUnavailable(
+            "the model gateway is marked unhealthy; direct provider lanes are disabled"
+        )
     # A bare llama.cpp alias keys on the live local endpoint: a restarted server (new port/key)
     # must not be served the old client, and a stopped one resolves to nothing, not a cloud client.
     from agent.auxiliary_local_runtime import bare_llamacpp_endpoint
@@ -6864,7 +6979,8 @@ def _build_call_kwargs(
     # Conversation affinity (OpenCode relay, opt-in custom-provider header) — same key as the main
     # turn so compression/title/vision calls stay on the conversation's warm backend.
     from agent.opencode_affinity import merge_session_affinity_headers
-    return merge_session_affinity_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    kwargs = merge_session_affinity_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    return _model_gateway.apply_request_identity(kwargs, base_url=base_url)
 
 
 def _validate_llm_response(

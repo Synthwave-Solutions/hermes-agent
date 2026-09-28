@@ -979,6 +979,75 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
                                             explicit_base_url=explicit_base_url), requested_provider)
 
 
+def _resolve_model_gateway_runtime(
+    *,
+    requested_provider: str,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The runtime under ``model_gateway.enforce``: always the gateway.
+
+    A named custom provider whose base URL is the gateway (HQ's
+    ``custom:omniroute``) keeps its config-only resolution, so its model
+    capabilities and headers still apply; every other request, whatever
+    provider it names, becomes a plain OpenAI-compatible runtime on the
+    gateway. An explicit key is used only when it came with the gateway URL,
+    so a provider key never reaches the gateway. Raises
+    ``ModelGatewayUnavailable`` when the gateway has no URL or key.
+    """
+    from agent import model_gateway as _model_gateway
+
+    fallback_key = ""
+    if explicit_base_url and _model_gateway.is_gateway_url(explicit_base_url):
+        fallback_key = (explicit_api_key or "").strip()
+    elif explicit_base_url:
+        logger.warning(
+            "model_gateway: runtime for %s requested a direct endpoint; routed to the gateway",
+            requested_provider or "auto",
+        )
+
+    runtime: Optional[Dict[str, Any]] = None
+    runtime_key: Any = None
+    if (requested_provider or "").startswith("custom:"):
+        named = _get_named_custom_provider(requested_provider)
+        named_base = str((named or {}).get("base_url") or "")
+        if named and _model_gateway.is_gateway_url(named_base):
+            runtime = _resolve_named_custom_runtime(
+                requested_provider=requested_provider,
+                target_model=target_model,
+            )
+            if runtime:
+                runtime_key = runtime.get("api_key")
+                if isinstance(runtime_key, str):
+                    fallback_key = fallback_key or runtime_key
+
+    base_url = _model_gateway.gateway_base_url()
+    api_key: Any = _model_gateway.gateway_api_key(fallback=fallback_key)
+    if not api_key and callable(runtime_key):
+        # A key_cmd on the gateway's own provider entry mints the key per call.
+        api_key = runtime_key
+    if not base_url or not api_key:
+        base_url, api_key = _model_gateway.require_gateway(fallback_key=fallback_key)
+    if not runtime:
+        runtime = {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+        }
+        if target_model:
+            runtime["model"] = target_model
+    runtime = dict(runtime)
+    runtime["base_url"] = str(runtime.get("base_url") or base_url).rstrip("/")
+    if not _model_gateway.is_gateway_url(runtime["base_url"]):
+        runtime["base_url"] = base_url
+    runtime["api_key"] = api_key
+    runtime["source"] = "model-gateway"
+    runtime["requested_provider"] = requested_provider
+    runtime["model_gateway"] = True
+    if runtime.get("api_mode") not in {"chat_completions", "anthropic_messages", "codex_responses"}:
+        runtime["api_mode"] = "chat_completions"
+    return runtime
+
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
                              explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
@@ -998,6 +1067,12 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
     requested_provider = resolve_requested_provider(requested)
+    from agent import model_gateway as _model_gateway
+    if _model_gateway.enforced() and requested_provider != "moa":
+        return _resolve_model_gateway_runtime(
+            requested_provider=requested_provider, explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url, target_model=target_model,
+        )
     _raise_if_provider_disabled(requested_provider)
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
     # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
