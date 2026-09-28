@@ -13,6 +13,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import contextvars
+import dataclasses
 import errno
 import json
 import logging
@@ -715,6 +716,7 @@ from cron.jobs import (
     advance_next_runs,
     claim_dispatch,
     claim_job_for_fire,
+    CronJobAccessDenied,
     fire_claim_fence,
     clear_run_claim,
     get_due_jobs,
@@ -4623,7 +4625,7 @@ def _build_job_prompt(
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
-        from cron.jobs import get_cron_output_dir
+        from cron.jobs import caller_may_act_on_job_id, get_cron_output_dir
         output_dir = get_cron_output_dir()
         if isinstance(context_from, str):
             context_from = [context_from]
@@ -4642,6 +4644,19 @@ def _build_job_prompt(
             if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
                 logger.warning(
                     "context_from: skipping invalid job_id %r for job_id=%r name=%r%s",
+                    source_job_id,
+                    job.get("id"),
+                    job.get("name"),
+                    _cron_job_origin_log_suffix(job),
+                )
+                continue
+            # A fire runs bound to its owner: a governed owner who is not an
+            # administrator reads only the output of their own jobs, whatever
+            # was stored in context_from (cron.jobs.caller_may_act_on_job).
+            if not is_self and not caller_may_act_on_job_id(source_job_id):
+                logger.warning(
+                    "context_from: skipping job_id %r for job_id=%r name=%r: "
+                    "it is not a job of this job's owner%s",
                     source_job_id,
                     job.get("id"),
                     job.get("name"),
@@ -7063,22 +7078,151 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
 
 
+_OWNERLESS_FIRE_REFUSAL = (
+    "Not run: this scheduled task has no owner and access control is "
+    "enforced. An administrator must assign an owner before it can run."
+)
+_POLICY_UNAVAILABLE_FIRE_REFUSAL = (
+    "Not run: the access policy could not be read, so this scheduled task "
+    "cannot be checked. An administrator must fix the policy before it can run."
+)
+
+
+class CronJobOwnerRefused(PermissionError):
+    """A fire refused by ``_governed_as_job_owner``.
+
+    ``recorded`` says whether the refusal is already on the job (and its
+    execution and the incident store); callers only need to stop. It stays
+    inside the scheduler: ``run_one_job`` and ``run_job_governed`` turn it
+    into a processed fire and a ``GovernedRunResult``.
+    """
+
+    def __init__(self, refusal: str, *, recorded: bool = False):
+        super().__init__(refusal)
+        self.refusal = refusal
+        self.recorded = recorded
+
+
+def _ownerless_fire_refusal(job: dict) -> Optional[str]:
+    """Why an ownerless job may not fire, or None when it may run unbound.
+
+    Only agent jobs under governance ``enforce`` are refused: a ``no_agent``
+    script has no agent turn to govern, and outside ``enforce`` ownerless jobs
+    keep running as before. The policy is the store's own, or for a named
+    profile without one the platform root's (``load_cron_governance_policy``).
+    A policy that cannot be read fails closed.
+    """
+    if job.get("no_agent"):
+        return None
+    try:
+        import hermes_cli.dashboard_governance.loader  # noqa: F401 (governance installed?)
+    except ImportError:
+        return None
+    from cron.jobs import load_cron_governance_policy
+
+    try:
+        policy = load_cron_governance_policy()
+    except Exception:
+        logger.warning(
+            "Job '%s': governance policy unreadable; refusing the ownerless fire",
+            job.get("id"),
+            exc_info=True,
+        )
+        return _POLICY_UNAVAILABLE_FIRE_REFUSAL
+    if getattr(policy, "mode", "off") != "enforce":
+        return None
+    return _OWNERLESS_FIRE_REFUSAL
+
+
+def _record_refused_fire(job: dict, reason: str, *, consume_occurrence: bool = True) -> bool:
+    """Record a refused fire where people look: job, execution, incidents.
+
+    Logged at WARNING without a traceback: a refusal is an expected outcome,
+    not a crash. Best-effort per store so one failing bookkeeping write never
+    hides the others. ``cron.jobs.mark_job_refused`` records it on the job
+    without using up a repeat or completing a one-shot; a scheduled fire
+    (``consume_occurrence``) also releases its claims, fenced by the claim
+    owner, and moves the job on. Returns True when the job row was updated.
+    """
+    from cron.jobs import mark_job_refused
+
+    job_id = str(job.get("id") or "")
+    logger.warning(
+        "Job '%s' (ID: %s): %s", job.get("name", job_id), job_id, reason
+    )
+    _upsert_incident_for_failure(job, reason)
+    claim = job.get("fire_claim")
+    expected_fire_owner = (
+        str(claim.get("by") or "")
+        if consume_occurrence and isinstance(claim, dict)
+        else None
+    )
+    recorded = False
+    try:
+        recorded = mark_job_refused(
+            job_id,
+            reason,
+            consume_occurrence=consume_occurrence,
+            expected_fire_owner=expected_fire_owner,
+        )
+    except Exception:
+        logger.warning("Job '%s': could not record the refused fire", job_id, exc_info=True)
+    try:
+        execution_id = job.get("execution_id") or create_execution(
+            job_id, source="direct"
+        )["id"]
+        finish_execution(execution_id, success=False, error=reason)
+    except Exception:
+        logger.debug("Job '%s': could not record the refused execution", job_id, exc_info=True)
+    return recorded
+
+
 @contextlib.contextmanager
-def _governed_as_job_owner(job: dict):
+def _governed_as_job_owner(
+    job: dict,
+    *,
+    record_refusal: bool = True,
+    consume_occurrence: bool = True,
+):
     """Run a fire under the governance of the person who created the job.
 
     A cron job outlives the conversation that made it. Without this the run
     has no identity at all, so a job a governed user created would act with
     the owner's full rights, including every Google account in the domain
-    (29-08-2026). Jobs without an owner (everything made before this, and
-    everything an admin or the CLI makes) run exactly as before.
+    (29-08-2026).
+
+    Jobs without an owner run unbound, exactly as before, unless the policy
+    is in ``enforce`` mode: then an ownerless agent job is refused, because
+    running it unbound is running it with everyone's rights. Jobs made by the
+    operator at the host shell (``hermes cron create``) or by a governed
+    administrator are stamped with ``cron.system_principal``
+    (``cron.jobs._resolve_creating_owner``) and older ones are migrated with
+    ``scripts/cron_assign_system_owner.py``; the principal then governs them
+    like any other owner.
+
+    The policy is the store's own; a named profile that has none follows the
+    platform root's policy (``cron.jobs.load_cron_governance_policy``), so a
+    profile store is governed like the root store and the WebUI.
 
     An owner whose grants cannot be resolved stops the run rather than
-    falling back to unrestricted: the failure is recorded on the job, which
-    is visible, where a silent fallback would not be.
+    falling back to unrestricted. Every refusal is recorded on the job, its
+    execution and the incident store (visible, where a silent fallback would
+    not be; ``record_refusal=False`` leaves that to the caller) and raised as
+    ``CronJobOwnerRefused``. ``consume_occurrence`` tells the record whether
+    this was a scheduled fire (``_record_refused_fire``). The two callers are
+    ``run_one_job`` (every scheduled and claimed fire) and
+    ``run_job_governed`` (runs on demand); neither lets the exception out.
     """
     owner = str(job.get("owner_email") or "").strip().lower()
     if not owner:
+        refusal = _ownerless_fire_refusal(job)
+        if refusal:
+            recorded = (
+                _record_refused_fire(job, refusal, consume_occurrence=consume_occurrence)
+                if record_refusal
+                else False
+            )
+            raise CronJobOwnerRefused(refusal, recorded=recorded)
         yield
         return
     from hermes_cli.dashboard_governance.context import (
@@ -7086,12 +7230,32 @@ def _governed_as_job_owner(job: dict):
         bind_governance_context,
         reset_governance_context,
     )
-    from hermes_cli.dashboard_governance.loader import load_governance_policy
     from hermes_cli.dashboard_governance.models import GovernanceSubject
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+    from cron.jobs import load_cron_governance_policy
 
-    policy = load_governance_policy()
-    access = resolve_effective_access(policy, GovernanceSubject(email=owner))
+    try:
+        policy = load_cron_governance_policy()
+        access = resolve_effective_access(policy, GovernanceSubject(email=owner))
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': governance for owner %s could not be resolved",
+            job.get("id"),
+            owner,
+            exc_info=True,
+        )
+        recorded = (
+            _record_refused_fire(
+                job,
+                _POLICY_UNAVAILABLE_FIRE_REFUSAL,
+                consume_occurrence=consume_occurrence,
+            )
+            if record_refusal
+            else False
+        )
+        raise CronJobOwnerRefused(
+            _POLICY_UNAVAILABLE_FIRE_REFUSAL, recorded=recorded
+        ) from exc
     token = bind_governance_context(
         DashboardGovernanceContext(
             subject=access.subject,
@@ -7103,6 +7267,143 @@ def _governed_as_job_owner(job: dict):
         yield
     finally:
         reset_governance_context(token)
+
+
+@dataclasses.dataclass(frozen=True)
+class GovernedRunResult:
+    """What ``run_job_governed`` did with one run of a job.
+
+    ``outcome`` is one of:
+
+    - ``"ran"``: ``run_job`` ran under the owner's governance. ``success``,
+      ``output``, ``final_response`` and ``error`` are its result, exactly as
+      ``run_job`` returns them (``as_run_job_tuple``); save and deliver them
+      as for any run.
+    - ``"refused"``: governance did not let the job run (an ownerless agent
+      job under ``enforce``, or an owner whose grants cannot be resolved).
+      ``refusal`` says why in plain language (``error`` repeats it) and
+      ``refusal_recorded`` says whether it is already on the job; there is no
+      output, and nothing is to be delivered.
+    - ``"failed"``: ``run_job`` raised. ``error`` names the exception.
+
+    Plain data: ``to_dict`` gives JSON-safe values, and it pickles, so a
+    caller that runs the job in a child process can send it back.
+    """
+
+    job_id: str
+    reason: str
+    outcome: str
+    success: bool
+    output: str = ""
+    final_response: str = ""
+    error: Optional[str] = None
+    refusal: Optional[str] = None
+    refusal_recorded: bool = False
+    owner_email: str = ""
+
+    @property
+    def ran(self) -> bool:
+        return self.outcome == "ran"
+
+    @property
+    def refused(self) -> bool:
+        return self.outcome == "refused"
+
+    def as_run_job_tuple(self) -> tuple[bool, str, str, Optional[str]]:
+        """``(success, output, final_response, error)`` like ``run_job``."""
+        return (self.success, self.output, self.final_response, self.error)
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def run_job_governed(
+    job: dict,
+    *,
+    reason: str,
+    record_refusal: bool = True,
+    **run_job_kwargs: Any,
+) -> GovernedRunResult:
+    """Run one job now, on demand, under its owner's governance.
+
+    The one entry point for code outside the scheduler that runs a job itself
+    instead of letting the ticker fire it (the WebUI "Run now" path). It
+    applies the gate every scheduled fire goes through
+    (``_governed_as_job_owner``): the run is bound to the owner's governance,
+    an ownerless agent job is refused under governance ``enforce``, and so is
+    a job whose owner's grants cannot be resolved. An ownerless ``no_agent``
+    script, and every ownerless job outside ``enforce``, runs as before.
+
+    It never raises for a refusal or for an exception inside ``run_job``;
+    the outcome comes back as a ``GovernedRunResult``. A refusal is logged at
+    WARNING without a traceback. Only a BaseException that is not an
+    Exception (interpreter shutdown, KeyboardInterrupt) propagates.
+
+    ``reason``: a short label for why the job runs now, such as ``"manual"``
+    for the WebUI Run now button or ``"api"`` for an API client. It is logged
+    and returned on the result.
+
+    ``record_refusal``: a refusal is recorded like the ticker records one (on
+    the job, a failed execution and the incident store of the active cron
+    store) but only as an outcome: a run on demand does not move, pause or
+    complete the job's schedule and uses up no repeat. A caller whose active
+    store is not the one that holds the job passes False and records the
+    refusal in the right store with
+    ``cron.jobs.mark_job_refused(job_id, refusal, consume_occurrence=False)``.
+
+    ``run_job_kwargs`` go to ``run_job`` unchanged. The caller keeps doing
+    what it does after a run today (save output, deliver, ``mark_job_run``),
+    for a ``"ran"`` result only.
+    """
+    job_id = str((job or {}).get("id") or "")
+    label = str(reason or "").strip() or "unspecified"
+    owner = str((job or {}).get("owner_email") or "").strip().lower()
+    try:
+        with _governed_as_job_owner(
+            job,
+            record_refusal=record_refusal,
+            consume_occurrence=False,
+        ):
+            success, output, final_response, error = run_job(job, **run_job_kwargs)
+    except CronJobOwnerRefused as refused:
+        # A recorded refusal was already logged at WARNING by the record.
+        logger.log(
+            logging.INFO if refused.recorded else logging.WARNING,
+            "Job '%s': run on demand (%s) refused: %s",
+            job_id,
+            label,
+            refused.refusal,
+        )
+        return GovernedRunResult(
+            job_id=job_id,
+            reason=label,
+            outcome="refused",
+            success=False,
+            error=refused.refusal,
+            refusal=refused.refusal,
+            refusal_recorded=refused.recorded,
+            owner_email=owner,
+        )
+    except Exception as exc:
+        logger.exception("Job '%s': run on demand (%s) failed", job_id, label)
+        return GovernedRunResult(
+            job_id=job_id,
+            reason=label,
+            outcome="failed",
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+            owner_email=owner,
+        )
+    return GovernedRunResult(
+        job_id=job_id,
+        reason=label,
+        outcome="ran",
+        success=bool(success),
+        output=output or "",
+        final_response=final_response or "",
+        error=error,
+        owner_email=owner,
+    )
 
 
 def run_one_job(
@@ -7169,6 +7470,12 @@ def run_one_job(
                     execution_token=execution_token,
                 ),
             )
+    except CronJobOwnerRefused:
+        # The gate refused the fire before the dispatch claim and already
+        # recorded it on the job, its execution and the incident store without
+        # using up a repeat or completing a one-shot: processed, like any
+        # failed run, and logged at WARNING, never as a failed future.
+        return True
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
@@ -8102,7 +8409,39 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            try:
+                claimed = claim_job_for_fire(job["id"], return_job=True)
+            except CronJobAccessDenied as denied:
+                # The scan runs outside any governed context, so the ticker
+                # normally never claims a foreign job (get_due_jobs also filters
+                # them out for a governed caller). This is the safety net for a
+                # governed caller reaching this path (a governed ``hermes cron
+                # tick``, or ownership changing between scan and claim): record
+                # the refusal and release the one-shot run_claim get_due_jobs
+                # stamped, so the occurrence is not lost and the execution row
+                # does not stay 'claimed' for its TTL.
+                logger.warning(
+                    "Job '%s': fire claim refused by governance; not dispatched: %s",
+                    job.get("name", job["id"]),
+                    denied,
+                )
+                finish_execution(
+                    job["execution_id"],
+                    success=False,
+                    error=f"Fire claim refused by governance: {denied}",
+                )
+                _schedule = job.get("schedule")
+                if isinstance(_schedule, dict) and _schedule.get("kind") == "once":
+                    try:
+                        clear_run_claim(job["id"])
+                    except Exception as _claim_err:
+                        logger.warning(
+                            "Could not clear run_claim for job '%s' after a "
+                            "refused fire: %s (claim will expire at TTL)",
+                            job.get("name", job["id"]),
+                            _claim_err,
+                        )
+                return True
             if not claimed:
                 finish_execution(
                     job["execution_id"],

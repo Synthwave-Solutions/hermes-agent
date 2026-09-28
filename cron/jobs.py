@@ -474,11 +474,25 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             )
         yield owns_claim
 
-# Fields on a cron job that must never change after creation. ``id`` is used
-# as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
-# updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# Fields on a cron job that must never change through ``update_job``.
+#
+# ``id`` is used as a filesystem path component under ``OUTPUT_DIR``; allowing
+# it to be updated lets an unsafe value (``../escape``, absolute path, nested)
+# leak into output writes/deletes.
+#
+# ``owner_email``, ``origin`` and ``created_at`` are the job's identity: the
+# owner decides whose governance every fire runs under (see
+# ``cron.scheduler._governed_as_job_owner``), ``origin`` is where "origin"
+# delivery goes. When only ``id`` was protected, anyone who could edit a job
+# (the agent ``cronjob`` tool, the engine dashboard, an API client) could blank
+# the owner so the job ran with nobody's governance, or re-own it. The only
+# way to change the owner afterwards is ``reassign_job_owner`` (``hermes cron
+# reassign-owner``), which is refused inside governed sessions and audited.
+# ``origin`` and ``created_at`` are set once, by ``create_job``: a caller that
+# stamps them with a follow-up ``update_job`` (WebUI builds before its cron
+# write fix did this for tasks made in the Tasks panel) is refused after the
+# job is saved, so such a caller must pass them to ``create_job`` instead.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "owner_email", "origin", "created_at"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -2204,6 +2218,855 @@ def _validate_job_mode_invariants(
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
 
+# ---------------------------------------------------------------------------
+# Job owner identity
+# ---------------------------------------------------------------------------
+
+_OWNER_IDENTITY_RE = re.compile(r"[^@\s]+@[^@\s]+")
+_OWNER_IDENTITY_MAX_LEN = 254
+
+# Append-only record of every owner change, next to jobs.json (per profile).
+OWNER_AUDIT_FILE_NAME = "owner-audit.jsonl"
+
+_OWNER_ADMIN_ONLY_ERROR = (
+    "Changing the owner of a scheduled task is an administrator action and "
+    "is not available inside a governed session."
+)
+
+_NO_VERIFIED_ACCOUNT_ERROR = (
+    "Cannot schedule a job for this session: no verified account to run it as. "
+    "Ask your admin."
+)
+
+_FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR = (
+    "A scheduled task made in this session always runs as your own account; "
+    "it cannot be given to another account."
+)
+
+_OWNER_ADMIN_OUTSIDE_OPERATOR_SHELL_ERROR = (
+    "Changing the owner of a scheduled task is an administrator action: run it "
+    "from the host shell, outside any agent session."
+)
+
+_FOREIGN_JOB_ERROR = (
+    "This scheduled task belongs to another account. Only its owner or an "
+    "administrator can change, run or remove it."
+)
+
+_FOREIGN_CONTEXT_SOURCE_ERROR = (
+    "A scheduled task can only use the output of your own scheduled tasks; "
+    "'{ref}' is not one of them."
+)
+
+_BOT_CEILING_ERROR = (
+    "A managed bot session cannot schedule, change, resume or run a scheduled "
+    "task, because the task would run without the bot's limits. It can list, "
+    "pause and remove its own tasks."
+)
+
+_ADMIN_ONLY_JOB_FIELDS_ERROR = (
+    "Only an administrator can give a scheduled task {fields}: a script, a "
+    "monitor or a script-only task runs outside your access rules."
+)
+
+_FOREIGN_DELIVERY_TARGET_ERROR = (
+    "A scheduled task of yours can deliver only to this conversation (origin), "
+    "to local, or to a platform's home channel; '{target}' is not one of them."
+)
+
+_OWNERLESS_CREATE_REFUSAL = (
+    "Cannot schedule this task: access control is enforced and the task would "
+    "have no owner to run as, so it would never run. Ask your admin."
+)
+
+_POLICY_UNAVAILABLE_CREATE_REFUSAL = (
+    "Cannot schedule this task: the access policy could not be read, so the "
+    "task could not be checked. Ask your admin."
+)
+
+# Set by tools/environments/local.py (``_inject_dwd_identity_env``) on every
+# child process of a governed non-admin session under ``enforce``: their
+# terminal, and the scripts of their cron jobs. It carries the person's
+# address, or "unresolved-identity" when their address could not be read.
+_GOVERNED_SHELL_IDENTITY_ENV = "HERMES_DWD_IDENTITY"
+
+
+def normalize_owner_identity(value: Any) -> str:
+    """Return ``value`` as a canonical owner address, or raise ValueError.
+
+    A job owner is a person or the configured system principal, always an
+    address that the governance policy is keyed by. Empty is not an owner:
+    there is no way to turn an owned job back into an ownerless one.
+    """
+    text = value.strip().lower() if isinstance(value, str) else ""
+    if (
+        not text
+        or len(text) > _OWNER_IDENTITY_MAX_LEN
+        or not _OWNER_IDENTITY_RE.fullmatch(text)
+    ):
+        raise ValueError(f"Not a valid owner address: {value!r}")
+    return text
+
+
+def system_principal_from_config(config: Any) -> str:
+    """``cron.system_principal`` from an already loaded config mapping.
+
+    Returns "" when unset. An invalid value is logged and treated as unset,
+    which fails closed: ownerless jobs are then refused under enforce rather
+    than stamped with something the policy can never match.
+    """
+    cron_cfg = config.get("cron") if isinstance(config, dict) else None
+    raw = cron_cfg.get("system_principal") if isinstance(cron_cfg, dict) else None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return ""
+    try:
+        return normalize_owner_identity(raw)
+    except ValueError:
+        logger.warning(
+            "cron.system_principal %r is not a valid address; treating it as unset",
+            raw,
+        )
+        return ""
+
+
+def cron_system_principal() -> str:
+    """The configured ``cron.system_principal`` for the active store, or "".
+
+    The active profile's own setting wins. A named profile that sets none
+    uses the platform root's (``platform_root_for``), so one setting in the
+    root config.yaml covers every profile store.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        logger.debug("cron: config unavailable, no system principal", exc_info=True)
+        config = {}
+    principal = system_principal_from_config(config)
+    if principal:
+        return principal
+    root = platform_root_for(get_hermes_home())
+    if root is None:
+        return ""
+    try:
+        return system_principal_from_config(read_config_file(root / "config.yaml"))
+    except ValueError:
+        logger.warning("cron: the platform config.yaml is unreadable; no system principal")
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# The governance policy a cron store is governed by
+# ---------------------------------------------------------------------------
+
+
+def platform_root_for(home: Union[str, Path]) -> Optional[Path]:
+    """The platform root home that ``home`` is a named profile of, or None.
+
+    ``<root>/profiles/<name>`` gives ``<root>``. A root home (or any path
+    that is not exactly a named profile home) gives None.
+    """
+    try:
+        from hermes_constants import named_profile_home
+
+        resolved = Path(home).expanduser().resolve(strict=False)
+        profile = named_profile_home(resolved)
+    except Exception:
+        logger.debug("cron: could not tell whether %s is a named profile", home, exc_info=True)
+        return None
+    if profile is None or profile.resolve(strict=False) != resolved:
+        return None
+    return profile.parent.parent
+
+
+def read_config_file(path: Path) -> Dict[str, Any]:
+    """Read a config.yaml as a plain mapping; {} when it does not exist.
+
+    Raises ValueError when the file exists but cannot be read or is not a
+    mapping, so a caller deciding governance can fail closed.
+    """
+    try:
+        if not path.exists():
+            return {}
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise ValueError(f"{path} could not be read: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} is not a mapping")
+    return loaded
+
+
+def _configured_policy_file(config: Any) -> str:
+    dash = config.get("dashboard") if isinstance(config, dict) else None
+    gov = dash.get("governance") if isinstance(dash, dict) else None
+    raw = gov.get("policy_file") if isinstance(gov, dict) else None
+    return str(raw).strip() if raw else ""
+
+
+def resolve_cron_policy_path(
+    *,
+    hermes_home: Optional[Union[str, Path]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, str]:
+    """Where the governance policy of a cron store lives, and why.
+
+    Returns ``(path, source)``: ``"store"`` when the store's own policy
+    applies, ``"platform"`` when the platform root's does.
+
+    - A root home is the platform: its own policy (the one the WebUI and the
+      dashboard enforce as well), with the loader's rule that a missing file
+      reads as "off".
+    - For a named profile, an enforced platform policy is the floor: while
+      the platform root's policy is in ``enforce``, every profile store fires
+      under it, whatever the profile's config.yaml names. A profile chose its
+      own policy file, and the loader reads any YAML mapping without a mode
+      as "off", so pointing ``policy_file`` at a file that exists (even the
+      profile's own config.yaml, which a person with config:write on that
+      profile can edit, and can even make read as an enforced policy that
+      names them an administrator) switched governance off, or widened it,
+      for that profile's fires.
+    - While the platform is not enforced, a named profile keeps a policy of
+      its own (a ``policy_file`` its config.yaml names, or its own
+      ``dashboard-governance.yaml``) and otherwise follows the platform's.
+      A named ``policy_file`` that does not exist raises ValueError instead
+      of reading as "off": a typo or a moved file must not run the store's
+      ownerless agent jobs unbound.
+
+    ``hermes_home`` and ``config`` default to the active store. Raises
+    ValueError when the platform config.yaml or, for a named profile, the
+    platform policy cannot be read (fail closed).
+    """
+    from hermes_cli.dashboard_governance.loader import resolve_policy_path
+
+    home = Path(hermes_home).expanduser() if hermes_home is not None else get_hermes_home()
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+        except Exception:
+            config = {}
+    own = resolve_policy_path(config=config, hermes_home=home)
+    root = platform_root_for(home)
+    if root is None:
+        return own, "store"
+    root_config = read_config_file(root / "config.yaml")
+    platform = resolve_policy_path(config=root_config, hermes_home=root)
+    if _policy_mode(platform) == "enforce":
+        return platform, "platform"
+    if _configured_policy_file(config):
+        if not own.exists():
+            raise ValueError(
+                f"The policy file {own} named in the config.yaml of the profile "
+                f"{home.name} does not exist"
+            )
+        return own, "store"
+    if own.exists():
+        return own, "store"
+    return platform, "platform"
+
+
+def _policy_mode(path: Path) -> str:
+    """The mode of the policy at ``path`` ("off" when it does not exist)."""
+    from hermes_cli.dashboard_governance.loader import load_governance_policy
+
+    try:
+        return str(load_governance_policy(path=path).mode or "off")
+    except Exception as exc:
+        raise ValueError(f"The governance policy {path} could not be read: {exc}") from exc
+
+
+def load_cron_governance_policy(
+    *,
+    hermes_home: Optional[Union[str, Path]] = None,
+    config: Optional[Dict[str, Any]] = None,
+):
+    """The governance policy a cron store's fires run under.
+
+    See ``resolve_cron_policy_path``: an enforced platform policy governs
+    every named profile store. A missing policy file reads as mode ``off``
+    (the loader's rule), except one a named profile names while the platform
+    is not enforced, which raises like an unreadable one.
+    """
+    from hermes_cli.dashboard_governance.loader import load_governance_policy
+
+    path, _source = resolve_cron_policy_path(hermes_home=hermes_home, config=config)
+    return load_governance_policy(path=path)
+
+
+def ensure_owner_admin_caller() -> None:
+    """Refuse the owner admin path to anyone but an administrator.
+
+    Changing who a job runs as is an administrator action, and an owner set
+    now still holds once ``enforce`` is switched on, so this does not depend
+    on the governance mode:
+
+    - a governed person's shell (``HERMES_DWD_IDENTITY``, set for their child
+      processes by ``tools/environments/local.py``) is refused;
+    - an in-process governance context passes only when every envelope in it
+      (``policy_contexts``: the current access and any continuation it
+      carries) is an administrator's and no bot ceiling narrows it, in any
+      mode, report_only included;
+    - without a governance context the caller must be the operator at the
+      host shell (``_is_operator_shell``: no session marker), the same rule
+      the system principal is stamped by. A WebUI terminal under report_only,
+      or a governed terminal with ``HERMES_DWD_IDENTITY`` unset, is not.
+
+    Anything unreadable is refused.
+    """
+    if str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip():
+        raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+    except ImportError:
+        ctx = None
+    else:
+        try:
+            ctx = current_governance_context()
+            envelopes = policy_contexts(ctx)
+        except Exception as exc:
+            # A governance payload is present but unreadable: fail closed.
+            raise PermissionError(_OWNER_ADMIN_ONLY_ERROR) from exc
+        if ctx is not None:
+            for bound in envelopes:
+                if getattr(bound, "bot_access_ceiling", None) is not None:
+                    raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+                if dwd_identity_for(bound.access) is not None:  # None means administrator
+                    raise PermissionError(_OWNER_ADMIN_ONLY_ERROR)
+            return
+    if not _is_operator_shell():
+        raise PermissionError(_OWNER_ADMIN_OUTSIDE_OPERATOR_SHELL_ERROR)
+
+
+class CronJobAccessDenied(PermissionError, ValueError):
+    """A governed person acted on a scheduled task that is not theirs.
+
+    Also a ValueError (like ``io.UnsupportedOperation`` is both an OSError
+    and a ValueError), so every surface that already turns a ValueError from
+    ``cron.jobs`` into a plain refusal (the CLI, the cronjob tool, the engine
+    dashboard's 400) shows it instead of a traceback.
+    """
+
+
+def _owner_or_blank(value: Any) -> str:
+    try:
+        return normalize_owner_identity(value)
+    except ValueError:
+        return ""
+
+
+def _governed_caller_identities(*, include_ceiling: bool = True) -> Optional[frozenset]:
+    """Who a governed caller who is not an administrator is, or None.
+
+    None means the caller is not held to their own jobs: the operator, an
+    administrator, an ungoverned process, or a governed person outside
+    ``enforce``. Otherwise the addresses the caller is bound to, from a
+    governed shell (``HERMES_DWD_IDENTITY``, only ever set for a governed
+    non-admin under enforce) and from every envelope of an in-process
+    governance context that is in ``enforce`` and not an administrator's.
+
+    When ``include_ceiling`` (the default, for acting on existing jobs), an
+    administrator's session narrowed by a bot access ceiling is bound to the
+    administrator's own address, not treated as a full administrator: a
+    ceiling caps what the session may do, so acting on a principal-owned or
+    ownerless job (which the resolver would run under unbounded administrator
+    rights) is a widening the ceiling exists to prevent. Even on the jobs it
+    owns a ceiled session may only list, pause and remove: no fire carries
+    the ceiling, so everything that makes a job run or changes what it runs
+    is refused as well (``bot_ceiling_applies``). Owner changes are refused
+    for such a session separately (``ensure_owner_admin_caller``).
+
+    Creating a job passes ``include_ceiling=False`` so that a ceiled
+    administrator's create is never given the admin's own (unbounded)
+    address as owner; ``create_job`` then refuses the create for any ceiled
+    session.
+
+    An address that cannot be used, or a context that cannot be read, is
+    "" and matches no job, so the caller acts on nothing (fail closed).
+    """
+    identities: Set[str] = set()
+    raw = str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip()
+    if raw:
+        identities.add(_owner_or_blank(raw))
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+    except ImportError:
+        return frozenset(identities) if identities else None
+    try:
+        envelopes = policy_contexts(current_governance_context())
+    except Exception:
+        logger.debug("cron: unreadable governance context; the caller acts on no job", exc_info=True)
+        identities.add("")
+        return frozenset(identities)
+    for bound in envelopes:
+        access = getattr(bound, "access", None)
+        if getattr(access, "mode", "") != "enforce":
+            continue
+        if include_ceiling and getattr(bound, "bot_access_ceiling", None) is not None:
+            # A ceiled session, admin or not, acts only on jobs it owns.
+            identities.add(_owner_or_blank(getattr(getattr(access, "subject", None), "email", "")))
+            continue
+        identity = dwd_identity_for(access)
+        if identity is not None:  # None means administrator
+            identities.add(_owner_or_blank(identity))
+    return frozenset(identities) if identities else None
+
+
+def _owned_by(job: Any, identities: frozenset) -> bool:
+    owner = str((job or {}).get("owner_email") or "").strip().lower() if isinstance(job, dict) else ""
+    return bool(owner) and all(identity == owner for identity in identities)
+
+
+def caller_may_act_on_job(job: Any) -> bool:
+    """Whether the caller may see, change, run or remove ``job``.
+
+    Always True for the operator, administrators, ungoverned processes and
+    governed people outside ``enforce``. A governed person who is not an
+    administrator (``_governed_caller_identities``) may act on their own
+    jobs only; ownerless jobs and jobs of the system principal are for
+    administrators. The scheduler binds a job's owner for every fire, so a
+    fire's own bookkeeping on its job passes.
+    """
+    identities = _governed_caller_identities()
+    return identities is None or _owned_by(job, identities)
+
+
+def caller_may_act_on_job_id(job_id: Any) -> bool:
+    """``caller_may_act_on_job`` for a job ID in the active store.
+
+    For a governed person the job must exist and be theirs; for everyone
+    else this is True without reading the store.
+    """
+    identities = _governed_caller_identities()
+    if identities is None:
+        return True
+    wanted = str(job_id or "")
+    return any(job.get("id") == wanted and _owned_by(job, identities) for job in load_jobs())
+
+
+def _ensure_owned_by_caller(job: Any, identities: Optional[frozenset]) -> None:
+    if identities is not None and not _owned_by(job, identities):
+        raise CronJobAccessDenied(_FOREIGN_JOB_ERROR)
+
+
+def _check_context_sources(refs: Any, jobs: List[Dict[str, Any]], identities: Optional[frozenset]) -> None:
+    """A governed person may chain only the output of their own jobs."""
+    if identities is None or not refs:
+        return
+    owned = {job.get("id") for job in jobs if _owned_by(job, identities)}
+    for ref in [refs] if isinstance(refs, str) else list(refs):
+        text = str(ref or "").strip()
+        if not text or text.lower() == "self":
+            continue
+        if text not in owned:
+            raise CronJobAccessDenied(_FOREIGN_CONTEXT_SOURCE_ERROR.format(ref=text))
+
+
+# ---------------------------------------------------------------------------
+# A session narrowed by a bot access ceiling never makes a job run
+# ---------------------------------------------------------------------------
+
+
+def bot_ceiling_applies() -> bool:
+    """True when a bot access ceiling narrows the calling session under enforce.
+
+    No fire carries a ceiling: every fire binds the governance of the job's
+    owner (``cron.scheduler._governed_as_job_owner``), which is unrestricted
+    for an administrator and the full grants of anyone else. So a ceiled
+    session (a managed bot turn, or a terminal below one, which carries the
+    ceiling in its environment) may list, pause and remove the jobs it owns
+    and nothing else: it creates no job, changes nothing a job runs with or
+    delivers to, and resumes, triggers, re-arms or claims no job. A
+    governance context that cannot be read counts as ceiled (fail closed).
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
+    except ImportError:
+        return False
+    try:
+        envelopes = policy_contexts(current_governance_context())
+    except Exception:
+        logger.debug("cron: unreadable governance context; treating it as ceiled", exc_info=True)
+        return True
+    return any(
+        getattr(bound, "bot_access_ceiling", None) is not None
+        and getattr(getattr(bound, "access", None), "mode", "") == "enforce"
+        for bound in envelopes
+    )
+
+
+def _ensure_no_bot_ceiling() -> None:
+    if bot_ceiling_applies():
+        raise CronJobAccessDenied(_BOT_CEILING_ERROR)
+
+
+def _update_only_pauses(updates: Dict[str, Any]) -> bool:
+    """Whether ``updates`` only stops the job (what ``pause_job`` writes)."""
+    for key, value in (updates or {}).items():
+        if key in ("paused_at", "paused_reason"):
+            continue
+        if key == "enabled" and value is False:
+            continue
+        if key == "state" and value == "paused":
+            continue
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# What a governed person may give a job: no script, only their own targets
+#
+# The WebUI Tasks panel lets only a cron admin set script or no_agent, and
+# takes a delivery target only from the caller's delivery options (local,
+# origin and the home channel of a known platform). The cronjob tool, the CLI
+# in a governed shell and the API server reach create_job and update_job
+# directly, so the same rules hold here for every caller that
+# ``_governed_caller_identities`` binds to their own jobs.
+# ---------------------------------------------------------------------------
+
+# A script (pre-run or script-only) and a monitor source run in the scheduler
+# outside the tool policy that governs the person's own session.
+_ADMIN_ONLY_JOB_FIELDS = ("script", "no_agent", "monitor_script", "monitor_url")
+
+
+def _same_job_value(stored: Any, value: Any) -> bool:
+    if isinstance(stored, str) and isinstance(value, str):
+        return stored.strip() == value.strip()
+    return stored == value
+
+
+def _ensure_no_admin_only_values(values: Dict[str, Any], stored: Optional[Dict[str, Any]]) -> None:
+    """Refuse a governed person a script, monitor or script-only job.
+
+    Clearing a field is always allowed, and so is saving back the value an
+    administrator already gave the job (``stored``).
+    """
+    refused = []
+    for field in _ADMIN_ONLY_JOB_FIELDS:
+        if field not in values:
+            continue
+        value = values[field]
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            continue
+        if stored is not None and _same_job_value(stored.get(field), value):
+            continue
+        refused.append(field)
+    if refused:
+        raise CronJobAccessDenied(_ADMIN_ONLY_JOB_FIELDS_ERROR.format(fields=", ".join(refused)))
+
+
+def _delivery_elements(deliver: Any) -> List[str]:
+    if deliver is None:
+        return []
+    raw = deliver if isinstance(deliver, (list, tuple)) else str(deliver).split(",")
+    return [str(part).strip() for part in raw if str(part).strip()]
+
+
+def _delivery_target_key(element: str) -> str:
+    platform, _, rest = element.partition(":")
+    return f"{platform.strip().lower()}:{rest.strip()}"
+
+
+def _origin_delivery_targets(origin: Any) -> Set[str]:
+    """The explicit ``platform:chat_id[:thread_id]`` forms of ``origin``."""
+    if not isinstance(origin, dict):
+        return set()
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        return set()
+    targets = {f"{platform}:{chat_id}"}
+    thread_id = str(origin.get("thread_id") or "").strip()
+    if thread_id:
+        targets.add(f"{platform}:{chat_id}:{thread_id}")
+    return targets
+
+
+def _cron_run_delivery_targets() -> Set[str]:
+    """The delivery target of the cron run this call is made from.
+
+    A job created from a cron run stores that run's own target in place of
+    "origin" (``tools.cronjob_tools._resolve_cron_context_deliver``). The
+    scheduler binds it in-process for the run (``run_job``), so only the
+    session variables bound in this context count, never the environment,
+    which a governed shell can set to anything.
+    """
+    try:
+        from gateway.session_context import _UNSET, _VAR_MAP
+    except Exception:
+        return set()
+
+    def _bound(name: str) -> str:
+        var = _VAR_MAP.get(name)
+        value = var.get() if var is not None else _UNSET
+        return "" if value is _UNSET else str(value or "").strip()
+
+    platform = _bound("HERMES_CRON_AUTO_DELIVER_PLATFORM").lower()
+    chat_id = _bound("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+    if not platform or not chat_id:
+        return set()
+    thread_id = _bound("HERMES_CRON_AUTO_DELIVER_THREAD_ID")
+    return {f"{platform}:{chat_id}:{thread_id}" if thread_id else f"{platform}:{chat_id}"}
+
+
+def _ensure_own_delivery_targets(deliver: Any, *, origin: Any, stored: Any = None) -> None:
+    """Refuse a governed person a delivery target that is not their own.
+
+    Allowed: ``local``; ``origin``; the bare name of a known delivery platform
+    (its configured home channel, the same list the WebUI offers); an explicit
+    ``platform:chat_id[:thread_id]`` that is the job's origin or the target of
+    the cron run creating it; and any target the job already has
+    (``stored``). Refused: every other explicit target (a chat, an email
+    address, a Google Chat space), ``all`` (every home channel at once), a
+    Bot Chat delivery (an agent turn outside the person's governance) and
+    unknown names.
+    """
+    from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS
+
+    own = _origin_delivery_targets(origin) | _cron_run_delivery_targets()
+    already = {_delivery_target_key(part) if ":" in part else part.lower() for part in _delivery_elements(stored)}
+    for element in _delivery_elements(deliver):
+        lowered = element.lower()
+        if lowered in ("local", "origin"):
+            continue
+        if ":" not in element:
+            if lowered in _KNOWN_DELIVERY_PLATFORMS or lowered in already:
+                continue
+        elif _delivery_target_key(element) in own or _delivery_target_key(element) in already:
+            continue
+        raise CronJobAccessDenied(_FOREIGN_DELIVERY_TARGET_ERROR.format(target=element))
+
+
+def _ownerless_create_refusal() -> Optional[str]:
+    """Why an ownerless agent job may not be created here, or None.
+
+    The fire gate (``cron.scheduler._ownerless_fire_refusal``) refuses such a
+    job on every fire under ``enforce``, and when the policy cannot be read;
+    creating it would only hide that. Same policy, same rule.
+    """
+    try:
+        import hermes_cli.dashboard_governance.loader  # noqa: F401 (governance installed?)
+    except ImportError:
+        return None
+    try:
+        policy = load_cron_governance_policy()
+    except Exception:
+        logger.warning("cron: governance policy unreadable; refusing an ownerless create", exc_info=True)
+        return _POLICY_UNAVAILABLE_CREATE_REFUSAL
+    if getattr(policy, "mode", "off") != "enforce":
+        return None
+    return _OWNERLESS_CREATE_REFUSAL
+
+
+_SYSTEM_PRINCIPAL_CREATE_SCOPE: ContextVar[bool] = ContextVar(
+    "cron_system_principal_create_scope",
+    default=False,
+)
+
+
+@contextlib.contextmanager
+def system_principal_create_scope():
+    """Give jobs created in this block to ``cron.system_principal``.
+
+    Used by ``hermes cron create``: the operator at the host shell is outside
+    any governed session, so the job would otherwise have no owner and be
+    refused under governance ``enforce``. It never applies to a governed
+    person: an explicit owner, the address of a governed session and the
+    address of a governed shell (``HERMES_DWD_IDENTITY``) all win over the
+    principal, and below any other agent session (``_is_operator_shell``)
+    the job gets no owner, so an agent job is refused under ``enforce``
+    (see ``_resolve_creating_owner``).
+    """
+    token = _SYSTEM_PRINCIPAL_CREATE_SCOPE.set(True)
+    try:
+        yield
+    finally:
+        _SYSTEM_PRINCIPAL_CREATE_SCOPE.reset(token)
+
+
+# Set in the environment of a process that runs inside, or descends from, an
+# agent session instead of the operator's own shell. HERMES_DWD_IDENTITY only
+# covers a governed non-admin under enforce; these cover the rest: the session
+# bridge of tools/environments/local.py (HERMES_SESSION_*, HERMES_UI_SESSION_ID,
+# HERMES_CRON_*), the WebUI turn environment (HERMES_SESSION_PLATFORM=webui,
+# HERMES_SESSION_USER_ID), gateway, cron and kanban workers, and a
+# dashboard-started run, which hands its governance to children in
+# HERMES_DASHBOARD_GOVERNANCE_CONTEXT. HERMES_CRON_JOB_ID marks the environment
+# of a cron job's script.
+_SESSION_MARKER_ENV = (
+    _GOVERNED_SHELL_IDENTITY_ENV,
+    "HERMES_DASHBOARD_GOVERNANCE_CONTEXT",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_CRON_SESSION",
+    "HERMES_CRON_JOB_ID",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_GATEWAY_SESSION",
+    "_HERMES_GATEWAY",
+    "HERMES_GATEWAY",
+    "HERMES_GATEWAY_MODE",
+    "HERMES_KANBAN_TASK",
+)
+_SESSION_MARKER_OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+
+def _session_marker_value(name: str) -> str:
+    """A marker's value in this process: its environment, or a session
+    variable a host bound in-process (``gateway.session_context``)."""
+    values = [os.environ.get(name) or ""]
+    try:
+        from gateway.session_context import _VAR_MAP, get_session_env
+
+        if name in _VAR_MAP:
+            values.append(get_session_env(name, "") or "")
+    except Exception:
+        pass
+    for value in values:
+        text = str(value).strip()
+        if text.lower() not in _SESSION_MARKER_OFF_VALUES:
+            return text
+    return ""
+
+
+def _is_operator_shell() -> bool:
+    """True only for the operator at the host shell.
+
+    ``hermes cron create`` gives new jobs the administrator principal, so it
+    must be sure it is not running inside, or below, an agent session: a
+    WebUI terminal under ``report_only``, a gateway, cron or kanban run, or a
+    dashboard-started run carry no ``HERMES_DWD_IDENTITY`` but are not the
+    operator either. Any session marker (``_SESSION_MARKER_ENV``) or any
+    governance context, bound in-process or handed down in the environment,
+    rules it out, and so does a context that cannot be read.
+
+    This reads the environment, which a person who controls their own shell
+    can change; it keeps the principal away from everyone who does not
+    deliberately strip their session, and the command gate governs what a
+    governed shell may run.
+    """
+    if any(_session_marker_value(name) for name in _SESSION_MARKER_ENV):
+        return False
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+    except ImportError:
+        return True
+    try:
+        return current_governance_context() is None
+    except Exception:
+        return False
+
+
+def _creating_session_is_enforced_admin() -> bool:
+    """True for a governed administrator's session under ``enforce``.
+
+    Only when nothing narrower applies: a principal-owned job runs with the
+    principal's (administrator) rights, so a session held down by a bot
+    ceiling or by a continuation envelope of a non-admin does not qualify.
+    Its job gets no owner, so ``enforce`` refuses to create it, rather than
+    let it run wider than the session that made it. Anything unreadable is
+    False.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import (
+            current_governance_context,
+            policy_contexts,
+        )
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        ctx = current_governance_context()
+        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+            return False
+        for bound in policy_contexts(ctx):
+            if getattr(bound, "bot_access_ceiling", None) is not None:
+                return False
+            if getattr(bound.access, "mode", "") != "enforce":
+                continue
+            if dwd_identity_for(bound.access) is not None:  # None means administrator
+                return False
+        return True
+    except Exception:
+        logger.debug("cron: could not read the creating session's envelopes", exc_info=True)
+        return False
+
+
+def _resolve_creating_owner(owner_email: Optional[str]) -> str:
+    """The owner stamped on a new job.
+
+    A governed person who is not an administrator
+    (``_governed_caller_identities``: their shell, which carries
+    ``HERMES_DWD_IDENTITY``, or an in-process governance context under
+    ``enforce``) always owns what they create: an explicit owner that differs,
+    or two different governed identities, are refused, an unusable address
+    refuses the create, and the system principal is never stamped for them.
+    Otherwise, in order: an explicit ``owner_email``; the configured system
+    principal when the creator is the CLI (``system_principal_create_scope``)
+    run by the operator at the host shell (``_is_operator_shell``: no session
+    marker, no governance context), or, outside the CLI, a governed
+    administrator under ``enforce`` with nothing narrower applied. Anyone
+    else (the CLI below an agent session, an ungoverned gateway sender, a
+    direct library call) gets no owner: ``create_job`` then refuses an agent
+    job under ``enforce`` and creates it ownerless otherwise.
+    """
+    explicit = str(owner_email).strip().lower() if owner_email else ""
+    # A bot ceiling does not make the creator own the new job by their own
+    # (unbounded administrator) address: that would let a ceiled session make
+    # a job that fires wider than itself. Such a create stays ownerless below
+    # (refused under enforce). Acting on existing jobs still honours the
+    # ceiling (include_ceiling defaults to True there).
+    governed = _governed_caller_identities(include_ceiling=False)
+    if governed is not None:
+        if "" in governed:
+            raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR)
+        if len(governed) > 1 or (explicit and explicit not in governed):
+            raise ValueError(_FOREIGN_OWNER_IN_GOVERNED_SESSION_ERROR)
+        return next(iter(governed))
+    if explicit:
+        return explicit
+    if _SYSTEM_PRINCIPAL_CREATE_SCOPE.get():
+        return cron_system_principal() if _is_operator_shell() else ""
+    if _creating_session_is_enforced_admin():
+        return cron_system_principal()
+    return ""
+
+
+def owner_audit_file() -> Path:
+    """The owner change audit log of the active cron store."""
+    return _current_cron_store().cron_dir / OWNER_AUDIT_FILE_NAME
+
+
+def _append_owner_audit(row: Dict[str, Any]) -> None:
+    """Append one audit row and flush it to disk before returning."""
+    path = owner_audit_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _secure_file(path)
+
+
 def _creating_owner_email() -> str:
     """The person whose session is creating this job.
 
@@ -2232,10 +3095,7 @@ def _creating_owner_email() -> str:
         # A governed session whose address we cannot read would otherwise
         # produce an ownerless job, which is the very thing this prevents:
         # such a job runs unbound. Refuse the create instead.
-        raise ValueError(
-            "Cannot schedule a job for this session: no verified account to run it as. "
-            "Ask your admin."
-        )
+        raise ValueError(_NO_VERIFIED_ACCOUNT_ERROR)
     return owner
 
 
@@ -2394,6 +3254,10 @@ def create_job(
         context_from = [str(j).strip() for j in context_from if str(j).strip()] or None
     else:
         context_from = None
+    # A governed person chains only the output of their own jobs.
+    governed = _governed_caller_identities()
+    if governed is not None and context_from:
+        _check_context_sources(context_from, load_jobs(), governed)
 
     prompt_text = _coerce_job_text(prompt).strip()
 
@@ -2416,6 +3280,31 @@ def create_job(
         base_url=normalized_base_url,
         no_agent=normalized_no_agent,
     )
+
+    # The person this job runs as. Every fire binds their governance context,
+    # so a job can never do more than the person who made it. Immutable after
+    # creation (see _IMMUTABLE_JOB_FIELDS). Under enforce an agent job without
+    # an owner would be refused on every fire, so it is not created at all.
+    job_owner = _resolve_creating_owner(owner_email)
+    # No fire carries a bot ceiling, so a ceiled session creates no job.
+    _ensure_no_bot_ceiling()
+    # A governed person gets no script or monitor and delivers only to their
+    # own places (the rules the WebUI Tasks panel applies to them).
+    if governed is not None:
+        _ensure_no_admin_only_values(
+            {
+                "script": normalized_script,
+                "no_agent": normalized_no_agent,
+                "monitor_script": normalized_monitor_script,
+                "monitor_url": normalized_monitor_url,
+            },
+            None,
+        )
+        _ensure_own_delivery_targets(deliver, origin=origin)
+    if not job_owner and not normalized_no_agent:
+        refusal = _ownerless_create_refusal()
+        if refusal:
+            raise ValueError(refusal)
 
     next_run_at = compute_next_run(parsed_schedule)
     if parsed_schedule.get("kind") == "once" and next_run_at is None:
@@ -2475,9 +3364,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
-        # The person this job runs as. Every fire binds their governance
-        # context, so a job can never do more than the person who made it.
-        "owner_email": (str(owner_email).strip().lower() if owner_email else _creating_owner_email()),
+        # The person this job runs as (resolved above).
+        "owner_email": job_owner,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -2526,10 +3414,16 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     - Otherwise, case-insensitive name match.
     - If a name matches more than one job, raises AmbiguousJobReference so the
       caller can surface the matching IDs rather than silently picking one.
+    - A governed person who is not an administrator finds only their own
+      jobs, by ID or by name (``caller_may_act_on_job``): someone else's job
+      is "not found" and never makes a name ambiguous.
     """
     if not ref:
         return None
     jobs = load_jobs()
+    governed = _governed_caller_identities()
+    if governed is not None:
+        jobs = [job for job in jobs if _owned_by(job, governed)]
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -2545,8 +3439,16 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
-    """List all jobs, optionally including disabled ones."""
-    jobs = [_normalize_job_record(j) for j in load_jobs()]
+    """List all jobs, optionally including disabled ones.
+
+    A governed person who is not an administrator sees only their own jobs
+    (``caller_may_act_on_job``).
+    """
+    stored = load_jobs()
+    governed = _governed_caller_identities()
+    if governed is not None:
+        stored = [job for job in stored if _owned_by(job, governed)]
+    jobs = [_normalize_job_record(j) for j in stored]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     try:
@@ -2562,20 +3464,30 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
-    # Block mutation of immutable fields. ``id`` in particular is a filesystem
-    # path component under OUTPUT_DIR — letting an update change it leaks
-    # path-escape values into output writes/deletes.
+    # Block mutation of immutable fields (see _IMMUTABLE_JOB_FIELDS). ``id``
+    # is a filesystem path component under OUTPUT_DIR; the identity fields
+    # decide whose governance a fire runs under. The whole update is refused,
+    # so a mixed payload never half-applies.
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+    # Only the owner or an administrator changes a job (caller_may_act_on_job).
+    governed = _governed_caller_identities()
+    # A session under a bot ceiling may only stop a job (bot_ceiling_applies).
+    ceiled = bot_ceiling_applies()
 
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            _ensure_owned_by_caller(job, governed)
+            if ceiled and not _update_only_pauses(updates):
+                raise CronJobAccessDenied(_BOT_CEILING_ERROR)
+            if "context_from" in (updates or {}):
+                _check_context_sources(updates.get("context_from"), jobs, governed)
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -2593,6 +3505,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            # A governed person gets no script or monitor and delivers only
+            # to their own places (see create_job); what the job already has
+            # may stay.
+            if governed is not None:
+                _ensure_no_admin_only_values(updates, job)
+                if "deliver" in updates:
+                    _ensure_own_delivery_targets(
+                        updates["deliver"], origin=job.get("origin"), stored=job.get("deliver")
+                    )
 
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or
@@ -2746,11 +3668,119 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def reassign_job_owner(
+    job_ref: str,
+    new_owner: Any,
+    *,
+    actor: str,
+    reason: str = "",
+    source: str = "cli",
+    expected_owner: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Give a job a new owner: the only way to change ``owner_email``.
+
+    ``update_job`` refuses the identity fields, so this admin path is the one
+    door. It is refused inside a governed, non-admin session
+    (``ensure_owner_admin_caller``), takes a valid address only (a job is
+    re-owned, never un-owned), and appends an audit row to
+    ``owner_audit_file()``. When the audit row cannot be written the change is
+    rolled back, so no owner change exists without its record.
+
+    ``expected_owner`` makes the change conditional on the current owner (use
+    "" for "still ownerless"), so a batch migration never overwrites an owner
+    someone set in the meantime; a mismatch raises ValueError and changes
+    nothing.
+
+    Returns ``{"job", "previous_owner", "new_owner", "changed"}``, or None when
+    no job matches ``job_ref`` (an ID, or a unique name).
+    """
+    ensure_owner_admin_caller()
+    owner = normalize_owner_identity(new_owner)
+    actor_text = str(actor or "").strip()
+    if not actor_text:
+        raise ValueError("An actor is required: every owner change is audited.")
+    reason_text = str(reason or "").strip()[:500]
+    source_text = str(source or "").strip()[:64] or "unknown"
+    wanted = None if expected_owner is None else str(expected_owner).strip().lower()
+
+    job = resolve_job_ref(str(job_ref or "").strip())
+    if not job:
+        return None
+    job_id = job["id"]
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, stored in enumerate(jobs):
+            if stored.get("id") != job_id:
+                continue
+            previous = str(stored.get("owner_email") or "").strip().lower()
+            if wanted is not None and previous != wanted:
+                raise ValueError(
+                    f"The owner of cron job {job_id} is {previous or 'unset'}, "
+                    f"not {wanted or 'unset'}; nothing was changed."
+                )
+            if previous == owner:
+                return {
+                    "job": _normalize_job_record(stored),
+                    "previous_owner": previous,
+                    "new_owner": owner,
+                    "changed": False,
+                }
+            updated = dict(stored)
+            updated["owner_email"] = owner
+            jobs[i] = updated
+            save_jobs(jobs)
+            row = {
+                "ts": _hermes_now().isoformat(),
+                "event": "cron_owner_reassigned",
+                "job_id": job_id,
+                "job_name": str(stored.get("name") or ""),
+                "previous_owner": previous,
+                "new_owner": owner,
+                "actor": actor_text,
+                "reason": reason_text,
+                "source": source_text,
+                "host": _audit_host(),
+                "pid": os.getpid(),
+            }
+            try:
+                _append_owner_audit(row)
+            except BaseException:
+                jobs[i] = stored
+                save_jobs(jobs)
+                raise
+            logger.warning(
+                "cron: owner of job %s reassigned from %r to %r by %s (%s)",
+                job_id,
+                previous or "(none)",
+                owner,
+                actor_text,
+                source_text,
+            )
+            return {
+                "job": _normalize_job_record(updated),
+                "previous_owner": previous,
+                "new_owner": owner,
+                "changed": True,
+            }
+    return None
+
+
+def _audit_host() -> str:
+    try:
+        import socket
+
+        return socket.gethostname()
+    except Exception:
+        return ""
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _ensure_owned_by_caller(job, _governed_caller_identities())
     return update_job(
         job["id"],
         {
@@ -2767,6 +3797,8 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _ensure_owned_by_caller(job, _governed_caller_identities())
+    _ensure_no_bot_ceiling()
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -2802,6 +3834,8 @@ def trigger_job(
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _ensure_owned_by_caller(job, _governed_caller_identities())
+    _ensure_no_bot_ceiling()
     if is_terminal_job(job):
         state = job.get("state")
         name = job.get("name", job_id)
@@ -2860,11 +3894,16 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
         )
 
+    governed = _governed_caller_identities()
+    ceiled = bot_ceiling_applies()
     with _jobs_lock():
         jobs = load_jobs()
         for index, job in enumerate(jobs):
             if job.get("id") != job_ref["id"]:
                 continue
+            _ensure_owned_by_caller(job, governed)
+            if ceiled:
+                raise CronJobAccessDenied(_BOT_CEILING_ERROR)
             now = _hermes_now()
             if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
@@ -2899,8 +3938,12 @@ def remove_job(job_id: str) -> bool:
     if not job:
         return False
     canonical_id = job["id"]
+    governed = _governed_caller_identities()
     with _jobs_lock():
         jobs = load_jobs()
+        for stored in jobs:
+            if stored.get("id") == canonical_id:
+                _ensure_owned_by_caller(stored, governed)
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
@@ -2941,6 +3984,13 @@ def mark_job_run(
     *,
     expected_fire_owner: Optional[str] = None,
 ) -> bool:
+    # A session under a bot ceiling runs no job (bot_ceiling_applies), so it
+    # has no run to record. The cronjob tool records a refused fire claim as
+    # a failed run; that must not use up a repeat or complete a one-shot.
+    # Every real fire records under its owner's context or none.
+    if bot_ceiling_applies():
+        logger.info("cron: not recording a run of job %s from a session under a bot ceiling", job_id)
+        return False
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -2952,6 +4002,88 @@ def mark_job_run(
             status=status,
             expected_fire_owner=expected_fire_owner,
         )
+
+
+def mark_job_refused(
+    job_id: str,
+    reason: str,
+    *,
+    consume_occurrence: bool = True,
+    expected_fire_owner: Optional[str] = None,
+) -> bool:
+    """Record a fire that governance refused before anything ran.
+
+    A refusal is not a run. It is recorded like a failed one (``last_status``
+    ``blocked_config``, ``reason`` in ``last_error``, one more
+    ``failure_streak``), but it never uses up a repeat limit and never
+    completes a one-shot, so the job still has every run it had once an
+    administrator has given it an owner.
+
+    ``consume_occurrence=True`` is for a scheduled fire (the ticker, a
+    provider fire, a claimed manual run through ``run_one_job``): its claims
+    are released and the job moves on. A recurring job goes to its next
+    occurrence. A one-shot is paused with ``reason`` and keeps no
+    ``last_run_at``: left due it would be refused on every tick until it aged
+    out of its grace window and was removed. After an owner is assigned,
+    re-arm it with ``hermes cron resume <id> --run-now`` (``rearm_oneshot``),
+    or with a plain ``hermes cron resume <id>`` while its time is still
+    inside the grace window. ``hermes cron run`` does not run it: a manual
+    run refuses a paused job.
+
+    ``consume_occurrence=False`` is for a run someone asked for outside the
+    schedule (``cron.scheduler.run_job_governed``): only the outcome is
+    recorded; schedule, state, repeat count and claims are left alone.
+
+    ``expected_fire_owner`` fences the write to the fire claim's owner, like
+    ``mark_job_run``. Returns True when the job was found and updated.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                schedule = job.get("schedule")
+                kind = schedule.get("kind") if isinstance(schedule, dict) else None
+                if consume_occurrence and kind != "once":
+                    # The lock is re-entrant: one critical section throughout.
+                    return _mark_job_run_locked(
+                        job_id,
+                        False,
+                        reason,
+                        status="blocked_config",
+                        expected_fire_owner=expected_fire_owner,
+                        counts_toward_repeat=False,
+                    )
+                if expected_fire_owner is not None:
+                    claim = job.get("fire_claim")
+                    if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
+                        logger.warning(
+                            "mark_job_refused: job_id %s fire claim owner changed; "
+                            "discarding stale refusal",
+                            job_id,
+                        )
+                        return False
+                job["last_status"] = "blocked_config"
+                job["last_error"] = reason
+                job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+                if consume_occurrence:
+                    now = _hermes_now().isoformat()
+                    job.pop("manual_run_at", None)
+                    job.pop("manual_run_prompt", None)
+                    job["fire_claim"] = None
+                    if job.get("run_claim") is not None:
+                        job["run_claim"] = None
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now
+                    job["paused_reason"] = reason
+                save_jobs(jobs)
+                return True
+        logger.warning("mark_job_refused: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
@@ -3045,6 +4177,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    counts_toward_repeat: bool = True,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -3060,6 +4193,10 @@ def _mark_job_run_locked(
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
+
+    ``counts_toward_repeat=False`` records the outcome without using up a
+    repeat limit. Only ``mark_job_refused`` passes it, and only for a
+    recurring job (a refused one-shot never comes here: it would end).
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -3130,7 +4267,7 @@ def _mark_job_run_locked(
                         and times > 0
                         and completed > 0
                     )
-                    if not preclaimed_oneshot:
+                    if counts_toward_repeat and not preclaimed_oneshot:
                         completed += 1
                         repeat["completed"] = completed
 
@@ -3529,12 +4666,23 @@ def _claim_job_for_fire_locked(
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
+
+    A governed person who is not an administrator claims (and so runs) only
+    their own jobs, and a session under a bot ceiling claims none
+    (``bot_ceiling_applies``): anything else raises ``CronJobAccessDenied``
+    before the record is touched. The ticker and the providers claim outside
+    any governed context.
     """
+    governed = _governed_caller_identities()
+    ceiled = bot_ceiling_applies()
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] != job_id:
                 continue
+            _ensure_owned_by_caller(job, governed)
+            if ceiled:
+                raise CronJobAccessDenied(_BOT_CEILING_ERROR)
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 return False
             # enabled + pause markers must both clear — a half-paused record
@@ -3827,6 +4975,18 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         needs_save = True
         jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
 
+    # A governed person who is not an administrator dispatches only their own
+    # jobs. The ticker runs outside any governed context, so this is None then
+    # and every job is scanned. It matters when a governed caller reaches this
+    # scan directly (``hermes cron tick`` in a governed shell, or a governed
+    # in-process context): another person's due job must never be fast-forwarded,
+    # run_claim-stamped or returned here, because the fire claim would then be
+    # refused by ``_claim_job_for_fire_locked`` and the occurrence lost. It is
+    # simply not due for this caller. A session under a bot ceiling claims no
+    # job at all (bot_ceiling_applies), so nothing is due for it.
+    governed = _governed_caller_identities()
+    ceiled = bot_ceiling_applies()
+
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
         # unexpected job record must never abort the whole scan. The id /
@@ -3835,6 +4995,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # job this tick" so healthy siblings still run and their recovered
         # state still reaches save_jobs() below.
         try:
+            if ceiled or (governed is not None and not _owned_by(job, governed)):
+                continue
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 continue
             if not job.get("enabled", True):

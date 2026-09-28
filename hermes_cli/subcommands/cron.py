@@ -1,6 +1,6 @@
 """``hermes cron`` subcommand parser.
 
-Extracted verbatim from ``hermes_cli/main.py:main()`` — same arguments, same
+Extracted verbatim from ``hermes_cli/main.py:main()``: same arguments, same
 ``func=cmd_cron`` dispatch. The handler is injected so this module does not
 import ``main`` (cycle avoidance).
 """
@@ -10,6 +10,125 @@ from __future__ import annotations
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
+
+
+def _cli_actor() -> str:
+    """Who is running this command, for the owner audit log."""
+    try:
+        import getpass
+
+        user = getpass.getuser()
+    except Exception:
+        user = ""
+    return f"os:{user or 'unknown'}"
+
+
+def _stamping_system_principal(cmd_cron: Callable) -> Callable:
+    """Wrap the create handler so the new job gets ``cron.system_principal``.
+
+    ``hermes cron create`` at the host shell is the operator, outside any
+    governed session; without an owner the job would be refused under
+    governance ``enforce``. Run from a governed person's shell (their
+    terminal carries ``HERMES_DWD_IDENTITY``) the job is that person's, or
+    the create is refused; it never gets the principal (see
+    ``cron.jobs._resolve_creating_owner``).
+    """
+
+    def _create_as_system_principal(args):
+        from cron.jobs import system_principal_create_scope
+
+        with system_principal_create_scope():
+            return cmd_cron(args)
+
+    _create_as_system_principal.__wrapped__ = cmd_cron
+    return _create_as_system_principal
+
+
+def _owner_checked_notepad(cmd_cron: Callable) -> Callable:
+    """Wrap ``hermes cron notepad`` so a governed person reaches only their own jobs.
+
+    The notepad is injected into the job's prompt on every run, so writing
+    it is editing the job, and reading it reads the job's state. In a
+    governed person's shell (``HERMES_DWD_IDENTITY``) or under their
+    governance context the job must be theirs
+    (``cron.jobs.caller_may_act_on_job_id``); below a session under a bot
+    ceiling the notepad is read-only, because no fire carries the ceiling
+    (``cron.jobs.bot_ceiling_applies``); anywhere else the command runs as
+    before.
+    """
+
+    def _notepad_for_the_owner(args):
+        from cron.jobs import _BOT_CEILING_ERROR, bot_ceiling_applies, caller_may_act_on_job_id
+        from hermes_cli.colors import Colors, color
+
+        job_id = str(getattr(args, "job_id", "") or "")
+        if job_id and not caller_may_act_on_job_id(job_id):
+            print(color(f"Job not found: {job_id}", Colors.RED))
+            return 1
+        if getattr(args, "notepad_action", None) in ("set", "delete") and bot_ceiling_applies():
+            print(color(f"Notepad error: {_BOT_CEILING_ERROR}", Colors.RED))
+            return 1
+        return cmd_cron(args)
+
+    _notepad_for_the_owner.__wrapped__ = cmd_cron
+    return _notepad_for_the_owner
+
+
+def cmd_cron_reassign_owner(args) -> int:
+    """``hermes cron reassign-owner``: the audited admin path for owner changes.
+
+    Exit codes: 0 done (or already owned by that address), 1 refused or
+    failed, 2 usage error.
+    """
+    from cron.jobs import (
+        AmbiguousJobReference,
+        cron_system_principal,
+        owner_audit_file,
+        reassign_job_owner,
+    )
+    from hermes_cli.colors import Colors, color
+
+    owner = str(getattr(args, "owner", None) or "").strip()
+    use_principal = bool(getattr(args, "system_principal", False))
+    if bool(owner) == use_principal:
+        print(color("Give exactly one new owner: an email address or --system-principal.", Colors.RED))
+        return 2
+    if use_principal:
+        owner = cron_system_principal()
+        if not owner:
+            print(color(
+                "cron.system_principal is not set in config.yaml (or is not a valid address).",
+                Colors.RED,
+            ))
+            return 1
+    try:
+        result = reassign_job_owner(
+            args.job_id,
+            owner,
+            actor=_cli_actor(),
+            reason=str(getattr(args, "reason", "") or ""),
+            source="cli",
+        )
+    except AmbiguousJobReference as exc:
+        print(color(str(exc), Colors.RED))
+        for match in exc.matches:
+            print(f"  {match['id']}  (name: {match.get('name')!r})")
+        return 1
+    except (PermissionError, ValueError) as exc:
+        print(color(f"Failed to reassign owner: {exc}", Colors.RED))
+        return 1
+    if result is None:
+        print(color(f"Job not found: {args.job_id}", Colors.RED))
+        return 1
+    job = result["job"]
+    label = f"{job.get('name') or job['id']} ({job['id']})"
+    if not result["changed"]:
+        print(f"Owner unchanged: {label} already belongs to {result['new_owner']}")
+        return 0
+    print(color(f"Reassigned job: {label}", Colors.GREEN))
+    print(f"  Owner: {result['previous_owner'] or '(none)'} -> {result['new_owner']}")
+    print(f"  Audit: {owner_audit_file()}")
+    return 0
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
@@ -27,6 +146,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create = cron_subparsers.add_parser(
         "create", aliases=["add"], help="Create a scheduled job"
     )
+    # Jobs made here get cron.system_principal as owner when no governed
+    # session owns them (subparser defaults win over the cron parser's func).
+    cron_create.set_defaults(func=_stamping_system_principal(cmd_cron))
     cron_create.add_argument(
         "schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'"
     )
@@ -65,7 +187,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         action="store_true",
         default=False,
         help=(
-            "Skip the LLM entirely — run --script on schedule and deliver "
+            "Skip the LLM entirely: run --script on schedule and deliver "
             "its stdout directly. Empty stdout = silent. Classic watchdog "
             "pattern (memory alerts, disk alerts, CI pings)."
         ),
@@ -284,7 +406,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
-    # cron incidents — durable failure incidents (list/ack)
+    # cron incidents: durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents"
     )
@@ -304,7 +426,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "incident_id", nargs="?", help="Incident ID to acknowledge (ack)"
     )
 
-    # cron notepad — per-job durable KV scratchpad (injected into the job
+    # cron notepad: per-job durable KV scratchpad (injected into the job
     # prompt each run; the running agent writes it via this CLI).
     cron_notepad = cron_subparsers.add_parser(
         "notepad",
@@ -320,6 +442,36 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_notepad.add_argument("key", nargs="?", help="Notepad key (get/set/delete)")
     cron_notepad.add_argument("value", nargs="?", help="Value to store (set)")
+    cron_notepad.set_defaults(func=_owner_checked_notepad(cmd_cron))
+
+    # cron reassign-owner: the only way to change who a job runs as. Editing a
+    # job cannot touch its owner (cron.jobs refuses the identity fields), so
+    # this admin path is dispatched directly, not through ``cmd_cron``.
+    cron_reassign = cron_subparsers.add_parser(
+        "reassign-owner",
+        help="Give a scheduled job a new owner (administrators only; audited)",
+        description=(
+            "Change the person a scheduled job runs as. The owner of a job "
+            "cannot be changed by editing it; this command is the only way. "
+            "It is refused inside a governed session, and every change is "
+            "appended to cron/owner-audit.jsonl."
+        ),
+    )
+    cron_reassign.add_argument("job_id", help="Job ID or name")
+    cron_reassign.add_argument(
+        "owner", nargs="?", help="Email address of the new owner"
+    )
+    cron_reassign.add_argument(
+        "--system-principal",
+        dest="system_principal",
+        action="store_true",
+        default=False,
+        help="Give the job to cron.system_principal from config.yaml",
+    )
+    cron_reassign.add_argument(
+        "--reason", default="", help="Why the owner changes (kept in the audit log)"
+    )
+    cron_reassign.set_defaults(func=cmd_cron_reassign_owner)
 
     # cron doctor
     cron_subparsers.add_parser("doctor", help="Check scheduled jobs for common health issues")
