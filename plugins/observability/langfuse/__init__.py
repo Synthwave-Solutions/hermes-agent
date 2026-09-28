@@ -112,7 +112,7 @@ def _failsafe(label: str):
 
 
 _CAPTURE_MODES = ("metadata", "sanitized", "full")
-_DEFAULT_CAPTURE_MODE = "sanitized"
+_DEFAULT_CAPTURE_MODE = "metadata"
 _warned_invalid_capture = False
 
 
@@ -142,6 +142,55 @@ def _redact_secrets(value: str) -> str:
         return redact_sensitive_text(value, force=True)
     except Exception:
         return value
+
+
+_PD_EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_PD_IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9]{4}[ ]?){2,7}[A-Z0-9]{1,4}\b")
+_PD_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+_PD_BSN_RE = re.compile(r"(?<![\d.])(?:\d{9}|\d{4}\.\d{2}\.\d{3})(?![\d.])")
+_PD_PHONE_RE = re.compile(
+    r"(?<![\w+])(?:(?:\+|00)\d{1,3}[ -]?(?:\(0\)[ -]?)?\d(?:[ -]?\d){6,12}|0\d(?:[ -]?\d){8})(?![\w])"
+)
+
+
+def _luhn_valid(digits: str) -> bool:
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def _bsn_valid(digits: str) -> bool:
+    """The Dutch citizen service number's eleven test."""
+    if len(digits) != 9 or digits == "000000000":
+        return False
+    weights = (9, 8, 7, 6, 5, 4, 3, 2, -1)
+    return sum(int(d) * w for d, w in zip(digits, weights)) % 11 == 0
+
+
+def _redact_personal_data(value: str) -> str:
+    """Mask e-mail addresses, IBANs, card numbers, BSNs and phone numbers."""
+    if not value:
+        return value
+    value = _PD_EMAIL_RE.sub("[email]", value)
+    value = _PD_IBAN_RE.sub("[iban]", value)
+
+    def _card(match: "re.Match[str]") -> str:
+        digits = re.sub(r"\D", "", match.group(0))
+        return "[card]" if 13 <= len(digits) <= 19 and _luhn_valid(digits) else match.group(0)
+
+    def _bsn(match: "re.Match[str]") -> str:
+        return "[bsn]" if _bsn_valid(match.group(0).replace(".", "")) else match.group(0)
+
+    value = _PD_CARD_RE.sub(_card, value)
+    value = _PD_BSN_RE.sub(_bsn, value)
+    value = _PD_PHONE_RE.sub("[phone]", value)
+    return value
 
 
 # (types, shape builder) for _describe_content; first match wins (bool handled before).
@@ -322,7 +371,7 @@ def _truncate_text(value: str, max_chars: int) -> Any:
         return {"type": "data_uri", "media_type": media_type or None, "omitted": True, "length": len(value)}
     # Redact BEFORE truncating so a secret straddling the cut cannot leak.
     if _capture_mode() == "sanitized":
-        value = _redact_secrets(value)
+        value = _redact_personal_data(_redact_secrets(value))
     over = len(value) - max_chars
     return value if over <= 0 else value[:max_chars] + f"... [truncated {over} chars]"
 
@@ -562,6 +611,19 @@ def _usage_and_cost(response: Any, *, provider: str, model: str, base_url: str, 
         return {}, {}
 
 
+def _trace_identity() -> Dict[str, Any]:
+    """User, profile, organisation, module and installation for every trace."""
+    try:
+        from agent import model_gateway
+
+        return model_gateway.trace_identity(
+            environment=_env("HERMES_LANGFUSE_ENV") or _env("LANGFUSE_ENV"),
+        )
+    except Exception as exc:
+        _debug(f"trace identity unavailable: {exc}")
+        return {"user_id": None, "tags": [], "metadata": {}}
+
+
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
                       turn_id: str = "", api_request_id: str = "") -> TraceState:
@@ -569,7 +631,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     last_user = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"), None) \
         if isinstance(messages, list) else None
     trace_input = None if last_user is None else {"role": "user", "content": _capture_content(last_user.get("content"))}
+    identity = _trace_identity()
+    identity_metadata = {str(k): str(v) for k, v in identity.get("metadata", {}).items()}
+    trace_tags = ["hermes", "langfuse", *identity.get("tags", [])]
+    trace_user = identity.get("user_id")
     metadata = {
+        **identity_metadata,
         "source": "hermes", "task_id": task_id, "turn_id": turn_id, "api_request_id": api_request_id,
         "platform": platform, "provider": provider, "model": model, "api_mode": api_mode,
         "capture_mode": _capture_mode(),
@@ -586,7 +653,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     if propagate_attributes is not None:
         try:
             with propagate_attributes(session_id=session_id or task_key, trace_name="Hermes turn",
-                                      tags=["hermes", "langfuse"]):
+                                      tags=trace_tags, user_id=trace_user, metadata=identity_metadata):
                 root_ctx, root_span = open_root()
         except Exception:
             root_ctx = None
@@ -594,7 +661,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         root_ctx, root_span = open_root()
 
     with _failsafe("update_trace(input)"):  # SDK v3 uses update_trace()
-        root_span.update_trace(input=trace_input)
+        root_span.update_trace(input=trace_input, user_id=trace_user, tags=trace_tags, metadata=identity_metadata)
 
     _debug(f"started trace {trace_id} for {task_key}")
     return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
