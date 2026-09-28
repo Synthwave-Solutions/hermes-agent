@@ -156,6 +156,9 @@ def get_tool_gateway_scheme() -> str:
 
 def build_vendor_gateway_url(vendor: str) -> str:
     """Return the gateway origin for a specific vendor."""
+    if _refuse_under_model_gateway(vendor):
+        from agent.model_gateway import ModelGatewayRefused
+        raise ModelGatewayRefused("tool_gateway", f"nous:{vendor}")
     if explicit_vendor_url := os.getenv(f"{vendor.upper().replace('-', '_')}_GATEWAY_URL", "").strip().rstrip("/"):
         return explicit_vendor_url
     shared_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/") or _DEFAULT_TOOL_GATEWAY_DOMAIN
@@ -174,6 +177,8 @@ def resolve_managed_tool_gateway(
     vendor: str, gateway_builder: Optional[Callable[[str], str]] = None,
     token_reader: Optional[Callable[[], Optional[str]]] = None) -> Optional[ManagedToolGatewayConfig]:
     """Resolve shared managed-tool gateway config for a vendor (entitled accounts only)."""
+    if _refuse_under_model_gateway(vendor):
+        return None
     if not managed_nous_tools_enabled():
         return None
     return _vendor_gateway(vendor, gateway_builder, token_reader)
@@ -194,3 +199,19 @@ def is_managed_tool_gateway_ready(
     :func:`peek_nous_access_token` (no OAuth refresh); callers about to make a real request use
     :func:`resolve_managed_tool_gateway` instead."""
     return resolve_managed_tool_gateway(vendor, gateway_builder=gateway_builder, token_reader=token_reader or peek_nous_access_token) is not None
+
+def _refuse_under_model_gateway(vendor: str) -> bool:
+    """True when ``model_gateway.enforce`` refuses the Nous gateway for ``vendor``.
+
+    The Nous Tool Gateway's hosts are on the provider host list whatever
+    vendor they front, so under enforcement every vendor is refused unless
+    ``model_gateway.tool_exceptions`` names it (HQ only, D58).
+    """
+    try:
+        from agent import model_gateway
+
+        return not model_gateway.tool_gateway_allowed(vendor)
+    except Exception:
+        logger.debug("model gateway check failed for vendor %s", vendor, exc_info=True)
+        return True
+

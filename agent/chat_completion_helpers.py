@@ -1626,6 +1626,45 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     )
 
 
+def _agent_request_base_url(agent) -> str:
+    if getattr(agent, "api_mode", "") == "anthropic_messages":
+        return str(getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", "") or "")
+    return str(getattr(agent, "base_url", "") or "")
+
+def _check_model_gateway_route(agent) -> None:
+    """Refuse a main-model request that bypasses the model gateway (R2).
+
+    Under ``model_gateway.enforce`` every completion path (chat, Responses,
+    Messages) must target the gateway; Bedrock's native Converse API never
+    does. MoA's facade is exempt because each of its slots is an auxiliary
+    call that resolves to the gateway itself.
+    """
+    from agent import model_gateway
+
+    if not model_gateway.enforced():
+        return
+    if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
+        return
+    if getattr(agent, "api_mode", "") == "bedrock_converse" or not model_gateway.is_gateway_url(
+        _agent_request_base_url(agent)
+    ):
+        raise model_gateway.ModelGatewayRefused(
+            "model",
+            getattr(agent, "provider", "") or "unknown",
+            "the agent's endpoint is not the model gateway",
+        )
+
+def _apply_model_gateway_identity(agent, kwargs: dict) -> dict:
+    """The ``user`` field and session header on every gateway completion."""
+    from agent import model_gateway
+
+    return model_gateway.apply_request_identity(
+        kwargs,
+        base_url=_agent_request_base_url(agent),
+        api_mode=str(getattr(agent, "api_mode", "") or "chat_completions"),
+        session_id=getattr(agent, "session_id", None),
+    )
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode.
 
@@ -1636,6 +1675,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """
     from agent.opencode_affinity import merge_session_affinity_headers
 
+    _check_model_gateway_route(agent)
     kwargs = merge_session_affinity_headers(
         _build_api_kwargs_for_mode(agent, api_messages, tools_for_api),
         getattr(agent, "provider", None),
@@ -1650,7 +1690,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         apply_model_tiering(agent, kwargs, api_messages)
     except Exception:
         logger.debug("model tiering unavailable", exc_info=True)
-    return kwargs
+    return _apply_model_gateway_identity(agent, kwargs)
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -2214,6 +2254,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
                 continue
+            from agent import model_gateway as _model_gateway
+            if _model_gateway.enforced() and fb_provider != "moa":
+                fb_provider = "custom"
+                fb_api_mode = "chat_completions"
+                fb_api_mode_explicit = True
             if fb_provider == "moa":
                 # A MoA entry means the preset itself, exactly like ``provider: moa`` in config or
                 # ``/model <preset> --provider moa``. The chokepoint's client is the preset's

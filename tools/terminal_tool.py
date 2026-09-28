@@ -1667,3 +1667,5 @@ registry.register(
     emoji="💻",
     max_result_size_chars=100_000,
 )
+
+from tools.terminal_tool_backends import _model_gateway_child_env

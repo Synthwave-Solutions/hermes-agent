@@ -249,6 +249,9 @@ def _get_provider(stt_config: dict) -> str:
     fallback); otherwise auto-detect local > groq > openai > mistral > xai > elevenlabs > deepinfra."""
     if not is_stt_enabled(stt_config):
         return "none"
+    from agent import model_gateway
+    if model_gateway.enforced():
+        return _gateway_stt_provider(stt_config)
     explicit = "provider" in stt_config
     provider = stt_config.get("provider", DEFAULT_PROVIDER)
     # The managed "Nous Subscription" selection is the OpenAI backend routed via the managed gateway.
@@ -435,6 +438,9 @@ def _transcribe_prepared_audio(
     if not is_stt_enabled(stt_config):
         return _error_result("STT is disabled in config.yaml (stt.enabled: false).")
     provider = _get_provider(stt_config)
+    refusal = _stt_model_gateway_refusal(provider, stt_config)
+    if refusal is not None:
+        return refusal
     with ExitStack() as cleanup:
         if not _is_local_stt_provider(provider, stt_config):
             error = _validate_audio_file_size(Path(file_path))
@@ -571,3 +577,74 @@ def transcribe_audio_local_fallback(file_path: str, model: Optional[str] = None)
     if _has_local_command():
         return _transcribe_local_command(file_path, _normalize_local_model(local_model))
     return _error_result("No installed local STT backend is available.", provider="local")
+
+def _gateway_stt_provider(stt_config: dict) -> str:
+    """STT provider selection under ``model_gateway.enforce`` (R2). Never raises.
+
+    Local transcription first; a never-configured section then uses
+    ``openai`` on the gateway's audio route. A configured provider that
+    bypasses the gateway (Groq, Mistral, xAI, ElevenLabs, DeepInfra, a
+    plugin, ``nous``) resolves to ``none`` unless
+    ``model_gateway.tool_exceptions`` names it; ``transcribe_audio`` turns
+    that into a structured refusal.
+    """
+    from agent import model_gateway
+    from tools.tool_backend_helpers import read_selection
+
+    provider = str(stt_config.get("provider", DEFAULT_PROVIDER) or "").strip().lower()
+    try:
+        explicit = read_selection("stt") is not None
+    except ValueError:
+        logger.warning("STT provider 'nous' refused under model_gateway.enforce")
+        return "none"
+    if provider in ("local", "local_command") or not explicit:
+        if _HAS_FASTER_WHISPER:
+            return "local"
+        if _has_local_command():
+            return "local_command"
+        if explicit:
+            return "none"
+        provider = "openai"
+    if provider == "nous" and model_gateway.tool_gateway_allowed("openai-audio"):
+        provider = "openai"
+    if provider == "openai":
+        if not _HAS_OPENAI:
+            return "none"
+        try:
+            _resolve_openai_audio_client_config()
+            return "openai"
+        except ValueError as exc:
+            if explicit:
+                logger.warning("STT provider 'openai' unavailable under model_gateway.enforce: %s", exc)
+            return "none"
+    if model_gateway.tool_backend_allowed("stt", provider):
+        return provider
+    logger.warning("STT provider %r refused under model_gateway.enforce", provider)
+    return "none"
+
+def _stt_model_gateway_refusal(provider: str, stt_config: dict) -> Optional[Dict[str, Any]]:
+    """The structured refusal for a configured STT backend that bypasses the gateway."""
+    from agent import model_gateway
+
+    if provider != "none" or not model_gateway.enforced():
+        return None
+    configured = str(stt_config.get("provider") or "").strip().lower()
+    try:
+        from tools.tool_backend_helpers import read_selection
+
+        if read_selection("stt") is None:
+            return None
+    except model_gateway.ModelGatewayRefused as exc:
+        return {**exc.to_dict(), "transcript": ""}
+    if configured in ("", "local", "local_command"):
+        return None
+    base_url = None
+    if configured == "openai":
+        openai_cfg = stt_config.get("openai") or {}
+        base_url = str(openai_cfg.get("base_url") or "").strip() or model_gateway.gateway_base_url()
+    try:
+        model_gateway.check_tool_backend("stt", configured, base_url)
+    except model_gateway.ModelGatewayRefused as exc:
+        return {**exc.to_dict(), "transcript": ""}
+    return None
+

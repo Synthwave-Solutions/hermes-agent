@@ -128,7 +128,7 @@ def _modal_unavailable_reason(modal_state: Dict[str, Any]) -> tuple[str, str]:
 # --- Environment builders. Signature: (*, image, cwd, timeout, cc, task_id, ssh_config, host_cwd)
 # (env_type is only forwarded to the plugin-registry fallback, not to the built-in builders.)
 def _build_local_env(*, cwd, timeout, **_):
-    return _LocalEnvironment(cwd=cwd, timeout=timeout)
+    return _LocalEnvironment(cwd=cwd, timeout=timeout, env=_model_gateway_child_env())
 
 
 def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
@@ -365,3 +365,23 @@ def _check_plugin_requirements(config: Dict[str, Any]) -> bool:
 # Built-in backend -> requirements checker; unknown backends go to the plugin registry.
 _REQUIREMENT_CHECKERS = {name: functools.partial(_check_requirements, name) for name in _BACKEND_SPECS}
 _check_vercel_sandbox_requirements = _REQUIREMENT_CHECKERS["vercel_sandbox"]  # used by code_execution_tool
+
+def _model_gateway_child_env() -> Dict[str, str]:
+    """Child environment of a local terminal under ``model_gateway.enforce`` (R2).
+
+    ``OPENAI_BASE_URL`` and ``ANTHROPIC_BASE_URL`` point at the model gateway
+    with the profile's own gateway key, and every provider credential
+    variable is blanked, so a ``codex`` or ``claude`` started from the
+    terminal reaches only the gateway. The overrides use the environment
+    layer's force prefix; identity and ceiling variables are not touched and
+    keep whatever that layer injects. ``{}`` when enforcement is off.
+    """
+    try:
+        from agent import model_gateway
+        from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+
+        return model_gateway.terminal_child_env(force_prefix=_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+    except Exception:
+        logger.warning("model gateway child environment unavailable", exc_info=True)
+        return {}
+

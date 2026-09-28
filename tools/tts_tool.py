@@ -8,6 +8,7 @@ Sibling ``tts_tool_*`` modules hold backends/delivery/lifecycle; they read the s
 here (config, provider resolution, lazy SDK importers) through ``_origin()`` at call time.
 """
 
+from agent.model_gateway import ModelGatewayRefused
 from pm import install_hint
 import asyncio
 import contextlib
@@ -141,11 +142,31 @@ def _load_tts_config() -> Dict[str, Any]:
     return {}
 
 
-def _get_provider(tts_config: Dict[str, Any]) -> str:
-    """Configured provider or the free default (inference credentials never imply consent to paid
-    speech); ``nous`` is serviced by the OpenAI path through the managed openai-audio gateway."""
+def _get_provider(tts_config: Dict[str, Any], override: Optional[str] = None) -> str:
+    """Get the explicitly configured TTS provider or the free default.
+
+    Inference credentials do not imply consent to paid speech generation.
+    Users opt into cloud TTS by setting ``tts.provider`` (normally through
+    ``hermes tools``); otherwise the historical Edge backend remains active.
+
+    The managed "Nous Subscription" selection (``tts.provider: nous``) is
+    serviced by the OpenAI provider implementation, routed through the
+    managed openai-audio gateway by ``_resolve_openai_audio_client_config``.
+
+    ``override`` is a per-call provider (the tool's ``provider`` argument),
+    returned as given. Both it and the configured provider pass the model
+    gateway check: under ``model_gateway.enforce`` a backend that bypasses
+    the gateway raises ``ModelGatewayRefused``.
+    """
+    if override:
+        provider = str(override).lower().strip()
+        _check_tts_model_gateway(provider, tts_config)
+        return provider
     provider = (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
-    return "openai" if provider == NOUS_MANAGED_PROVIDER else provider
+    _check_tts_model_gateway(provider, tts_config)
+    if provider == NOUS_MANAGED_PROVIDER:
+        return "openai"
+    return provider
 
 
 # Platforms whose native voice-bubble delivery requires Ogg/Opus (MP3 renders broken there).
@@ -271,7 +292,7 @@ def _apply_call_overrides(tts_config: Dict[str, Any], speed: Optional[float], pr
     resolve the provider name."""
     if speed is not None:
         tts_config = {**tts_config, "speed": max(0.25, min(4.0, float(speed)))}
-    return tts_config, provider.lower().strip() if provider else _get_provider(tts_config)
+    return tts_config, _get_provider(tts_config, override=provider)
 
 
 def _session_platform() -> tuple:
@@ -345,6 +366,10 @@ def _text_to_speech_single(
     Command providers resolve BEFORE built-in dispatch, but built-in names short-circuit so
     ``tts.providers.openai.command`` can't shadow OpenAI. Plugins fire only for names that are
     neither; a None return falls through to built-in dispatch (unknown -> Edge default)."""
+    try:
+        _check_tts_model_gateway(provider, tts_config)
+    except ModelGatewayRefused as exc:
+        return exc.tool_result()
     try:
         if command_provider_config is not None:
             logger.info("Generating speech with command TTS provider '%s'...", provider)
@@ -436,7 +461,10 @@ def text_to_speech_tool(
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
-    tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
+    try:
+        tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
+    except ModelGatewayRefused as exc:
+        return exc.tool_result()
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
@@ -578,7 +606,10 @@ def check_tts_requirements() -> bool:
     first-use SDK install that synthesis performs. This is the ``text_to_speech`` tool's
     ``check_fn``, so it runs on every tool listing and must never install."""
     tts_config = _load_tts_config()
-    provider = _get_provider(tts_config)
+    try:
+        provider = _get_provider(tts_config)
+    except ModelGatewayRefused:
+        return False
     if _resolve_command_provider_config(provider, tts_config) is not None:
         return True
     check = _BUILTIN_REQUIREMENTS.get(provider)
@@ -655,3 +686,26 @@ registry.register(
     check_fn=check_tts_requirements,
     emoji="🔊",
     dynamic_schema_overrides=_tts_schema_overrides)
+
+def _check_tts_model_gateway(provider: str, tts_config: Dict[str, Any]) -> None:
+    """Refuse a TTS backend that bypasses the model gateway (R2).
+
+    No-op unless ``model_gateway.enforce`` is on. Then only ``openai`` with
+    its base URL on the gateway (an unset ``tts.openai.base_url`` means the
+    gateway) and the local engines pass; ``edge``, ElevenLabs, the other
+    cloud, command and plugin providers and ``nous`` raise
+    ``ModelGatewayRefused`` unless ``model_gateway.tool_exceptions`` names
+    them.
+    """
+    from agent import model_gateway
+
+    if not model_gateway.enforced():
+        return
+    base_url = None
+    if provider == "openai":
+        openai_cfg = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
+        base_url = str(openai_cfg.get("base_url") or "").strip() or model_gateway.gateway_base_url()
+    elif provider == NOUS_MANAGED_PROVIDER and model_gateway.tool_gateway_allowed("openai-audio"):
+        return
+    model_gateway.check_tool_backend("tts", provider, base_url)
+

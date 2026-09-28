@@ -189,7 +189,44 @@ class ClientLifecycleMixin:
         from agent.process_bootstrap import build_keepalive_http_client
         return build_keepalive_http_client(base_url, verify=verify)
 
-    _create_openai_client = _forward("agent.agent_runtime_helpers", "create_openai_client")
+    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+        """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
+        from agent.agent_runtime_helpers import create_openai_client
+        client_kwargs = self._model_gateway_client_kwargs(client_kwargs)
+        return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
+
+    def _model_gateway_client_kwargs(self, client_kwargs: dict) -> dict:
+        """Client keyword arguments for the SynthPulse model gateway (R2).
+
+        Under ``model_gateway.enforce`` a client for any other endpoint is
+        refused (MoA's in-process facade excepted: its slots call the gateway
+        through the auxiliary client). A client for the gateway carries the
+        session header by default; each request adds the pseudonymous
+        ``user`` field (``agent.chat_completion_helpers.build_api_kwargs``).
+        """
+        from agent import model_gateway
+
+        base_url = str((client_kwargs or {}).get("base_url") or "")
+        if (
+            model_gateway.enforced()
+            and (getattr(self, "provider", "") or "").strip().lower() != "moa"
+            and not model_gateway.is_gateway_url(base_url)
+        ):
+            raise model_gateway.ModelGatewayRefused(
+                "model",
+                getattr(self, "provider", "") or "unknown",
+                "the client endpoint is not the model gateway",
+            )
+        if not model_gateway.is_gateway_url(base_url):
+            return client_kwargs
+        headers = model_gateway.identity_headers(getattr(self, "session_id", None))
+        if not headers:
+            return client_kwargs
+        kwargs = dict(client_kwargs)
+        merged = dict(kwargs.get("default_headers") or {})
+        merged.update(headers)
+        kwargs["default_headers"] = merged
+        return kwargs
     _force_close_tcp_sockets = _forward_static("agent.agent_runtime_helpers", "force_close_tcp_sockets")
     _cleanup_dead_connections = _forward("agent.agent_runtime_helpers", "cleanup_dead_connections")
     _run_codex_stream = _forward("agent.codex_runtime", "run_codex_stream")

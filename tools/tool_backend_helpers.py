@@ -15,10 +15,12 @@ _DEFAULT_MODAL_MODE = "auto"
 _VALID_MODAL_MODES = {"auto", "direct", "managed"}
 
 
-def managed_nous_tools_enabled(*, force_fresh: bool = False) -> bool:
+def managed_nous_tools_enabled(*, force_fresh: bool = False, capability: str | None = None) -> bool:
     """Coarse gate: entitled to the Nous Tool Gateway (paid Portal access OR a live free
     pool). Fails closed on unknown/error — never blocks startup. Callers narrow per category
     via ``tool_gateway_entitled_for``; ``force_fresh`` is for flows needing a just-bought grant."""
+    if capability and not _model_capability_may_use_nous(capability):
+        return False
     try:
         from hermes_cli.nous_account import get_nous_portal_account_info
         # Branched call, not ``force_fresh=force_fresh``: tests stub the reader with zero-arg lambdas.
@@ -182,6 +184,8 @@ def resolve_openai_audio_api_key() -> str:
 
 def prefers_gateway(config_section: str) -> bool:
     """True when ``<section>.use_gateway`` is set in config.yaml. Never raises."""
+    if not _model_capability_may_use_nous(config_section):
+        return False
     try:
         from hermes_cli.config import load_config
         section = (load_config() or {}).get(config_section)
@@ -212,7 +216,7 @@ def _raw_section(section: str) -> Dict[str, Any] | None:
         return None
 
 
-def read_selection(section: str) -> str | None:
+def _read_selection_unchecked(section: str) -> str | None:
     """THE single runtime read of the persisted `hermes tools` selection: ``"nous"`` (managed
     gateway row), a vendor name (direct, own credentials), or ``None`` (never configured ->
     legacy autodetect allowed). Reads the RAW config.yaml so key presence means "actually
@@ -236,7 +240,10 @@ def read_selection(section: str) -> str | None:
 def selection_exists(section: str) -> bool:
     """True when ANY selection signal was ever written for the section (wider than
     read_selection: per-capability web keys count too)."""
-    if read_selection(section) is not None:
+    try:
+        if read_selection(section) is not None:
+            return True
+    except ValueError:
         return True
     extra = _EXTRA_SELECTION_KEYS.get(section, ())
     raw = _raw_section(section) if extra else None
@@ -275,4 +282,31 @@ def selection_error(section: str, selection_name: str, failure: str) -> str:
 def fal_key_is_configured() -> bool:
     """True when FAL_KEY is set (scope/env, else ``.env`` for CLI paths that run before dotenv
     loads) to a non-whitespace value, so tool-side and CLI setup-time checks agree."""
+    from agent import model_gateway
+    if not (model_gateway.tool_backend_allowed("image_gen", "fal") or model_gateway.tool_backend_allowed("video_gen", "fal")):
+        return False
     return bool(_scoped_credential("FAL_KEY") or _dotenv_value("FAL_KEY"))
+
+def _model_capability_may_use_nous(section: str) -> bool:
+    """False when ``model_gateway.enforce`` refuses the Nous gateway for a model capability."""
+    try:
+        from agent import model_gateway
+
+        if section not in model_gateway.MODEL_CAPABILITIES:
+            return True
+        return model_gateway.tool_backend_allowed(section, NOUS_MANAGED_PROVIDER) or model_gateway.tool_gateway_allowed(
+            _NOUS_VENDOR_FOR_SECTION.get(section, section)
+        )
+    except Exception:
+        logger.debug("model gateway check failed for %s", section, exc_info=True)
+        return False
+
+
+_NOUS_VENDOR_FOR_SECTION = {"tts": "openai-audio", "stt": "openai-audio", "image_gen": "fal-queue", "video_gen": "fal-queue"}
+
+def read_selection(section: str) -> str | None:
+    selected = _read_selection_unchecked(section)
+    if selected == NOUS_MANAGED_PROVIDER and not _model_capability_may_use_nous(section):
+        from agent.model_gateway import ModelGatewayRefused
+        raise ModelGatewayRefused(section, selected)
+    return selected
