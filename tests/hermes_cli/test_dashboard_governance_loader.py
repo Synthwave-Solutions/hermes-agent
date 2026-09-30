@@ -108,3 +108,23 @@ def test_save_policy_rejects_invalid_policy_without_overwriting(tmp_path):
         save_governance_policy({"version": 1, "mode": "maybe"}, path=path)
 
     assert "mode: enforce" in path.read_text(encoding="utf-8")
+
+
+def test_policy_refresh_observes_same_size_permission_change(tmp_path):
+    from hermes_cli.dashboard_governance.loader import load_governance_policy
+
+    path = tmp_path / "policy.yaml"
+    path.write_text("mode: enforce\nroles:\n  user:\n    grants:\n      permissions: [sessions:read]\n")
+    assert load_governance_policy(path=path).roles["user"].grants.permissions == frozenset({"sessions:read"})
+    path.write_text(path.read_text().replace("sessions:read", "sessions:deny"))
+    assert load_governance_policy(path=path).roles["user"].grants.permissions == frozenset({"sessions:deny"})
+
+
+@pytest.mark.parametrize("document", ["roles: [", "!!python/object/apply:os.system ['echo unsafe']"])
+def test_policy_rejects_malformed_or_unsafe_yaml(tmp_path, document):
+    from hermes_cli.dashboard_governance.loader import GovernancePolicyError, load_governance_policy
+
+    path = tmp_path / "policy.yaml"
+    path.write_text(document)
+    with pytest.raises(GovernancePolicyError):
+        load_governance_policy(path=path)
