@@ -971,19 +971,19 @@ class _CodexResponseAssembler:
 
     def _on_terminal(self, event: Any, event_type: str) -> bool:
         self.saw_terminal = True
+        # SYNTHWAVE fork: the terminal frame type is authoritative. An omitted or stale nested
+        # ``response.status`` must not leave the optimistic EOF-recovery default (completed) on a
+        # failed/incomplete stream (docs/responses-terminal-failure-fidelity.md).
+        self.terminal_status = event_type.removeprefix("response.")
         resp_obj = _event_field(event, "response")
         if resp_obj is not None:
             self.terminal_usage, self.terminal_response_id = _event_field(resp_obj, "usage"), _event_field(resp_obj, "id")
             self.terminal_service_tier = _event_field(resp_obj, "service_tier")
-            rstatus = _event_field(resp_obj, "status")
-            if isinstance(rstatus, str):
-                self.terminal_status = rstatus
             if event_type == "response.incomplete":
                 self.terminal_incomplete_details = _event_field(resp_obj, "incomplete_details")
             elif event_type == "response.failed":
                 self.terminal_error = _event_field(resp_obj, "error")
         self.saw_response_completed = self.saw_response_completed or event_type == "response.completed"
-        self.terminal_status = self.terminal_status or event_type.removeprefix("response.")
         return True
 
     # Exact-type handlers first, then substring-matched ones in priority order. ``error`` frames
