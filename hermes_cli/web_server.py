@@ -185,6 +185,11 @@ async def _lifespan(app: "FastAPI"):
     # overlap ``npm install`` / ``npm run build``. Locks live on app.state (not
     # module globals) so they bind to the running loop, not the import-time one.
     app.state.chat_argv_lock = asyncio.Lock()
+    # Serializes governance-policy read-modify-write cycles so two concurrent
+    # /api/governance mutations can never interleave and silently drop each
+    # other's entry edits (the loader's atomic replace only protects a single
+    # writer's snapshot, not the read-then-write sequence).
+    app.state.governance_policy_lock = asyncio.Lock()
 
     # Bring state.db schema current BEFORE the first session-list poll
     # (#79531/#80037): a store left behind by `hermes update` otherwise 500s
@@ -347,6 +352,11 @@ def _app_state_default(app: "FastAPI", name: str, factory):
 
 def _get_chat_argv_lock(app: "FastAPI") -> asyncio.Lock:
     return _app_state_default(app, "chat_argv_lock", asyncio.Lock)
+
+
+def _get_governance_policy_lock(app: "FastAPI") -> asyncio.Lock:
+    """SynthPulse governance-policy mutation lock (see the lifespan comment)."""
+    return _app_state_default(app, "governance_policy_lock", asyncio.Lock)
 
 
 def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
@@ -684,6 +694,19 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 
 @app.middleware("http")
+async def _dashboard_governance_gate(request: Request, call_next):
+    """SynthPulse whitelist-first dashboard governance gate.
+
+    Registered after the plugin runtime gate and before the OAuth/token gates (Starlette runs
+    later-registered middleware first), so it sees the authenticated ``request.state``
+    principal before handlers run while public auth-bootstrap routes stay reachable.
+    """
+    from hermes_cli.dashboard_governance.enforcement import governance_middleware
+
+    return await governance_middleware(request, call_next)
+
+
+@app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
     """OAuth gate — active only when start_server flags ``auth_required``; pass-through on loopback.
 
@@ -1005,6 +1028,7 @@ from hermes_cli.web_routers import (  # noqa: E402
     chat_workspaces as _chat_workspaces_routes,
     dashboard_ui as _dashboard_ui_routes,
     shared_metrics as _shared_metrics_routes,
+    governance as _governance_routes,
 )
 
 app.include_router(_files_routes.router)
@@ -1038,6 +1062,8 @@ app.include_router(_chat_ws_routes.router)
 app.include_router(_chat_workspaces_routes.router)
 app.include_router(_dashboard_ui_routes.router)
 app.include_router(_shared_metrics_routes.router)
+# SynthPulse dashboard governance admin API (/api/governance/*).
+app.include_router(_governance_routes.router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth

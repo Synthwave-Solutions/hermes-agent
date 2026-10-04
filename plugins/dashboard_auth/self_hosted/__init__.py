@@ -6,11 +6,21 @@ URL, exchanges the code, and verifies the **ID token** (the access token is opaq
 against the discovered ``jwks_uri`` with ``iss``/``aud`` pinned. Public and confidential
 (``client_secret`` layered on top of PKCE, never replacing it) clients both work. Config:
 ``dashboard.oauth.self_hosted.{issuer,client_id,scopes,client_secret}`` or ``HERMES_DASHBOARD_OIDC_*``.
+
+Governance group mapping (SynthPulse dashboard governance): the verified ID token's SSO group
+memberships surface on ``Session.groups`` so policies can map groups to roles. The claim name is
+``dashboard.governance.sso_group_claim`` (env ``HERMES_DASHBOARD_OIDC_GROUP_CLAIM``), default
+``groups``. Google ID tokens carry no groups claim, only ``hd`` and ``email``, so both are always
+appended as pseudo-groups. Role ingestion is opt-in: ``Session.roles`` names seed the resolver's
+effective role set directly, so an IDP role string colliding with a policy role name (e.g. an
+Azure AD app role "admin") would silently inherit its grants. Roles are extracted ONLY when
+``dashboard.governance.sso_role_claim`` (env ``HERMES_DASHBOARD_OIDC_ROLE_CLAIM``) names a claim.
 """
 
 from __future__ import annotations
 
 import base64
+import dataclasses
 import logging
 import threading
 import time
@@ -41,6 +51,20 @@ _TAG = "dashboard-auth-self-hosted"
 
 # ``openid`` is mandatory (no ID token without it); profile/email populate display_name/email.
 _DEFAULT_SCOPES = "openid profile email"
+
+# Default ID-token claim carrying SSO group memberships (Keycloak, Authentik, Zitadel and Okta
+# emit ``groups`` when the client is mapped); other IDPs set ``dashboard.governance.sso_group_claim``.
+_DEFAULT_GROUP_CLAIM = "groups"
+
+# Deliberately NO default role claim: role names land directly in the governance resolver's
+# effective role set, so ingesting an IDP ``roles`` claim must be an explicit operator opt-in.
+_DEFAULT_ROLE_CLAIM = ""
+
+# Protocol plumbing, not identity: stripped before claims reach ``Session.claims`` so the
+# governance layer only sees identity facets (``nonce``/``at_hash``/``c_hash`` bind tokens).
+_PROTOCOL_CLAIMS = frozenset({
+    "exp", "iat", "nbf", "aud", "iss", "jti", "azp", "nonce", "at_hash", "c_hash", "sid",
+    "auth_time", "acr", "amr"})
 
 # RS256 is the OIDC default; ES256 is common on modern IDPs (Zitadel, newer Keycloak).
 # HS256 is deliberately excluded: it implies a shared secret we don't hold in the
@@ -79,7 +103,10 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
     name = "self-hosted"
     display_name = "Self-Hosted OIDC"
 
-    def __init__(self, *, issuer: str, client_id: str, scopes: str = _DEFAULT_SCOPES, client_secret: str = "") -> None:
+    def __init__(
+        self, *, issuer: str, client_id: str, scopes: str = _DEFAULT_SCOPES, client_secret: str = "",
+        group_claim: str = _DEFAULT_GROUP_CLAIM, role_claim: str = _DEFAULT_ROLE_CLAIM,
+    ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
         if not client_id:
@@ -93,6 +120,11 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         # Empty/whitespace secret ⇒ public client, so a provisioned-but-blank secret
         # can't flip us into a broken confidential mode.
         self._client_secret = (client_secret or "").strip()
+        # Governance mapping: a blank group claim falls back to the default so a blank config
+        # value can't silently disable group extraction; a blank role claim DISABLES role
+        # extraction (explicit opt-in, see _DEFAULT_ROLE_CLAIM).
+        self._group_claim = (group_claim or "").strip() or _DEFAULT_GROUP_CLAIM
+        self._role_claim = (role_claim or "").strip()
         # Discovery + JWKS resolve lazily so registration never hits the network
         # (the IDP may be down at boot; fail per-request instead).
         self._discovery: Dict[str, Any] | None = None
@@ -266,16 +298,63 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         groups = claims.get("groups")
         if not org_id and isinstance(groups, list) and groups:
             org_id = ",".join(str(g) for g in groups)
-        return session_from_claims(
+        session = session_from_claims(
             self.name, claims, access_token=id_token, refresh_token=refresh_token, label="ID token", email=email,
             display_name=str(claims.get("name") or claims.get("preferred_username") or claims.get("nickname") or email or ""),
             org_id=str(org_id or ""))
+        # Governance identity facets, re-derived on every verify_session because the session is
+        # stateless (the ID token IS the session).
+        session_groups, session_roles, identity_claims = self._governance_facets(claims, email=email)
+        return dataclasses.replace(session, groups=session_groups, roles=session_roles, claims=identity_claims)
+
+    def _session_from_tokens(self, *, id_token: str, refresh_token: str, claims: Dict[str, Any]) -> Session:
+        """Keyword-only alias of :meth:`_session` kept for the governance claim-mapping tests."""
+        return self._session(id_token, refresh_token, claims)
+
+    # ---- internals: governance facets -------------------------------------
+
+    @staticmethod
+    def _claim_values(value: Any) -> tuple[str, ...]:
+        """Normalise a groups/roles claim to a tuple of strings: a JSON list (Keycloak,
+        Authentik, Okta), a comma- or space-separated string (some Azure AD / ADFS mappers), or a
+        bare string. Anything else (None, numbers, objects) yields ``()``."""
+        if isinstance(value, list):
+            return tuple(str(v).strip() for v in value if str(v).strip())
+        if isinstance(value, str):
+            return tuple(p for p in value.replace(",", " ").split() if p)
+        return ()
+
+    def _governance_facets(
+        self, claims: Dict[str, Any], *, email: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], Dict[str, Any]]:
+        """``(groups, roles, identity_claims)`` from verified claims.
+
+        Groups: the configured group claim plus the Google ``hd`` and ``email`` pseudo-groups,
+        de-duplicated order-preservingly. Roles: the configured role claim, ONLY when one is set.
+        Claims: a copy with protocol claims stripped; tokens are never included (the input is the
+        decoded ID-token payload)."""
+        groups: list[str] = list(self._claim_values(claims.get(self._group_claim)))
+        hd = str(claims.get("hd", "") or "").strip()
+        if hd:
+            groups.append(hd)
+        if email:
+            groups.append(email)
+        roles = (tuple(dict.fromkeys(self._claim_values(claims.get(self._role_claim))))
+                 if self._role_claim else ())
+        identity_claims = {key: value for key, value in claims.items() if key not in _PROTOCOL_CLAIMS}
+        return tuple(dict.fromkeys(groups)), roles, identity_claims
 
 
 # ---- Plugin entry point ----
 
 def _load_config_oauth_section() -> dict:
     return load_config_section(logger, _TAG, "dashboard", "oauth", "self_hosted")
+
+
+def _load_config_governance_section() -> dict:
+    """``dashboard.governance`` from config.yaml (or ``{}``): it configures the governance
+    layer's input (which claims carry groups/roles), not the OAuth handshake."""
+    return load_config_section(logger, _TAG, "dashboard", "governance")
 
 
 def _settings() -> dict:
@@ -295,11 +374,16 @@ def _settings() -> dict:
             "dashboard.oauth.self_hosted.{issuer,client_id} in config.yaml — or pass "
             "--insecure to skip the OAuth gate entirely. (issuer set: %s; client_id set: %s)"
             % (bool(issuer), bool(client_id)))
+    governance_cfg = _load_config_governance_section()
     return {
         "issuer": issuer, "client_id": client_id,
         "scopes": setting("HERMES_DASHBOARD_OIDC_SCOPES", "scopes") or _DEFAULT_SCOPES,
         # Credential: canonical home is the env var / ~/.hermes/.env. Empty ⇒ public client.
-        "client_secret": setting("HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "client_secret")}
+        "client_secret": setting("HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "client_secret"),
+        "group_claim": resolve_env_or_cfg(
+            "HERMES_DASHBOARD_OIDC_GROUP_CLAIM", governance_cfg.get("sso_group_claim")) or _DEFAULT_GROUP_CLAIM,
+        # No default: unset keeps role extraction disabled (explicit operator opt-in).
+        "role_claim": resolve_env_or_cfg("HERMES_DASHBOARD_OIDC_ROLE_CLAIM", governance_cfg.get("sso_role_claim"))}
 
 
 def register(ctx) -> None:
@@ -309,5 +393,7 @@ def register(ctx) -> None:
     kw, LAST_SKIP_REASON = register_provider(ctx, logger, _TAG, SelfHostedOIDCProvider, _settings)
     if kw is not None:
         logger.info(
-            "dashboard-auth-self-hosted: registered provider (issuer=%s, client_id=%s, scopes=%r, confidential=%s)",
-            kw["issuer"], kw["client_id"], kw["scopes"], bool(kw["client_secret"]))  # never log the secret itself
+            "dashboard-auth-self-hosted: registered provider (issuer=%s, client_id=%s, scopes=%r, confidential=%s, "
+            "group_claim=%s, role_claim=%s)",
+            kw["issuer"], kw["client_id"], kw["scopes"], bool(kw["client_secret"]),  # never log the secret itself
+            kw["group_claim"], kw["role_claim"] or "<disabled>")

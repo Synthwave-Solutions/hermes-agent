@@ -25,7 +25,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from hermes_cli.session_listing import subagent_listing_scope
 from hermes_cli.web_deps import late
@@ -796,8 +796,15 @@ def _read_profiles():
 
 
 @router.get("/api/profiles")
-async def list_profiles_endpoint():
-    return await _read_profiles()
+async def list_profiles_endpoint(request: Request):
+    # Dashboard governance: the coalesced read is shared across concurrent callers, so the
+    # per-principal profile filter runs after it, on a fresh list (never mutate the shared result).
+    from hermes_cli.dashboard_governance.enforcement import (
+        effective_access_for_request, filter_profiles_for_access)
+
+    payload = await _read_profiles()
+    access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+    return {**payload, "profiles": filter_profiles_for_access(list(payload.get("profiles") or []), access)}
 
 
 @router.post("/api/profiles")

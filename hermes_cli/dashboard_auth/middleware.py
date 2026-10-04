@@ -10,7 +10,7 @@ redirected to ``/login``; ``/api/*`` routes get a 401 JSON envelope.
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Mapping
 from urllib.parse import quote
 
 from fastapi import Request
@@ -60,6 +60,24 @@ def _safe_next_target(request: Request) -> str:
         return ""
     query = request.url.query
     return quote(f"{path}?{query}" if query else path, safe="")
+
+
+def _attach_session_state(request: Request, session) -> None:
+    """Attach the verified session and its governance identity facets.
+
+    ``dashboard_governance.enforcement.subject_from_request`` reads
+    ``request.state.groups`` / ``request.state.roles`` /
+    ``request.state.claims`` (via getattr with empty defaults), so this is
+    the single choke point where the Session's optional SSO facets become
+    visible to the governance resolver. Providers whose sessions predate the
+    optional fields (or that never populate them) degrade to empty values.
+    Never attach tokens here: only identity facets leave the Session.
+    """
+    request.state.session = session
+    request.state.groups = tuple(getattr(session, "groups", ()) or ())
+    request.state.roles = tuple(getattr(session, "roles", ()) or ())
+    claims = getattr(session, "claims", None)
+    request.state.claims = dict(claims) if isinstance(claims, Mapping) else {}
 
 
 def _unauth_response(request: Request, *, reason: str) -> Response:
@@ -129,7 +147,7 @@ async def _serve_refreshed(request: Request, call_next, new_session, provider: s
     """Serve the request under a just-rotated session and write the rotated cookies back. Writing
     the ROTATED RT is mandatory: Portal runs reuse detection, so replaying the stale RT would
     revoke the session."""
-    request.state.session = new_session
+    _attach_session_state(request, new_session)
     response = await call_next(request)
     set_session_cookies(
         response, access_token=new_session.access_token, refresh_token=new_session.refresh_token,
@@ -170,7 +188,7 @@ async def gated_auth_middleware(
         except ProviderError as e:
             return unreachable_response(str(e))
         if bearer_session is not None:
-            request.state.session = bearer_session
+            _attach_session_state(request, bearer_session)
             return await call_next(request)
         return _unauth_response(request, reason="invalid_or_expired_session")
 
@@ -201,7 +219,7 @@ async def gated_auth_middleware(
             return _session_expired_response(request)
         return await _serve_refreshed(request, call_next, *refreshed)
 
-    request.state.session = session
+    _attach_session_state(request, session)
     response = await call_next(request)
     if not provider_hint and session.provider:
         set_session_provider_cookie(

@@ -2,14 +2,23 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional
 
 
 @dataclass(frozen=True)
 class Session:
-    """A verified interactive identity (from ``complete_login`` / ``verify_session``). All fields
-    mandatory; providers without orgs set ``org_id=""``. The tokens are opaque to Hermes."""
+    """A verified interactive identity (from ``complete_login`` / ``verify_session``). The first
+    eight fields are mandatory; providers without orgs set ``org_id=""``. The tokens are opaque
+    to Hermes.
+
+    ``groups`` / ``roles`` / ``claims`` are OPTIONAL identity facets for the dashboard-governance
+    layer (SSO group to role mapping). They default to empty so every existing provider keeps
+    working unchanged; an OIDC provider populates them from the *verified* ID-token claims.
+    ``claims`` MUST carry identity claims only (never tokens, secrets, or raw credential
+    material) because it is surfaced to the governance resolver and effective-access endpoints.
+    """
+
     user_id: str
     email: str
     display_name: str
@@ -18,6 +27,12 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    # Governance identity facets (optional; see class docstring).
+    groups: tuple[str, ...] = ()
+    roles: tuple[str, ...] = ()
+    # ``hash=False``: dicts aren't hashable, and these facets are derived
+    # from the token anyway, so they must not poison the frozen hash.
+    claims: Mapping[str, Any] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)

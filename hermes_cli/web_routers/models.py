@@ -9,13 +9,14 @@ import concurrent.futures
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_config import (
     _AUX_TASK_SLOTS, _UNSET, _apply_model_assignment_sync, _dashboard_code_skew_guard,
-    _prepare_main_assignment,
+    _normalize_main_model_assignment, _prepare_main_assignment,
 )
+from hermes_cli.web_server_governance import ensure_model_allowed, filter_model_options_for_request
 from agent.model_metadata import is_local_endpoint
 from starlette.concurrency import run_in_threadpool
 from hermes_cli.web_models import ModelAssignment, MoaConfigPayload, MoaModelSlot
@@ -140,6 +141,7 @@ async def get_model_options(
     refresh: bool = False,
     include_unconfigured: bool = False,
     explicit_only: bool = False,
+    request: Request = None,  # type: ignore[assignment]  # injected by FastAPI; None for direct calls
 ):
     """Authenticated providers + curated model lists — REST twin of the ``model.options``
     JSON-RPC on tui_gateway, same response shape so ``ModelPickerDialog`` shares the types.
@@ -164,7 +166,9 @@ async def get_model_options(
                     load_picker_context(), explicit_only=bool(explicit_only),
                     include_unconfigured=bool(include_unconfigured), refresh=bool(refresh))
 
-        return await run_in_threadpool(_build_payload_scoped)
+        payload = await run_in_threadpool(_build_payload_scoped)
+        # SynthPulse dashboard governance: hide providers/models the principal may not use.
+        return filter_model_options_for_request(payload, request)
 
 
 def _nous_recommended_default() -> dict:
@@ -315,7 +319,10 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
 
 
 @router.post("/api/model/set")
-async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = None):
+async def set_model_assignment(
+    body: ModelAssignment, profile: Optional[str] = None,
+    request: Request = None,  # type: ignore[assignment]  # injected by FastAPI; None for direct calls
+):
     """Assign a model to the main slot or an auxiliary task slot. Writes
     ``~/.hermes/config.yaml`` — applies to **new** sessions only; a running chat
     PTY hot-swaps via the ``/model`` slash command instead."""
@@ -351,6 +358,8 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                         "confirm_required": True, "confirm_message": warning.message}
 
         reasoning_effort = body.reasoning_effort if "reasoning_effort" in body.model_fields_set else _UNSET
+        # SynthPulse dashboard governance: an ungranted provider/model is a 403 ``{"reason"}``.
+        governance_access = getattr(request.state, "governance_access", None) if request is not None else None
 
         def _apply_assignment():
             # Same RMW span as PUT /api/config: applyMainModel fires this while the
@@ -358,8 +367,17 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
             # catalog fetches / endpoint probes are network I/O, so they run BEFORE the lock;
             # only load→apply→save holds it.
             with _profile_scope(body.profile or profile):
+                # Governance check on the normalized pair BEFORE switch_model's probes, and again
+                # on the resolved target below (aliases may canonicalise to another model).
+                if scope == "main" and provider and model:
+                    ensure_model_allowed(governance_access, *_normalize_main_model_assignment(provider, model))
+                elif scope != "main" and provider:
+                    ensure_model_allowed(governance_access, provider, model)
                 prepared = (_prepare_main_assignment(load_config(), provider, model, base_url, api_key)
                             if scope == "main" else None)
+                if governance_access is not None and prepared is not None:
+                    resolved = prepared[1]
+                    ensure_model_allowed(governance_access, resolved.target_provider, resolved.new_model)
                 with _CONFIG_MUTATION_LOCK:
                     return _apply_model_assignment_sync(
                         scope, provider, model, task, base_url, api_key,

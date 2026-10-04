@@ -477,9 +477,21 @@ def _require_session(request: Request):
 async def api_auth_me(request: Request):
     """Return the verified session as JSON. Auth-required (gate enforces)."""
     sess = _require_session(request)
-    return {
+    payload = {
         "user_id": sess.user_id, "email": sess.email, "display_name": sess.display_name,
         "org_id": sess.org_id, "provider": sess.provider, "expires_at": sess.expires_at}
+    # SynthPulse dashboard governance: surface the caller's effective access so the SPA can
+    # gate navigation without a second round-trip. Best-effort: identity must still answer
+    # when the policy file is unreadable.
+    try:
+        from hermes_cli.dashboard_governance.enforcement import (
+            effective_access_for_request, serialize_effective_access)
+
+        access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
+        payload["governance"] = serialize_effective_access(access)
+    except Exception:
+        _log.exception("dashboard-auth: failed to attach governance summary to /api/auth/me")
+    return payload
 
 
 @router.post("/api/auth/ws-ticket", name="auth_ws_ticket")

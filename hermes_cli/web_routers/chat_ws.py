@@ -495,6 +495,12 @@ async def pty_ws(ws: WebSocket) -> None:
             return
         if workspace_cwd:
             resolve_kwargs["workspace_cwd"] = workspace_cwd
+    # SynthPulse dashboard governance: the child inherits the accepted principal's grants.
+    from hermes_cli.web_server_governance import dashboard_governance_context_env_for_ws
+    governance_context_env = dashboard_governance_context_env_for_ws(
+        ws, credential=cred, profile=profile, resume=resume, channel=channel)
+    if governance_context_env:
+        resolve_kwargs["governance_context_env"] = governance_context_env
 
     try:
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
