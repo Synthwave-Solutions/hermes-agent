@@ -86,6 +86,10 @@ _ACTIVE_STATES = ("running", "stalling")
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
 _ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+# Routing keys plus the trusted WebUI continuation reference (fork: governed async
+# continuations). Persisted, restored on recovery, and carried on every completion
+# event; only ``_capture_routing_origin`` can stamp the reference.
+_ORIGIN_KEYS = (*_ROUTING_KEYS, "webui_continuation_ref")
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
@@ -142,12 +146,27 @@ def _transaction():
 def _capture_routing_origin() -> Dict[str, Any]:
     """Snapshot scope_id/user_id/user_name on the PARENT thread (the daemon worker
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
-    Best-effort: empty values are omitted."""
+    Best-effort: empty values are omitted. A ``webui_continuation_ref`` is stamped
+    only by a trusted, already-loaded WebUI helper; a malformed one fails closed."""
+    origin: Dict[str, Any] = {}
+    # Only a trusted, already-loaded WebUI helper can stamp this reference.
+    # Never import a guessed host module or accept a model/tool argument.
+    import sys
+    import re
+    continuation = sys.modules.get("api.governance.continuation")
+    if continuation is not None:
+        ref = continuation.current_ref()
+        if ref:
+            if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}", ref):
+                raise ValueError("Invalid trusted WebUI continuation reference")
+            origin["webui_continuation_ref"] = ref
     try:
         from gateway.session_context import get_session_env
-        return {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
+        origin.update(
+            {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))})
     except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
-        return {}
+        pass
+    return origin
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
@@ -159,7 +178,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ORIGIN_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
@@ -297,7 +316,7 @@ def recover_abandoned_delegations() -> int:
                 "status": "unknown", "summary": None, "error": error, **diagnostics,
                 **({"results": recovered_results} if recovered_results else {}),
                 "dispatched_at": dispatched_at, "completed_at": now,
-                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
+                **{k: task[k] for k in _ORIGIN_KEYS if task.get(k)}}
             result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
                       **({"results": recovered_results} if recovered_results else {})}
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -639,6 +658,66 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
 
 
+def pending_for_session(origin_ui_session_id: str, *, homes=None) -> int:
+    """Count live work and durable completions not yet accepted by the parent.
+
+    ``homes`` is an optional collection of trusted profile homes resolved by
+    the host from this session's own profile/bot roster. No request-supplied
+    paths or process environment mutation is needed. Each ledger is opened
+    read-only; duplicate delegation IDs across homes count once. Errors and
+    dropped delivery propagate as unknown, never false completion.
+
+    Old WebUI turns did not stamp origin_ui_session_id. They are recognized
+    only when BOTH their immutable parent ID and routing session key equal the
+    requested UI ID. An explicit UI origin can never be overridden by aliases.
+    """
+    if not origin_ui_session_id:
+        return 0
+
+    def matches(record):
+        exact = str(record.get("origin_ui_session_id") or "")
+        if exact:
+            return exact == origin_ui_session_id
+        return (str(record.get("parent_session_id") or "") == origin_ui_session_id
+                and str(record.get("session_key") or "") == origin_ui_session_id)
+
+    with _records_lock:
+        pending = {
+            key for key, record in _records.items()
+            if record.get("status") in _LIVE_STATES
+            and matches(record)
+        }
+    if homes is None:
+        paths = [_db_path()]
+    else:
+        from pathlib import Path
+        paths = [Path(home) / "state.db" for home in homes]
+        if not paths:
+            raise ValueError("No authoritative profile homes supplied")
+    for path in dict.fromkeys(path.resolve() for path in paths):
+        if not path.is_file():
+            continue
+        with _DB_LOCK:
+            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+            try:
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='async_delegations'").fetchone():
+                    continue
+                rows = conn.execute(
+                    """SELECT delegation_id, state, delivery_state FROM async_delegations
+                       WHERE (origin_ui_session_id=? OR
+                         (COALESCE(origin_ui_session_id,'')='' AND parent_session_id=? AND origin_session=?))
+                         AND (state IN ('running','stalling','finalizing') OR delivery_state IN ('pending','dropped'))""",
+                    (origin_ui_session_id, origin_ui_session_id, origin_ui_session_id),
+                ).fetchall()
+                for delegation_id, _state, delivery in rows:
+                    if delivery == "dropped":
+                        raise RuntimeError("A delegated completion was not delivered to its parent")
+                    pending.add(delegation_id)
+            finally:
+                conn.close()
+    return len(pending)
+
+
 def active_task_count() -> int:
     """Number of running child subagents (a batch of N contributes N; a batch with
     no goal list counts 1) — the truthful observability figure, unlike slots."""
@@ -931,7 +1010,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+        **{k: record[k] for k in _ORIGIN_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     try:
         _persist_completion(evt, result)
@@ -973,7 +1052,7 @@ def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tas
         "goal": snapshot.get("goal", ""), "goals": snapshot.get("goals"), "context": snapshot.get("context"),
         "toolsets": snapshot.get("toolsets"), "role": snapshot.get("role"), "model": snapshot.get("model"),
         "status": "running", "dispatched_at": snapshot.get("dispatched_at") or time.time(), "completed_at": time.time(),
-        **{k: snapshot[k] for k in _ROUTING_KEYS if snapshot.get(k)}}
+        **{k: snapshot[k] for k in _ORIGIN_KEYS if snapshot.get(k)}}
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

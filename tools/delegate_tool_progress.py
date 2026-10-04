@@ -119,8 +119,11 @@ _LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
 # Event → _ChildProgressRelay method name. Lifecycle strings are emitted by the orchestrator itself (not
 # DelegateEvent). Any other DelegateEvent (TASK_TOOL_STARTED and the reserved TASK_* values) takes the tool-started
 # path; None means "recognised but ignored".
-_LIFECYCLE_EVENTS = frozenset({"subagent.start", "subagent.complete", "subagent.text"})
+# SYNTHWAVE fork: "subagent.spawn_requested" (queued before the child starts) feeds the safe
+# subagent activity projection (tools/delegation_progress.py).
+_LIFECYCLE_EVENTS = frozenset({"subagent.spawn_requested", "subagent.start", "subagent.complete", "subagent.text"})
 _EVENT_HANDLERS: Dict[Any, Optional[str]] = {
+    "subagent.spawn_requested": "_on_spawn_requested",
     "subagent.start": "_on_start",
     "subagent.complete": "_on_complete",
     "subagent.text": "_on_text",
@@ -345,6 +348,10 @@ class _ChildProgressRelay:
             self.batch.clear()
 
     # ── Lifecycle events emitted by the orchestrator itself ──
+    def _on_spawn_requested(self, tool_name, preview, args, kwargs):
+        # SYNTHWAVE fork: the queued phase carries only the assigned goal label, never child output.
+        self._relay("subagent.spawn_requested", preview=self.goal_label)
+
     def _on_start(self, tool_name, preview, args, kwargs):
         if self.goal_label:
             self._tree_line(f"🔀 {_short(self.goal_label, 55)}")
