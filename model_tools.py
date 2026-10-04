@@ -205,6 +205,138 @@ _tool_defs_cache_lock = threading.Lock()
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _current_dashboard_governance_context():
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        return current_governance_context()
+    except Exception:
+        return None
+
+
+def _governance_cache_fingerprint():
+    ctx = _current_dashboard_governance_context()
+    if ctx is None:
+        return None
+    try:
+        if (getattr(ctx.access, "mode", "off") != "enforce" and not getattr(ctx, "continuation_contexts", ())
+                and not getattr(ctx, "workspace_path", "")):
+            return None
+        return ctx.cache_fingerprint()
+    except Exception:
+        return None
+
+
+def _governance_tool_decision(tool_name: str):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import tool_allowed_for_context
+        return tool_allowed_for_context(ctx, tool_name, registry)
+    except Exception as exc:
+        logger.debug("dashboard governance tool policy failed for %s: %s", tool_name, exc)
+        # Fail closed only when an enforce context is active; otherwise preserve
+        # legacy CLI/gateway behavior if the governance package cannot import.
+        try:
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+_PROJECT_FILE_TOOLS = frozenset({"read_file", "search_files", "write_file", "patch"})
+
+
+def _normalize_project_file_args(function_name, function_args, task_id):
+    # Bind authorization and execution to the file backend's exact task cwd.
+    ctx = _current_dashboard_governance_context()
+    if ((getattr(ctx, "project_workspace", "") or getattr(ctx, "workspace_path", ""))
+            and function_name in _PROJECT_FILE_TOOLS):
+        from pathlib import Path as _ProjectPath
+        from tools.file_tools import _resolve_base_dir, _uses_container_paths
+        raw = str(function_args.get("path") or ".")
+        if not _ProjectPath(raw).is_absolute() and not _uses_container_paths(task_id or "default"):
+            return {**function_args, "path": str(_resolve_base_dir(task_id or "default") / raw)}
+    return function_args
+
+
+def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any]):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        return tool_arguments_allowed_for_context(ctx, tool_name, function_args)
+    except Exception as exc:
+        logger.debug("dashboard governance argument policy failed for %s: %s", tool_name, exc)
+        try:
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_argument_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+def _governance_usage_decision(tool_name: str, args: Optional[Dict[str, Any]] = None):
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.usage import check_usage_caps
+        return check_usage_caps(ctx, tool_name, args or {})
+    except Exception as exc:
+        logger.debug("dashboard governance usage cap check failed for %s: %s", tool_name, exc)
+        try:
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
+                from hermes_cli.dashboard_governance.models import AccessDecision
+                return AccessDecision(False, "governance_usage_policy_error")
+        except Exception:
+            pass
+        return None
+
+
+def _governance_record_tool_usage(tool_name: str, args: Optional[Dict[str, Any]] = None) -> None:
+    ctx = _current_dashboard_governance_context()
+    try:
+        from hermes_cli.dashboard_governance.usage import record_tool_usage
+        record_tool_usage(ctx, tool_name, args or {})
+    except Exception as exc:
+        logger.debug("dashboard governance usage recording failed for %s: %s", tool_name, exc)
+
+
+def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]], *, _scope_status=None) -> List[Dict[str, Any]]:
+    ctx = _current_dashboard_governance_context()
+    if ctx is None or (getattr(ctx.access, "mode", "off") != "enforce" and not getattr(ctx, "continuation_contexts", ())
+                       and not getattr(ctx, "workspace_path", "")):
+        return tool_defs
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import project_tool_names_for_context
+        names = [td.get("function", {}).get("name", "") for td in tool_defs]
+        projection = project_tool_names_for_context(ctx, (name for name in names if name), registry)
+        if _scope_status is not None:
+            _scope_status.append(projection.scope_allowed)
+        return [td for td, name in zip(tool_defs, names) if name in projection.names]
+    except Exception:
+        if _scope_status is not None:
+            _scope_status.append(False)
+        return []
+
+
+def _recheck_cached_tool_projection(tool_defs):
+    # Cached schemas are not proof of current workspace/bot membership. Do not
+    # re-filter assembled virtual tools or mutate the shared schema cache.
+    ctx = _current_dashboard_governance_context()
+    allowed = True
+    if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce"
+                            or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
+        try:
+            from hermes_cli.dashboard_governance.tool_policy import tool_projection_scope_allowed
+            allowed = tool_projection_scope_allowed(ctx)
+        except Exception:
+            allowed = False
+    result = list(tool_defs) if allowed else []
+    global _last_resolved_tool_names
+    _last_resolved_tool_names = [td["function"]["name"] for td in result]
+    return result
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized results when a dynamic-schema dependency changes (discord caps, sandbox mode)."""
     with _tool_defs_cache_lock:
@@ -220,9 +352,14 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    # Only a per-call status, never a reusable permission snapshot. A denied
+    # live governance scope must not cache [] and keep a later re-authorized user empty.
+    scope_status: List[bool] = []
+
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+                                         skip_tool_search_assembly=skip_tool_search_assembly,
+                                         _scope_status=scope_status)
     if not quiet_mode:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
@@ -235,22 +372,25 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     # fingerprints it sees over its lifetime (#19251).
     with _tool_defs_cache_lock:
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
-    if cached is None:
-        result = compute()
-        if cache_key is None:
-            return list(result)
-        with _tool_defs_cache_lock:
-            cached = _tool_defs_cache.get(cache_key)  # another thread may have filled it meanwhile
-            if cached is None:
-                if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-                    _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
-                _tool_defs_cache[cache_key] = cached = result
-    else:
-        global _last_resolved_tool_names
-        _last_resolved_tool_names = [t["function"]["name"] for t in cached]
+    if cached is not None:
+        # Cached schemas are not proof of current workspace/bot membership:
+        # recheck the live governance scope (also refreshes _last_resolved_tool_names).
+        return _recheck_cached_tool_projection(cached)
+    result = compute()
+    if cache_key is None or not all(scope_status):
+        return list(result)
+    with _tool_defs_cache_lock:
+        cached = _tool_defs_cache.get(cache_key)  # another thread may have filled it meanwhile
+        reused = cached is not None
+        if cached is None:
+            if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
+            _tool_defs_cache[cache_key] = cached = result
+    # A concurrent constructor may have populated the cache after this call's
+    # projection; its earlier live membership checks cannot be reused.
     # Always a shallow copy: run_agent appends memory/LCM schemas to its list; a
     # shared list would accumulate duplicate names (HTTP 400 from DeepSeek/Kimi/MiMo).
-    return list(cached)
+    return _recheck_cached_tool_projection(cached) if reused else list(cached)
 
 
 def _tool_defs_cache_key(
@@ -276,6 +416,7 @@ def _tool_defs_cache_key(
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _governance_cache_fingerprint(),
     )
 
 
@@ -504,14 +645,19 @@ _TOOL_SEARCH_LISTING_FORMS = {
 
 
 def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                              *, _scope_status: Optional[List[bool]] = None) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
     # Selection is per schema, not per process/profile. Kanban's local checks
     # are uncached; the outer definitions cache already keys on this selection.
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
     with scoped_kanban_toolset_selection(enabled_toolsets):
-        filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
+        # Dashboard governance projection runs BEFORE the dynamic rewriters, so
+        # their availability set (cross-references in descriptions) only names
+        # tools that passed both check_fn and governance filtering.
+        filtered_tools = _apply_dynamic_schemas(_filter_tools_by_governance(
+            registry.get_definitions(tools_to_include, quiet=quiet_mode), _scope_status=_scope_status))
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
@@ -835,11 +981,29 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
     else:
         dispatch_kwargs["user_task"] = user_task
 
-    def _dispatch(next_args: Dict[str, Any]) -> Any:
+    def _unchecked_dispatch(next_args: Dict[str, Any]) -> Any:
+        # Execution middleware and plugin hooks may alter arguments.
+        # Revalidate the exact final project file invocation, freshly.
+        if (function_name in _PROJECT_FILE_TOOLS
+                and getattr(_current_dashboard_governance_context(), "project_workspace", "")):
+            next_args = _normalize_project_file_args(function_name, next_args, ids.task_id)
+            decision = _governance_argument_decision(function_name, next_args)
+            if decision is None or not decision.allowed:
+                return tool_error("Project file access denied before execution")
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+
+    def _dispatch(next_args: Dict[str, Any]) -> Any:
+        # Review the exact arguments AFTER all plugin/middleware edits.
+        # The action reviewer rechecks current profile/tool/argument
+        # policy and never grants a capability missing from whitelist.
+        from hermes_cli.dashboard_governance.action_approval import authorize_tool_action
+        reviewed = authorize_tool_action(_current_dashboard_governance_context(), function_name, next_args, registry)
+        if reviewed is not None and reviewed.get("approved") is not True:
+            return tool_error("Action blocked by governance: " + str(reviewed.get("reason") or "approval denied"))
+        return _unchecked_dispatch(next_args)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:
@@ -871,6 +1035,138 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: Dict[st
 
 def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+_DWD_IDENTITY_GUIDANCE = (
+    "This Google Workspace CLI (gchat, gmail, gws-hermes, gdrive-dwd) may only "
+    "act as the signed-in user. Re-run the exact same command with "
+    "`--as <the user's own e-mail address>` placed right after the CLI name "
+    "(reads included). Never run it without --as and never use another "
+    "person's address: that is refused and cannot be approved by an admin. "
+    "If the task needs to read or send as someone else, tell the user plainly "
+    "that this is not possible from their account."
+)
+
+_GOVERNANCE_DENY_GUIDANCE = (
+    "Do NOT silently switch to a lesser workaround. Tell the user in your "
+    "reply exactly which step was blocked by governance and how that limits "
+    "the result. When access_request is 'filed', say explicitly that an "
+    "access request has ALREADY been placed in the admins' SynthPulse WebUI "
+    "(governance screen, Approvals tab) and name the admins listed in "
+    "'approvers' so the user knows who to ask for the one-click approval. "
+    "Also tell the user they can follow their own requests under Settings > "
+    "Access requests in the SynthPulse WebUI. "
+    "Only continue with a fallback after naming this trade-off to the user."
+)
+
+
+def _wait_for_governance_grant(ctx, tool_name, function_args, reason, detail, tool_call_id, session_id):
+    """Park this exact call frame only through a trusted, bounded run waiter.
+
+    No serialized callback, old journal, tool arguments or synthetic prompt is
+    used to restart work. The callback must honor run cancellation and return
+    within 300 seconds. Policy is loaded again before this invocation proceeds.
+    """
+    approved = False
+    released = False
+    operation = {}
+    waiter = None
+    try:
+        from dataclasses import replace
+        from hermes_cli.dashboard_governance.grant_requests import _map_denial, _operation, load_store
+        from hermes_cli.dashboard_governance.context import bind_governance_context
+        from hermes_cli.dashboard_governance.loader import load_governance_policy
+        from hermes_cli.dashboard_governance.resolver import resolve_effective_access
+        from hermes_cli.dashboard_governance.tool_policy import tool_allowed_for_context, tool_arguments_allowed_for_context
+        waiter = getattr(ctx, "approval_waiter", None)
+        policy_path = getattr(ctx, "approval_policy_path", "")
+        mapped = _map_denial(tool_name, reason, detail)
+        if not callable(waiter) or not policy_path or mapped is None:
+            return False
+        email = ctx.access.subject.email.strip().lower()
+        _, operation = _operation(ctx, email, *mapped, tool_name, reason, tool_call_id, session_id, "", time.time())
+        if operation["binding_status"] != "bound" or operation["freshness_status"] != "bound":
+            return False
+        aggregate = load_store().get(f"{email}|{mapped[0]}|{mapped[1]}", {})
+        stored = (aggregate.get("operations") or {}).get(operation["operation_id"])
+        if not isinstance(stored, dict) or any(stored.get(key) != operation.get(key) for key in
+                ("actor_email", "session_id", "request_id", "tool_call_id", "prompt_sha256", "binding_status", "freshness_status")):
+            return False
+        operation = dict(stored)
+        if waiter(operation) is not True:
+            return False
+        approved = True
+        policy = load_governance_policy(path=policy_path)
+        if policy.mode != "enforce":
+            return False
+        fresh_access = resolve_effective_access(policy, ctx.subject)
+        if getattr(ctx, "bot_access_ceiling", None) is not None:
+            checker = getattr(ctx, "bot_access_check", None)
+            if not callable(checker) or checker() is not True:
+                return False
+            role_ceiling = fresh_access.role_ceiling
+            if role_ceiling is not None:
+                role_ceiling = replace(role_ceiling, profiles=role_ceiling.profiles | {ctx.active_profile})
+            fresh_access = replace(fresh_access, profiles=fresh_access.profiles | {ctx.active_profile}, role_ceiling=role_ceiling)
+        fresh = replace(ctx, access=fresh_access)
+        if not fresh.access.is_profile_allowed(ctx.active_profile):
+            return False
+        tool_decision = tool_allowed_for_context(fresh, tool_name, registry)
+        args_decision = tool_arguments_allowed_for_context(fresh, tool_name, function_args)
+        if not tool_decision.allowed or not args_decision.allowed:
+            return False
+        bind_governance_context(fresh)
+        released = True
+        return True
+    except Exception:
+        logger.debug("approval wait or policy revalidation failed", exc_info=True)
+        return False
+    finally:
+        if approved and not released:
+            finish = getattr(waiter, "finish", None)
+            if callable(finish):
+                try:
+                    finish(operation.get("operation_id"), False)
+                except Exception:
+                    pass
+
+
+
+def _governance_denial_payload(ctx, tool_name, reason, detail="", *, tool_call_id="", dispatch_session_id=""):
+    """Shared denial extras: file the request and say who can approve it."""
+    filed = False
+    if str(reason or "").startswith("dwd_identity"):
+        # Identity binding is not a grant an admin can hand out: the fix is
+        # to call the CLI as yourself. Nothing to file, say how to proceed.
+        return {
+            "required_behavior": _DWD_IDENTITY_GUIDANCE,
+            "access_request": "not_applicable",
+        }
+    try:
+        from hermes_cli.dashboard_governance.grant_requests import (
+            approver_emails,
+            record_denial,
+        )
+
+        filed = record_denial(ctx, tool_name, reason, detail, tool_call_id=tool_call_id, dispatch_session_id=dispatch_session_id)
+        approvers = approver_emails() if filed else []
+    except Exception:
+        approvers = []
+    payload = {
+        "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
+        "access_request": "filed" if filed else "none",
+    }
+    if filed:
+        payload["access_request_location"] = (
+            "SynthPulse WebUI > Governance > Approvals tab (kind: Access)"
+        )
+        # Where the requester can watch their own request's status.
+        payload["access_request_self_view"] = (
+            "SynthPulse WebUI > Settings > Access requests"
+        )
+        if approvers:
+            payload["approvers"] = approvers
+    return payload
 
 
 def handle_function_call(
@@ -933,9 +1229,73 @@ def handle_function_call(
         if is_connector_name(function_name) and parse_connector_name(function_name) is None:
             return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__{tool}."))
 
+    _dispatch_decision = _governance_tool_decision(function_name)
+    if _dispatch_decision is not None and not _dispatch_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        _deny_extra = _governance_denial_payload(
+            _governance_ctx, function_name, _dispatch_decision.reason,
+            getattr(_dispatch_decision, "detail", ""),
+            tool_call_id=tool_call_id, dispatch_session_id=session_id,
+        )
+        if _deny_extra.get("access_request") != "filed" or not _wait_for_governance_grant(_governance_ctx, function_name, function_args,
+                                          _dispatch_decision.reason, getattr(_dispatch_decision, "detail", ""),
+                                          tool_call_id, session_id):
+            return json.dumps({
+                "error": f"Tool denied by dashboard governance: {_dispatch_decision.reason}",
+                **_deny_extra,
+                "governance": {
+                    "mode": _governance_mode,
+                    "tool": function_name,
+                    "reason": _dispatch_decision.reason,
+                },
+            }, ensure_ascii=False)
+
     original_args = dict(function_args)
     if not skip_tool_request_middleware:
         function_args, original_args, trace = _apply_request_middleware(function_name, function_args, ids, trace)
+
+    function_args = _normalize_project_file_args(function_name, function_args, task_id)
+
+    _argument_decision = _governance_argument_decision(function_name, function_args)
+    if _argument_decision is not None and not _argument_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        _deny_extra = _governance_denial_payload(
+            _governance_ctx, function_name, _argument_decision.reason,
+            getattr(_argument_decision, "detail", ""),
+            tool_call_id=tool_call_id, dispatch_session_id=session_id,
+        )
+        if _deny_extra.get("access_request") != "filed" or not _wait_for_governance_grant(_governance_ctx, function_name, function_args,
+                                          _argument_decision.reason, getattr(_argument_decision, "detail", ""),
+                                          tool_call_id, session_id):
+            return json.dumps({
+                "error": (
+                    f"Tool denied by dashboard governance: {_argument_decision.reason}"
+                    + (f" ({getattr(_argument_decision, 'detail', '')})" if getattr(_argument_decision, "detail", "") else "")
+                ),
+                **_deny_extra,
+                "governance": {
+                    "mode": _governance_mode,
+                    "tool": function_name,
+                    "reason": _argument_decision.reason,
+                    "detail": getattr(_argument_decision, "detail", ""),
+                },
+            }, ensure_ascii=False)
+
+    _usage_decision = _governance_usage_decision(function_name, function_args)
+    if _usage_decision is not None and not _usage_decision.allowed:
+        _governance_ctx = _current_dashboard_governance_context()
+        _governance_mode = getattr(_governance_ctx.access, "mode", "enforce") if _governance_ctx else "enforce"
+        return json.dumps({
+            "error": f"Tool denied by dashboard governance: {_usage_decision.reason}",
+            "required_behavior": _GOVERNANCE_DENY_GUIDANCE,
+            "governance": {
+                "mode": _governance_mode,
+                "tool": function_name,
+                "reason": _usage_decision.reason,
+            },
+        }, ensure_ascii=False)
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -959,6 +1319,7 @@ def handle_function_call(
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
+        _governance_record_tool_usage(function_name, function_args)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 

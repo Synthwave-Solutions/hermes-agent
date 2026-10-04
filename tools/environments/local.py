@@ -304,7 +304,114 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     # already applies this invariant; Cron scripts use this sanitizer directly (#92998).
     if path_key is not None:
         out[path_key] = _prepend_hermes_bin_dir(fix_path(out.get(path_key, "")))
+    # SynthPulse governance: pin the Google DWD identity to the governed caller and
+    # hand them only the env vars their policy names. Applied to every terminal
+    # spawn surface (foreground _make_run_env and the background/PTY
+    # _sanitize_subprocess_env path); no-op for admins and ungoverned runs.
+    _inject_dwd_identity_env(out)
+    _inject_granted_env_vars(out)
     return _finalize_child_env(out)
+
+
+def _inject_dwd_identity_env(env: dict[str, str]) -> None:
+    """Pin domain-wide delegation to the governed caller for this child.
+
+    The Google CLIs (gchat, gmail, gws-hermes, gdrive-dwd) can act as any
+    mailbox in the domain, and with no ``--as`` they fall back to the owner's
+    own token. The command gate refuses a foreign ``--as``, but an interpreter
+    the user is allowed to run can invoke those CLIs out of its sight, so the
+    identity travels with the process instead: ``hermes_dwd`` turns this value
+    into the address the CLI acts as, and refuses every other one.
+
+    Only set for a governed non-admin under enforce. Admins, report_only and
+    ungoverned runs keep today's behaviour, so the owner's own shell and the
+    crons are untouched. A governed caller whose address cannot be resolved
+    gets a value that can never match an account: fail closed, not fall back.
+    """
+    env.pop("HERMES_DWD_IDENTITY", None)
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return
+        from hermes_cli.dashboard_governance.context import policy_contexts
+        identities = [dwd_identity_for(bound.access) for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
+        identity = next((value for value in identities if value is not None), None)
+        if identity is None:  # admin: unrestricted, same as before
+            return
+        env["HERMES_DWD_IDENTITY"] = identity or "unresolved-identity"
+    except Exception:
+        logger.debug("could not bind DWD identity for subprocess", exc_info=True)
+
+
+def _hermes_dotenv_values(names: set[str]) -> dict[str, str]:
+    """Read exactly the named keys out of the Hermes .env.
+
+    Nothing else is read and nothing is put into this process's own
+    environment, so one person's grant cannot widen what another session
+    sees.
+    """
+    found: dict[str, str] = {}
+    if not names:
+        return found
+    try:
+        from hermes_constants import get_hermes_home
+        path = Path(get_hermes_home()) / ".env"
+    except Exception:
+        path = Path(os.path.expanduser("~/.hermes/.env"))
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return found
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.removeprefix("export ").strip()
+        if key not in names:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        found[key] = value
+    return found
+
+
+def _inject_granted_env_vars(env: dict[str, str]) -> None:
+    """Hand a governed caller the environment variables they were granted.
+
+    The terminal can no longer read the Hermes .env, which is right: it holds
+    every platform key. But some work legitimately needs one of them, so the
+    policy names the variables per person and the value is filled in here for
+    their child processes only. Naming the variable is the authorisation:
+    revocable, visible in the policy, and audited, instead of a file that
+    everyone with a shell could open.
+
+    Admins and ungoverned runs are untouched: they already inherit whatever
+    the parent process carries.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return
+        from hermes_cli.dashboard_governance.context import policy_contexts
+        bounds = [bound for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
+        if not bounds:
+            return
+        names = {str(n).strip() for n in getattr(bounds[0].access.grants, "env_vars", ()) if str(n).strip()}
+        if getattr(ctx, "continuation_contexts", ()):
+            names = {name for name in names if all(bound.access.allows("env_vars", name) for bound in bounds)}
+        if not names:
+            return
+        for key, value in _hermes_dotenv_values(names).items():
+            env.setdefault(key, value)
+    except Exception:
+        logger.debug("could not apply granted env vars for subprocess", exc_info=True)
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:

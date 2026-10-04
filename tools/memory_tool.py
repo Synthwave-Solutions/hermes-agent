@@ -35,13 +35,83 @@ logger = logging.getLogger(__name__)
 _memory_surface_flags: ContextVar[Optional[Tuple[bool, bool]]] = ContextVar("memory_surface_flags", default=None)
 
 
+# SynthPulse private actor scope: a trusted adapter binds the authenticated
+# person's own memories directory (and can disable personal memory entirely for
+# shared conversations). Context-local, so concurrent sessions never mix.
+_personal_memory_dir: ContextVar[Optional[Path]] = ContextVar("personal_memory_dir", default=None)
+_personal_memory_disabled: ContextVar[bool] = ContextVar("personal_memory_disabled", default=False)
+
+
+def bind_personal_memory_dir(path: Path, *, enabled: bool = True):
+    """Bind a trusted adapter-owned scope; never accept model/tool arguments here."""
+    root = Path(path)
+    if not root.is_absolute():
+        raise ValueError("Personal memory directory must be absolute")
+    if any(part.is_symlink() for part in (root, *root.parents)):
+        raise PermissionError("Personal memory directory cannot contain symlinks")
+    return (_personal_memory_dir.set(root), _personal_memory_disabled.set(not enabled))
+
+
+def personal_memory_scope_active():
+    return _personal_memory_dir.get() is not None
+
+
+def reset_personal_memory_dir(token):
+    _personal_memory_disabled.reset(token[1])
+    _personal_memory_dir.reset(token[0])
+
+
 def get_memory_dir() -> Path:
-    """Profile-scoped memories dir, resolved per call (HERMES_HOME may switch after import)."""
-    return get_hermes_home() / "memories"
+    """Profile-scoped memories dir, resolved per call (HERMES_HOME may switch after import).
+    An authenticated adapter scope wins over a shared bot's home."""
+    return _personal_memory_dir.get() or (get_hermes_home() / "memories")
 
 
 from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
-    ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, MemoryStore, _scan_memory_content)
+    ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, _scan_memory_content)
+from tools.memory_tool_store import MemoryStore as _BaseMemoryStore  # noqa: E402
+
+
+class MemoryStore(_BaseMemoryStore):
+    """Built-in memory store pinned to the personal scope bound at construction.
+
+    The upstream store resolves ``get_memory_dir()`` on every call; a store
+    created inside an authenticated actor scope must keep reading and writing
+    that actor's files even when later used outside the scope (another thread,
+    a background review), so the bound directory is captured here. Bound
+    directories and memory files may not be symlinks. Constructing a store while
+    personal memory is disabled (shared conversations) fails closed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        if _personal_memory_disabled.get():
+            raise PermissionError("Personal memory is unavailable in shared conversations")
+        self._bound_memory_dir = _personal_memory_dir.get()
+        super().__init__(*args, **kwargs)
+
+    def _memory_directory(self) -> Path:
+        root = self._bound_memory_dir
+        if root is None:
+            from tools import memory_tool as _mt  # get_memory_dir is monkeypatched there (as in the base)
+            return _mt.get_memory_dir()
+        if any(p.is_symlink() for p in (root, *root.parents)):
+            raise PermissionError("Personal memory directory cannot contain symlinks")
+        return root
+
+    def _path_for(self, target: str) -> Path:
+        path = self._memory_directory() / ("USER.md" if target == "user" else "MEMORY.md")
+        if self._bound_memory_dir and path.is_symlink():
+            raise PermissionError("Personal memory file cannot be a symlink")
+        return path
+
+    def save_to_disk(self, target: str):
+        """Persist the live entries for *target* (fork API kept for callers/tests)."""
+        path = self._path_for(target)
+        from hermes_constants import mkdir_under_hermes_home
+
+        mkdir_under_hermes_home(path.parent)
+        with self._file_lock(path):
+            self._write_file(path, self._entries_for(target))
 
 
 def load_on_disk_store() -> "MemoryStore":
@@ -279,6 +349,8 @@ def get_builtin_memory_config(config: Optional[Dict[str, Any]] = None) -> Dict[s
 
 def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> Tuple[bool, bool]:
     """Return ``(memory_enabled, user_profile_enabled)`` from resolved config."""
+    if _personal_memory_disabled.get():
+        return False, False
     section = get_builtin_memory_config(config)
     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
 
@@ -436,3 +508,19 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides)
+
+
+def require_personal_file_access(path):
+    """Protect private documents in file tools, without claiming a host sandbox."""
+    scope = _personal_memory_dir.get()
+    if scope is None:
+        return
+    # Adapter layout: <personal root>/<actor>/memories.
+    own = scope.parent.resolve()
+    private_root = own.parent
+    target = Path(path).resolve()
+    if target == private_root or private_root.is_relative_to(target):
+        raise PermissionError("File access would include private personal context")
+    if target.is_relative_to(private_root):
+        if _personal_memory_disabled.get() or not target.is_relative_to(own):
+            raise PermissionError("Personal context is private to its authenticated owner")

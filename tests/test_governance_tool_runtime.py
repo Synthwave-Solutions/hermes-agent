@@ -1,0 +1,1402 @@
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+import model_tools
+from hermes_cli.dashboard_governance.models import EffectiveAccess, GovernanceSubject, GrantSet
+
+
+def _access(
+    *,
+    mode: str = "enforce",
+    tools=(),
+    toolsets=(),
+    mcp_servers=(),
+    mcp_tools=None,
+    file_read_roots=(),
+    file_write_roots=(),
+    file_denied_globs=(),
+    cli_commands=(),
+    cli_workdir_roots=(),
+    usage_caps=None,
+) -> EffectiveAccess:
+    grants = GrantSet(
+        tools=frozenset(tools),
+        toolsets=frozenset(toolsets),
+        mcp_servers=frozenset(mcp_servers),
+        mcp_tools={key: frozenset(value) for key, value in (mcp_tools or {}).items()},
+        file_read_roots=frozenset(file_read_roots),
+        file_write_roots=frozenset(file_write_roots),
+        file_denied_globs=frozenset(file_denied_globs),
+        cli_commands=frozenset(cli_commands),
+        cli_workdir_roots=frozenset(cli_workdir_roots),
+        usage_caps=dict(usage_caps or {}),
+    )
+    return EffectiveAccess(
+        subject=GovernanceSubject(email="operator@example.test"),
+        mode=mode,
+        grants=grants,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _clear_tool_defs_cache():
+    model_tools._clear_tool_defs_cache()
+    yield
+    model_tools._clear_tool_defs_cache()
+
+
+def _tool(name: str):
+    return {"type": "function", "function": {"name": name, "description": f"{name} tool"}}
+
+
+class TestDashboardGovernanceContext:
+    def test_contextvar_binding_restores_previous_context(self):
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext,
+            current_governance_context,
+            governance_context,
+        )
+
+        first = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="first@example.test"),
+            access=_access(tools=["read_file"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        second = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="second@example.test"),
+            access=_access(tools=["terminal"]),
+            active_profile="ops",
+            session_id="session-2",
+            request_id="request-2",
+        )
+
+        assert current_governance_context() is None
+        with governance_context(first):
+            assert current_governance_context() is first
+            with governance_context(second):
+                assert current_governance_context() is second
+            assert current_governance_context() is first
+        assert current_governance_context() is None
+
+    def test_env_payload_rehydrates_context_for_subprocesses(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext,
+            GOVERNANCE_CONTEXT_ENV,
+            current_governance_context,
+            serialize_context_for_env,
+        )
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["read_file"], toolsets=["web"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setenv(GOVERNANCE_CONTEXT_ENV, serialize_context_for_env(ctx))
+
+        restored = current_governance_context()
+        assert restored is not None
+        assert restored.access.mode == "enforce"
+        assert restored.access.grants.tools == frozenset({"read_file"})
+        assert restored.access.grants.toolsets == frozenset({"web"})
+        assert restored.subject.email == "operator@example.test"
+
+
+class TestGovernanceToolSchemaFiltering:
+    def test_enforce_mode_filters_model_tool_schemas_to_allowed_tools(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setattr(
+            model_tools.registry,
+            "get_definitions",
+            lambda names, quiet=True: [_tool(name) for name in sorted(names)],
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "file" if name == "read_file" else "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset=model_tools.registry.get_toolset_for_tool(name)))
+        monkeypatch.setattr("model_tools.resolve_toolset", lambda name: {"read_file", "terminal"} if name == "mixed" else set())
+        monkeypatch.setattr("model_tools.validate_toolset", lambda name: name == "mixed")
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["read_file"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        with governance_context(ctx):
+            defs = model_tools.get_tool_definitions(enabled_toolsets=["mixed"], quiet_mode=True)
+
+        names = {tool["function"]["name"] for tool in defs}
+        assert names == {"read_file"}
+
+    def test_enforce_mode_allows_tools_by_allowed_toolset(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setattr(
+            model_tools.registry,
+            "get_definitions",
+            lambda names, quiet=True: [_tool(name) for name in sorted(names)],
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr("model_tools.resolve_toolset", lambda name: {"terminal"} if name == "terminal" else set())
+        monkeypatch.setattr("model_tools.validate_toolset", lambda name: name == "terminal")
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(toolsets=["terminal"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        with governance_context(ctx):
+            defs = model_tools.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+
+        assert [tool["function"]["name"] for tool in defs] == ["terminal"]
+
+    def test_report_only_mode_does_not_filter_schemas(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setattr(
+            model_tools.registry,
+            "get_definitions",
+            lambda names, quiet=True: [_tool(name) for name in sorted(names)],
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "file")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="file", schema={}))
+        monkeypatch.setattr("model_tools.resolve_toolset", lambda name: {"read_file", "write_file"} if name == "file" else set())
+        monkeypatch.setattr("model_tools.validate_toolset", lambda name: name == "file")
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(mode="report_only"),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        with governance_context(ctx):
+            defs = model_tools.get_tool_definitions(enabled_toolsets=["file"], quiet_mode=True)
+
+        names = {tool["function"]["name"] for tool in defs}
+        assert names == {"read_file", "write_file"}
+
+
+class TestGovernanceToolDispatch:
+    def test_enforce_mode_blocks_disallowed_tool_before_hooks_and_dispatch(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["read_file"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hook should not fire")))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("terminal", {"command": "pwd"}))
+
+        assert result["error"] == "Tool denied by dashboard governance: tool_not_allowed"
+        assert result["governance"]["mode"] == "enforce"
+        assert result["governance"]["tool"] == "terminal"
+
+    def test_enforce_mode_allows_explicitly_granted_tool(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["web_search"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "web")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="web", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("web_search", {"query": "test"}))
+
+        assert result == {"ok": True}
+
+    def test_enforce_mode_blocks_write_file_outside_write_root(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        allowed_root = tmp_path / "allowed"
+        allowed_root.mkdir()
+        outside = tmp_path / "outside.txt"
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["write_file"], file_write_roots=[str(allowed_root)]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "file")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="file", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("write_file", {"path": str(outside), "content": "x"}))
+
+        assert result["error"].startswith("Tool denied by dashboard governance: file_write_root_not_allowed")
+        assert result["governance"]["tool"] == "write_file"
+
+    def test_enforce_mode_blocks_terminal_command_not_in_allowlist(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["terminal"], cli_commands=["git"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("terminal", {"command": "rm -rf /tmp/nope"}))
+
+        assert result["error"].startswith("Tool denied by dashboard governance: cli_command_not_allowed")
+        assert result["governance"]["tool"] == "terminal"
+
+    def test_enforce_mode_blocks_shell_operator_even_for_allowed_command(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["terminal"], cli_commands=["git"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("terminal", {"command": "git status && rm -rf /tmp/nope"}))
+
+        assert result["error"].startswith("Tool denied by dashboard governance: cli_command_not_allowed")
+        assert result["governance"]["tool"] == "terminal"
+
+    def test_enforce_mode_checks_arguments_after_request_middleware_rewrite(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["terminal"], cli_commands=["git"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "terminal")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="terminal", schema={}))
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda tool_name, args, **context: SimpleNamespace(
+                payload={"command": "git status && rm -rf /tmp/nope"},
+                original_payload=args,
+                changed=True,
+                trace=[{"source": "test-middleware", "reason": "rewrite"}],
+            ),
+        )
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("terminal", {"command": "git status"}))
+
+        assert result["error"].startswith("Tool denied by dashboard governance: cli_command_not_allowed")
+        assert result["governance"]["tool"] == "terminal"
+
+    def test_enforce_mode_blocks_tool_call_after_daily_cap(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["web_search"], usage_caps={"daily_tool_calls": 1}),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "web")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="web", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            first = json.loads(model_tools.handle_function_call("web_search", {"query": "one"}))
+            second = json.loads(model_tools.handle_function_call("web_search", {"query": "two"}))
+
+        assert first == {"ok": True}
+        assert second["error"] == "Tool denied by dashboard governance: daily_tool_calls_exceeded"
+        assert second["governance"]["tool"] == "web_search"
+
+    def test_usage_cap_slot_reserved_before_dispatch(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(tools=["web_search"], usage_caps={"daily_tool_calls": 1}),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "web")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="web", schema={}))
+        seen = []
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda name, args, **kwargs: seen.append((name, args)) or json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            first = json.loads(model_tools.handle_function_call("web_search", {"query": "first"}))
+            second = json.loads(model_tools.handle_function_call("web_search", {"query": "second"}))
+
+        assert first == {"ok": True}
+        assert second["error"] == "Tool denied by dashboard governance: daily_tool_calls_exceeded"
+        assert seen == [("web_search", {"query": "first"})]
+
+    def test_enforce_mode_blocks_file_write_after_daily_cap(self, monkeypatch, tmp_path):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        allowed_root = tmp_path / "allowed"
+        allowed_root.mkdir()
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(
+                tools=["write_file"],
+                file_write_roots=[str(allowed_root)],
+                usage_caps={"daily_file_writes": 1},
+            ),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "file")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="file", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            first = json.loads(model_tools.handle_function_call("write_file", {"path": str(allowed_root / "one.txt"), "content": "x"}))
+            second = json.loads(model_tools.handle_function_call("write_file", {"path": str(allowed_root / "two.txt"), "content": "x"}))
+
+        assert first == {"ok": True}
+        assert second["error"] == "Tool denied by dashboard governance: daily_file_writes_exceeded"
+        assert second["governance"]["tool"] == "write_file"
+
+    def test_enforce_mode_requires_mcp_server_and_tool_allowlist(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(toolsets=["mcp-github"], mcp_servers=["github"], mcp_tools={"github": ["list_issues"]}),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "mcp-github")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="mcp-github", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: json.dumps({"ok": True}))
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with governance_context(ctx):
+            allowed = json.loads(model_tools.handle_function_call("mcp_github_list_issues", {}))
+            denied = json.loads(model_tools.handle_function_call("mcp_github_delete_repo", {}))
+
+        assert allowed == {"ok": True}
+        assert denied["error"] == "Tool denied by dashboard governance: tool_not_allowed"
+
+    def test_mcp_toolset_grant_alone_does_not_bypass_mcp_policy(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=_access(toolsets=["mcp-github"]),
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "mcp-github")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="mcp-github", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("mcp_github_list_issues", {}))
+
+        assert result["error"] == "Tool denied by dashboard governance: tool_not_allowed"
+
+    def test_skill_view_requires_skill_name_grant(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        grants = GrantSet(tools=frozenset({"skill_view"}), skills_view=frozenset({"allowed-skill"}))
+        access = EffectiveAccess(subject=GovernanceSubject(email="operator@example.test"), mode="enforce", grants=grants)
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=access,
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "skills")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="skills", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("skill_view", {"name": "blocked-skill"}))
+
+        assert result["error"].startswith("Tool denied by dashboard governance: skill_not_allowed")
+
+    def test_skill_manage_requires_manage_grant(self, monkeypatch):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
+
+        grants = GrantSet(tools=frozenset({"skill_manage"}), skills_manage=frozenset({"allowed-skill"}))
+        access = EffectiveAccess(subject=GovernanceSubject(email="operator@example.test"), mode="enforce", grants=grants)
+        ctx = DashboardGovernanceContext(
+            subject=GovernanceSubject(email="operator@example.test"),
+            access=access,
+            active_profile="default",
+            session_id="session-1",
+            request_id="request-1",
+        )
+        monkeypatch.setattr(model_tools.registry, "get_toolset_for_tool", lambda name: "skills")
+        monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: SimpleNamespace(toolset="skills", schema={}))
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch should not run")))
+
+        with governance_context(ctx):
+            result = json.loads(model_tools.handle_function_call("skill_manage", {"name": "blocked-skill", "action": "patch"}))
+
+        assert result["error"].startswith("Tool denied by dashboard governance: skill_manage_not_allowed")
+
+
+class TestHeredocBodiesAreData:
+    """A heredoc body is stdin for one command, not a list of commands.
+
+    Reported by Hrishikesh Oemraw on 28 Aug 2026: every request came back as a
+    governance denial. His agent ran an ordinary python heredoc whose body held
+    `d=json.load(r); print('URL',u)`; the gate split on that semicolon and
+    refused the fragment as cli_command_not_allowed (print(URL,u)). The same
+    shape blocked every governed user, since agents write python this way.
+    """
+
+    def _decide(self, command: str):
+        from hermes_cli.dashboard_governance.tool_policy import _check_cli_command
+
+        return _check_cli_command(command, _access(cli_commands=("python3", "cat", "grep", "git")).grants)
+
+    def test_the_exact_command_that_was_refused_is_allowed(self):
+        command = (
+            "python3 - <<'PY'\n"
+            "import json,urllib.request\n"
+            "for u in ['a','b']:\n"
+            " with urllib.request.urlopen(u) as r:\n"
+            "  d=json.load(r); print('URL',u)\n"
+            "PY"
+        )
+        assert self._decide(command).allowed is True
+
+    @pytest.mark.parametrize("body", ["x = a | b", "a and b; c", "d && e", "s = 'x' # ;|&"])
+    def test_shell_operators_inside_a_body_are_text(self, body):
+        assert self._decide(f"python3 - <<'PY'\n{body}\nPY").allowed is True
+
+    def test_a_bare_delimiter_still_gates_what_the_shell_would_run(self):
+        """<<PY expands, so a substitution in the body is a real command."""
+        decision = self._decide("cat <<PY\n$(rm -rf /x)\nPY")
+        assert decision.allowed is False
+        assert decision.detail == "rm"
+
+    def test_a_quoted_delimiter_makes_the_same_text_literal(self):
+        assert self._decide("python3 - <<'PY'\ns = '$(rm -rf /x)'\nPY").allowed is True
+
+    def test_a_command_word_before_the_heredoc_is_still_checked(self):
+        assert self._decide("nmap - <<'PY'\nprint(1)\nPY").allowed is False
+
+    def test_a_herestring_is_not_a_heredoc(self):
+        assert self._decide("grep foo <<< 'bar'").allowed is True
+
+    def test_backticks_and_process_substitution_stay_refused(self):
+        assert self._decide("echo `rm -rf /x`").allowed is False
+        assert self._decide("cat <(rm -rf /x)").allowed is False
+
+    def test_an_ordinary_compound_command_is_unchanged(self):
+        assert self._decide("git status && rm -rf /x").allowed is False
+        assert self._decide("cat a.txt | grep b").allowed is True
+
+
+class TestDwdIdentityBinding:
+    """Hard requirement 29-08-2026: a governed non-admin may only drive their
+    OWN Google Workspace account. Every gchat/gmail/gws-hermes/gdrive-dwd call
+    must carry `--as <own email>`; without it the CLI would run on the owner's
+    token (as Michael), with another address it would impersonate someone."""
+
+    ME = "stephen@synthwave.solutions"
+
+    def _access(self, *, roles=("tech_lead",), sources=(), email=ME, cli=("gchat", "gmail", "gws-hermes", "git", "echo", "head")):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode="enforce",
+            roles=frozenset(roles),
+            grants=GrantSet(cli_commands=frozenset(cli)),
+            grant_sources=tuple(sources),
+        )
+
+    def _decide(self, access, command):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "terminal", {"command": command})
+
+    def test_send_without_as_is_refused(self):
+        d = self._decide(self._access(), "gchat send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_required" and d.detail == "gchat"
+
+    def test_read_without_as_is_refused_too(self):
+        d = self._decide(self._access(), "gchat messages --space spaces/x --limit 5")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+
+    def test_as_self_is_allowed(self):
+        assert self._decide(self._access(), f"gchat --as {self.ME} send --space spaces/x --text hi").allowed
+        assert self._decide(self._access(), f"gmail --as={self.ME} list --limit 3").allowed
+        assert self._decide(self._access(), f"gws-hermes --as {self.ME} gmail messages list").allowed
+
+    def test_as_self_is_case_insensitive(self):
+        assert self._decide(self._access(), "gchat --as Stephen@Synthwave.Solutions spaces").allowed
+
+    def test_as_someone_else_is_refused(self):
+        d = self._decide(self._access(), "gchat --as michael@synthwave.solutions send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_mismatch"
+        assert d.detail == "gchat --as michael@synthwave.solutions"
+
+    def test_dangling_as_is_refused(self):
+        assert not self._decide(self._access(), "gmail --as").allowed
+
+    def test_env_prefix_cannot_substitute_for_as(self):
+        # gchat honours GCHAT_WRITE_AS only when --as is absent; the gate still
+        # demands an explicit --as self, so the env prefix buys nothing.
+        d = self._decide(self._access(), "GCHAT_WRITE_AS=michael@synthwave.solutions gchat send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+        assert self._decide(self._access(), f"GCHAT_WRITE_AS=x gchat --as {self.ME} send --space spaces/x --text hi").allowed
+
+    def test_every_segment_is_checked(self):
+        assert self._decide(self._access(), f"git status && gchat --as {self.ME} spaces").allowed
+        d = self._decide(self._access(), f"gchat --as {self.ME} spaces; gmail list")
+        assert not d.allowed and d.detail == "gmail"
+
+    def test_command_substitution_and_heredoc_are_checked(self):
+        assert not self._decide(self._access(), "echo $(gchat spaces)").allowed
+        assert not self._decide(self._access(), "cat <<EOF\n$(gmail list)\nEOF").allowed
+        assert self._decide(self._access(), f"echo $(gchat --as {self.ME} spaces)").allowed
+
+    def test_full_path_invocation_is_checked(self):
+        d = self._decide(self._access(cli=("*",)), "/home/synthwavehq/.local/bin/gchat send --space spaces/x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+
+    def test_wildcard_cli_grant_does_not_lift_the_binding(self):
+        d = self._decide(self._access(cli=("*",)), "gmail send --to a@b.nl --subject s --text t")
+        assert not d.allowed and d.reason == "dwd_identity_required"
+
+    def test_unknown_identity_fails_closed(self):
+        d = self._decide(self._access(email=""), "gchat --as stephen@synthwave.solutions spaces")
+        assert not d.allowed and d.reason == "dwd_identity_mismatch"
+
+    def test_bootstrap_admin_is_unrestricted(self):
+        a = self._access(email="michael@synthwave.solutions", roles=(), sources=("bootstrap_admin",), cli=("*",))
+        assert self._decide(a, "gchat send --space spaces/x --text hi").allowed
+        assert self._decide(a, "gmail --as info@synthwave.solutions list").allowed
+
+    def test_owner_and_admin_roles_are_unrestricted(self):
+        for role in ("owner", "admin"):
+            a = self._access(email="yaser@synthwave.solutions", roles=(role,), cli=("*",))
+            assert self._decide(a, "gchat --as odis@synthwave.solutions spaces").allowed
+
+    def test_non_dwd_commands_are_untouched(self):
+        assert self._decide(self._access(), "git log --oneline -3 | head").allowed
+        assert self._decide(self._access(), "echo --as nobody@x.nl").allowed
+
+    def test_governance_off_is_untouched(self):
+        a = EffectiveAccess(subject=GovernanceSubject(email=self.ME), mode="report_only", grants=GrantSet())
+        assert self._decide(a, "gchat send --space spaces/x --text hi").allowed
+
+    def test_model_tools_denial_gives_the_fix_and_files_nothing(self):
+        payload = model_tools._governance_denial_payload(None, "terminal", "dwd_identity_required", "gchat")
+        assert payload["access_request"] == "not_applicable"
+        assert "--as" in payload["required_behavior"]
+
+
+class TestSecretsAreOutOfShellReach:
+    """29-08-2026: the file tools honoured denied_globs, the terminal did not,
+    so a governed user could `cat` the domain-wide-delegation key that
+    read_file refused them. Every path in a command line is now checked, and
+    the per-person allow_globs exception still opens one named file."""
+
+    KEY = "/home/synthwavehq/.hermes/gmail-dwd-sa.json"
+
+    def _access(self, *, allow=(), cli=("cat", "cp", "grep", "ls", "python3", "git")):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email="stephen@synthwave.solutions"),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            grants=GrantSet(
+                cli_commands=frozenset(cli),
+                file_denied_globs=frozenset({"**/.env", "**/*-sa.json", "**/.hermes/**"}),
+                file_allow_globs=frozenset(allow),
+            ),
+        )
+
+    def _decide(self, access, command):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "terminal", {"command": command})
+
+    def test_reading_the_delegation_key_is_refused(self):
+        d = self._decide(self._access(), f"cat {self.KEY}")
+        assert not d.allowed and d.reason == "file_denied_glob" and d.detail == self.KEY
+
+    def test_tilde_path_is_refused(self):
+        assert not self._decide(self._access(), "cat ~/.hermes/gmail-dwd-sa.json").allowed
+
+    def test_a_path_quoted_inside_an_interpreter_argument_is_refused(self):
+        d = self._decide(self._access(), f"python3 -c \"print(open('{self.KEY}').read())\"")
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_copying_it_out_is_refused(self):
+        assert not self._decide(self._access(), f"cp {self.KEY} /tmp/k.json").allowed
+
+    def test_dotenv_files_are_refused(self):
+        assert not self._decide(self._access(), "cat /home/synthwavehq/clients/peterson/.env").allowed
+
+    def test_ordinary_client_work_still_runs(self):
+        assert self._decide(self._access(), "git -C /home/synthwavehq/clients/adams status").allowed
+        assert self._decide(self._access(), "grep -rn TODO /home/synthwavehq/clients/360kas/src").allowed
+
+    def test_a_granted_exception_opens_exactly_that_file(self):
+        access = self._access(allow={"/home/synthwavehq/.hermes/skills/x/notify.py"})
+        assert self._decide(access, "cat /home/synthwavehq/.hermes/skills/x/notify.py").allowed
+        assert not self._decide(access, f"cat {self.KEY}").allowed
+
+    def test_a_caller_without_denied_globs_is_unchanged(self):
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email="stephen@synthwave.solutions"),
+            mode="enforce",
+            grants=GrantSet(cli_commands=frozenset({"cat"})),
+        )
+        assert self._decide(access, f"cat {self.KEY}").allowed
+
+
+class TestIdentityBindingCannotBeShakenOff:
+    """The identity that pins the Google CLIs travels in the child process
+    environment, so the gate refuses both the wrapper words that used to hide
+    the real command and any attempt to name that variable."""
+
+    ME = "stephen@synthwave.solutions"
+
+    def _access(self, cli=("gchat", "env", "command", "time", "echo")):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            grants=GrantSet(cli_commands=frozenset(cli)),
+        )
+
+    def _decide(self, command, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), "terminal", {"command": command})
+
+    def test_command_wrapper_no_longer_hides_the_call(self):
+        d = self._decide("command gchat --as michael@synthwave.solutions spaces")
+        assert not d.allowed and d.reason == "dwd_identity_mismatch"
+
+    def test_time_wrapper_no_longer_hides_the_call(self):
+        assert not self._decide("time gchat --as michael@synthwave.solutions spaces").allowed
+
+    def test_wrapper_still_passes_an_allowed_call_through(self):
+        assert self._decide(f"command gchat --as {self.ME} spaces").allowed
+
+    def test_a_wrapped_command_outside_the_allowlist_is_still_refused(self):
+        d = self._decide("command curl https://example.com")
+        assert not d.allowed and d.reason == "cli_command_not_allowed"
+
+    def test_clearing_the_identity_variable_is_refused(self):
+        d = self._decide("HERMES_DWD_IDENTITY= gchat send --space x --text hi")
+        assert not d.allowed and d.reason == "dwd_identity_tamper"
+
+    def test_unsetting_the_identity_variable_is_refused(self):
+        assert not self._decide("env -u HERMES_DWD_IDENTITY gchat spaces").allowed
+
+    def test_admins_are_not_bound_and_may_name_the_variable(self):
+        admin = EffectiveAccess(
+            subject=GovernanceSubject(email="michael@synthwave.solutions"),
+            mode="enforce",
+            roles=frozenset({"owner", "admin"}),
+            grants=GrantSet(cli_commands=frozenset({"echo"})),
+            grant_sources=("bootstrap_admin",),
+        )
+        assert self._decide("echo $HERMES_DWD_IDENTITY", access=admin).allowed
+
+
+class TestGrantedEnvVarsReachTheShell:
+    """The terminal can no longer read the Hermes .env, so a person who needs
+    one platform key gets that variable name granted and the value is filled
+    in for their child processes only. Naming the variable is the
+    authorisation: revocable, per person, and visible in the policy."""
+
+    def _bind(self, grants, mode="enforce", email="stephen@synthwave.solutions", roles=("tech_lead",), sources=()):
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext, bind_governance_context, reset_governance_context)
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode=mode,
+            roles=frozenset(roles),
+            grants=grants,
+            grant_sources=tuple(sources),
+        )
+        ctx = DashboardGovernanceContext(subject=access.subject, access=access)
+        return bind_governance_context(ctx), reset_governance_context
+
+    def _child_env(self, dotenv, grants, **kw):
+        from unittest.mock import patch
+        from tools.environments import local
+        token, reset = self._bind(grants, **kw)
+        try:
+            with patch.object(local, "_hermes_dotenv_values",
+                              lambda names: {k: v for k, v in dotenv.items() if k in names}):
+                return local._sanitize_subprocess_env({"PATH": "/usr/bin"})
+        finally:
+            reset(token)
+
+    DOTENV = {"OMNIROUTE_API_KEY": "sk-omni", "NOTION_API_KEY": "ntn-x", "STRIPE_SECRET": "sk-live"}
+
+    def test_a_granted_variable_arrives_with_its_value(self):
+        env = self._child_env(self.DOTENV, GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
+        assert env["OMNIROUTE_API_KEY"] == "sk-omni"
+
+    def test_only_the_granted_names_arrive(self):
+        env = self._child_env(self.DOTENV, GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
+        assert "NOTION_API_KEY" not in env and "STRIPE_SECRET" not in env
+
+    def test_without_the_grant_nothing_arrives(self):
+        env = self._child_env(self.DOTENV, GrantSet())
+        assert not ({"OMNIROUTE_API_KEY", "NOTION_API_KEY", "STRIPE_SECRET"} & set(env))
+
+    def test_report_only_does_not_hand_out_secrets(self):
+        env = self._child_env(self.DOTENV, GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})), mode="report_only")
+        assert "OMNIROUTE_API_KEY" not in env
+
+    def test_an_inherited_value_is_not_overwritten(self):
+        from unittest.mock import patch
+        from tools.environments import local
+        token, reset = self._bind(GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
+        try:
+            with patch.object(local, "_hermes_dotenv_values", lambda names: {"OMNIROUTE_API_KEY": "from-dotenv"}):
+                env = local._sanitize_subprocess_env({"PATH": "/usr/bin", "OMNIROUTE_API_KEY": "already-set"})
+        finally:
+            reset(token)
+        assert env["OMNIROUTE_API_KEY"] == "already-set"
+
+    def test_the_grant_round_trips_through_the_policy_and_the_bridge(self):
+        from hermes_cli.dashboard_governance.context import (
+            serialize_context_for_env, context_from_env_payload, DashboardGovernanceContext)
+        grants = GrantSet.from_mapping({"env": {"vars": ["OMNIROUTE_API_KEY"]}})
+        assert grants.env_vars == frozenset({"OMNIROUTE_API_KEY"})
+        access = EffectiveAccess(subject=GovernanceSubject(email="x@y.z"), mode="enforce", grants=grants)
+        payload = serialize_context_for_env(DashboardGovernanceContext(subject=access.subject, access=access))
+        assert context_from_env_payload(payload).access.grants.env_vars == frozenset({"OMNIROUTE_API_KEY"})
+
+
+class TestCronJobsCarryTheirOwner:
+    """A cron job outlives the conversation that made it. Without an owner the
+    fire has no identity and acts with the platform owner's full rights, so a
+    governed user could reach every Google account in the domain through a job
+    they scheduled."""
+
+    def _ctx(self, email, roles=("tech_lead",), sources=(), mode="enforce"):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode=mode,
+            roles=frozenset(roles),
+            grants=GrantSet(),
+            grant_sources=tuple(sources),
+        )
+        return DashboardGovernanceContext(subject=access.subject, access=access)
+
+    def _creating_owner(self, ctx):
+        from unittest.mock import patch
+        from hermes_cli.dashboard_governance import context as gov_context
+        from cron.jobs import _creating_owner_email
+        with patch.object(gov_context, "current_governance_context", lambda: ctx):
+            return _creating_owner_email()
+
+    def test_a_governed_user_stamps_their_address_on_the_job(self):
+        assert self._creating_owner(self._ctx("stephen@synthwave.solutions")) == "stephen@synthwave.solutions"
+
+    def test_an_admin_leaves_the_job_ownerless_as_before(self):
+        ctx = self._ctx("michael@synthwave.solutions", roles=("owner", "admin"), sources=("bootstrap_admin",))
+        assert self._creating_owner(ctx) == ""
+
+    def test_an_ungoverned_create_leaves_the_job_ownerless(self):
+        assert self._creating_owner(None) == ""
+
+    def test_report_only_does_not_stamp_an_owner(self):
+        assert self._creating_owner(self._ctx("stephen@synthwave.solutions", mode="report_only")) == ""
+
+    def test_a_governed_session_without_an_address_cannot_schedule_at_all(self):
+        """An ownerless job from a governed session would run unbound, which is
+        the hole itself. Refuse the create rather than write one."""
+        import pytest as _pytest
+        with _pytest.raises(ValueError):
+            self._creating_owner(self._ctx(""))
+
+    def test_a_fire_runs_under_the_owner_and_unbinds_afterwards(self):
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        with _governed_as_job_owner({"id": "j1", "owner_email": "stephen@synthwave.solutions"}):
+            bound = current_governance_context()
+            assert bound is not None and bound.access.subject.email == "stephen@synthwave.solutions"
+        assert current_governance_context() is None
+
+    def test_an_ownerless_job_still_runs_unbound(self):
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        with _governed_as_job_owner({"id": "j2"}):
+            assert current_governance_context() is None
+
+    def test_the_fire_cannot_act_as_someone_else(self):
+        """The whole point of the owner: the job may only drive the account of
+        the person who scheduled it, exactly like their own session."""
+        from unittest.mock import patch
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance import loader, resolver
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+
+        granted = EffectiveAccess(
+            subject=GovernanceSubject(email="stephen@synthwave.solutions"),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            grants=GrantSet(cli_commands=frozenset({"gchat"})),
+        )
+        with patch.object(loader, "load_governance_policy", lambda *a, **k: object()), \
+                patch.object(resolver, "resolve_effective_access", lambda *a, **k: granted):
+            with _governed_as_job_owner({"id": "j3", "owner_email": "stephen@synthwave.solutions"}):
+                access = current_governance_context().access
+                refused = decide_tool_argument_access(
+                    access, "terminal",
+                    {"command": "gchat --as michael@synthwave.solutions send --space x --text hi"})
+                allowed = decide_tool_argument_access(
+                    access, "terminal",
+                    {"command": "gchat --as stephen@synthwave.solutions send --space x --text hi"})
+        assert not refused.allowed and refused.reason == "dwd_identity_mismatch"
+        assert allowed.allowed
+
+
+class TestPerPersonCliDeny:
+    """A per-person CLI deny has to bite through a wildcard grant.
+
+    Requested 02-09-2026: one colleague gets full administrator capability
+    except the bank CLI. Without this the only way to keep one command away
+    from a wildcard grant was to withdraw the wildcard and enumerate every
+    other command, so the deny was written into the policy and silently did
+    nothing.
+    """
+
+    @staticmethod
+    def _access(*, cli=("*",), denied=("bunq",)):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email="delivery@example.test"),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset(cli),
+                cli_denied_commands=frozenset(denied),
+            ),
+        )
+
+    def _check(self, command, **kwargs):
+        from hermes_cli.dashboard_governance.tool_policy import _check_cli_command
+        return _check_cli_command(command, self._access(**kwargs).grants)
+
+    def test_denied_command_refused_despite_wildcard(self):
+        decision = self._check("bunq balance")
+        assert not decision.allowed
+        assert decision.reason == "cli_command_denied"
+        assert decision.detail == "bunq"
+
+    def test_denied_command_refused_behind_an_absolute_path(self):
+        assert not self._check("/home/someone/.local/bin/bunq payments").allowed
+
+    def test_denied_command_refused_in_a_later_segment(self):
+        assert not self._check("git status; bunq accounts list").allowed
+
+    def test_denied_command_refused_inside_command_substitution(self):
+        assert not self._check("echo $(bunq balance)").allowed
+
+    def test_other_commands_still_run_on_the_wildcard(self):
+        assert self._check("git status").allowed
+
+    def test_allowlist_still_applies_when_nothing_is_denied(self):
+        assert self._check("git status", cli=("git",), denied=()).allowed
+        assert not self._check("bunq balance", cli=("git",), denied=()).allowed
+
+
+class TestDeliveryLeadActsForColleagues:
+    """admin_delivery drives every colleague's Workspace account.
+
+    Michael, 02-09-2026: Hrishi reads everyone's mail, Chat and calendar
+    "net zoals wij als admins". The identity binding built on 29-08 stays in
+    force for every other governed role, so this is a deliberate exemption for
+    one named role and not a hole in the gate.
+    """
+
+    ME = "hrishikesh@synthwave.solutions"
+    OTHER = "michael@synthwave.solutions"
+
+    def _access(self, *, roles):
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset(roles),
+            grants=GrantSet(cli_commands=frozenset({"gchat", "gmail", "gws-hermes"})),
+        )
+
+    def _decide(self, command, *, roles=("admin_delivery",)):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(self._access(roles=roles), "terminal",
+                                           {"command": command})
+
+    def test_reads_another_mailbox(self):
+        assert self._decide(f"gmail --as {self.OTHER} list").allowed
+
+    def test_reads_another_chat_account(self):
+        assert self._decide(f"gchat --as {self.OTHER} raw GET /v1/spaces").allowed
+
+    def test_reads_another_calendar(self):
+        assert self._decide(
+            f"gws-hermes --as {self.OTHER} calendar events list").allowed
+
+    def test_sends_as_a_colleague(self):
+        assert self._decide(f"gmail --as {self.OTHER} send --to x@y.z").allowed
+
+    def test_own_account_still_works(self):
+        assert self._decide(f"gchat --as {self.ME} send --space s --text hi").allowed
+
+    def test_every_other_governed_role_stays_bound(self):
+        refused = self._decide(f"gmail --as {self.OTHER} list", roles=("tech_lead",))
+        assert not refused.allowed
+        assert refused.reason == "dwd_identity_mismatch"
+
+    def test_a_role_less_governed_user_stays_bound(self):
+        refused = self._decide(f"gchat --as {self.OTHER} raw GET /v1/spaces", roles=())
+        assert not refused.allowed
+        assert refused.reason == "dwd_identity_mismatch"
+
+    def test_the_exemption_is_the_role_not_the_person(self):
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+        assert dwd_identity_for(self._access(roles=("admin_delivery",))) is None
+        assert dwd_identity_for(self._access(roles=("operator",))) == self.ME
+
+
+class TestOwnSessionAttachmentsAreReadable:
+    """14-09-2026: the WebUI writes uploads and large composer pastes to
+    <hermes home>/webui/attachments/<session>/, under the `**/.hermes/**`
+    secret boundary, so a governed user could not read the .md the WebUI had
+    just made from their own paste (Hrishikesh), and every paste raised an
+    access request. The inbox of the session a turn runs under is that
+    person's own message: readable without a grant. Every other session's
+    inbox, and anything a link or `..` inside it points at, stays governed."""
+
+    SID = "995b40e6ef40"
+    OTHER = "0123456789ab"
+    ME = "hrishikesh@synthwave.solutions"
+
+    @pytest.fixture(autouse=True)
+    def _inbox(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes" / "webui" / "attachments"
+        monkeypatch.setenv("HERMES_WEBUI_ATTACHMENT_DIR", str(root))
+        self.inbox = root / self.SID
+        self.inbox.mkdir(parents=True)
+        self.paste = self.inbox / "pasted-text-2026-09-14_05-23-49-141.md"
+        self.paste.write_text("gehaald uit google chat")
+        self.other = root / self.OTHER / "pasted-text-x.md"
+        self.other.parent.mkdir()
+        self.other.write_text("someone else's paste")
+        self.secret = tmp_path / ".hermes" / "gmail-dwd-sa.json"
+        self.secret.write_text("{}")
+
+    def _access(self, **extra):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset({"cat", "head"}),
+                file_read_roots=frozenset({"/home/synthwavehq/clients"}),
+                file_denied_globs=frozenset({"**/.hermes/**", "**/*-sa.json"}),
+            ),
+            **extra,
+        )
+
+    def _decide(self, tool, args, session_id=SID, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), tool, args, session_id=session_id)
+
+    def test_the_paste_of_the_running_session_is_readable(self):
+        d = self._decide("read_file", {"path": str(self.paste)})
+        assert d.allowed and d.reason == "session_attachment_allowed"
+
+    def test_searching_the_own_inbox_is_allowed(self):
+        assert self._decide("search_files", {"path": str(self.inbox)}).allowed
+
+    def test_the_terminal_may_read_it_too(self):
+        assert self._decide("terminal", {"command": f"head -50 {self.paste}"}).allowed
+
+    def test_another_sessions_inbox_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.other)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}).allowed
+
+    def test_without_a_session_nothing_changes(self):
+        d = self._decide("read_file", {"path": str(self.paste)}, session_id="")
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_a_malformed_session_id_opens_nothing(self):
+        assert not self._decide("read_file", {"path": str(self.paste)}, session_id="../..").allowed
+
+    def test_a_traversal_out_of_the_inbox_is_still_refused(self):
+        sneaky = self.inbox / ".." / ".." / "gmail-dwd-sa.json"
+        assert not self._decide("read_file", {"path": str(sneaky)}).allowed
+        assert not self._decide("terminal", {"command": f"cat {sneaky}"}).allowed
+
+    def test_a_symlink_inside_the_inbox_resolves_to_its_target(self):
+        link = self.inbox / "innocent.md"
+        link.symlink_to(self.secret)
+        assert not self._decide("read_file", {"path": str(link)}).allowed
+        assert not self._decide("terminal", {"command": f"cat {link}"}).allowed
+
+    def test_writing_into_the_inbox_is_not_widened(self):
+        d = self._decide("write_file", {"path": str(self.inbox / "note.md")})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_a_blacklist_user_gets_the_same_exception(self):
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email="iflair@synthwave.solutions"),
+            mode="enforce",
+            permissions=frozenset({"terminal:use"}),
+            access_mode="blacklist",
+            access_level="elevated",
+            grants=GrantSet(
+                cli_commands=frozenset({"*"}),
+                cli_workdir_roots=frozenset({"*"}),
+                file_read_roots=frozenset({"*"}),
+                file_denied_globs=frozenset({"**/.hermes/**", "**/*-sa.json"}),
+            ),
+        )
+        assert self._decide("read_file", {"path": str(self.paste)}, access=access).allowed
+        assert self._decide("terminal", {"command": f"cat {self.paste}"}, access=access).allowed
+        assert not self._decide("read_file", {"path": str(self.other)}, access=access).allowed
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}, access=access).allowed
+
+    def test_the_bound_context_carries_the_session(self):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        mine = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID)
+        theirs = DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.OTHER)
+        assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
+        assert not tool_arguments_allowed_for_context(theirs, "read_file", {"path": str(self.paste)}).allowed
+
+    def test_a_workspace_root_that_swallows_the_state_dir_does_not_hide_the_inbox(self, tmp_path):
+        """20-09-2026 (Yaser: "mn superagent workspace ligt eruit"): a stray
+        workspace registered at /home contained the attachment inbox, so the
+        live membership check refused every upload for everyone but that
+        entry's owner. The inbox is exempt from the candidate check; the
+        selected root and other sessions' inboxes stay governed."""
+        from dataclasses import replace
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        workspace = str(tmp_path / "clients" / "_synthwave")
+        members_only = lambda path: path == workspace  # noqa: E731
+        mine = replace(DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID),
+                       workspace_path=workspace, workspace_access_check=members_only)
+        assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed
+        assert tool_arguments_allowed_for_context(mine, "search_files", {"path": str(self.inbox)}).allowed
+        other = tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.other)})
+        assert not other.allowed and other.reason == "workspace_access_revoked"
+        assert not tool_arguments_allowed_for_context(mine, "write_file", {"path": str(self.paste)}).allowed
+        revoked = replace(mine, workspace_access_check=lambda _: False)
+        assert tool_arguments_allowed_for_context(revoked, "read_file", {"path": str(self.paste)}).reason == "workspace_access_revoked"
+
+
+class TestBlacklistTerminalIsStructureAgnostic:
+    """14-09-2026 (Michael: "mijn tech team kan helemaal niks met de super
+    agent zo"): a `for` loop, a brace group, backticks or an odd heredoc came
+    back as cli_compound_command_not_allowed / cli_shell_operator_not_allowed
+    for the blacklist accounts. Shell structure is never a reason to refuse
+    such an account; its explicit blacklist, the DWD identity binding and the
+    approval selectors still bite wherever they appear in the line. Whitelist
+    accounts keep the strict parser."""
+
+    ME = "iflair@synthwave.solutions"
+
+    def _access(self, *, mode="blacklist", approval=()):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            roles=frozenset({"tech_lead"}),
+            permissions=frozenset({"terminal:use"}),
+            access_mode=mode,
+            access_level="elevated",
+            grants=GrantSet(
+                cli_commands=frozenset({"*"}),
+                cli_workdir_roots=frozenset({"*"}),
+                cli_denied_commands=frozenset({"bunq", "bunq_cli.py", "*bunq*", "*productive*", "sudo", "su"}),
+                cli_approval_commands=frozenset(approval),
+                file_read_roots=frozenset({"*"}),
+                file_denied_globs=frozenset({"**/bunq*", "**/.config/bunq/**"}),
+            ),
+        )
+
+    def _decide(self, command, access=None):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access or self._access(), "terminal", {"command": command})
+
+    @pytest.mark.parametrize("command", [
+        'for p in /workspace/*peterson*; do [ -e "$p" ] && printf "%s\\n" "$p"; done',
+        "python3 - <<'PY'\nimport json\nprint(json.load(open('/workspace/makro/metro-state.json'))['cookies'][:1])\nPY\ncommand -v node",
+        "echo `date`",
+        "{ ls /workspace; pwd; }",
+        "( cd /workspace && npm test )",
+        "while read -r l; do echo \"$l\"; done < /workspace/list.txt",
+        "cat /workspace/x.json | jq '.a' > /tmp/out.txt 2>&1",
+        "if [ -d /workspace/x ]; then ls /workspace/x; fi",
+        "python3 -c \"print('it''s')\"",
+    ])
+    def test_shell_structure_never_refuses_a_blacklist_account(self, command):
+        d = self._decide(command)
+        assert d.allowed, (command, d.reason)
+
+    @pytest.mark.parametrize("command,reason", [
+        ("sudo ls", "cli_command_denied"),
+        ("for i in 1; do sudo ls; done", "cli_command_denied"),
+        ("cd /workspace && python3 ~/bunq-agentic/bunq_cli.py", "file_denied_glob"),
+        ("echo x | productive list", "cli_command_denied"),
+        ("bash <<'SH'\nbunq balance\nSH", "cli_command_denied"),
+        ("cat ~/.config/bunq/token.json", "file_denied_glob"),
+        ("echo `productive`", "cli_command_denied"),
+        ("bash -c \"bunq balance\"", "cli_command_denied"),
+        ("eval \"bunq list\"", "cli_command_denied"),
+        ("x=$(bunq balance); echo $x", "cli_command_denied"),
+        ("ls | xargs -n 1 productive", "cli_command_denied"),
+        ("sudo -u alice bunq balance", "cli_command_denied"),
+        (r"find . -name '*.py' -exec productive {} \;", "cli_command_denied"),
+        ("nohup productive sync &", "cli_command_denied"),
+    ])
+    def test_the_explicit_blacklist_still_bites_anywhere(self, command, reason):
+        d = self._decide(command)
+        assert not d.allowed and d.reason == reason, (command, d.reason, d.detail)
+
+    @pytest.mark.parametrize("command", [
+        'git commit -m "sync productive hours to sheet"',
+        "git commit -m 'remove bunq link from readme'",
+        "grep -rn productive src/",
+        "grep -rn sudo README.md",
+        "echo do not use sudo here",
+        "pip install trading212-api",
+        "PROJECT=productive-sync npm run build",
+        "npm run build -- --productive",
+        "grep -rn gmail src/",
+        "pip install gmail-api",
+        "cat notes.txt | grep -i su",
+    ])
+    def test_a_word_that_is_merely_mentioned_is_not_a_command(self, command):
+        d = self._decide(command)
+        assert d.allowed, (command, d.reason, d.detail)
+
+    @pytest.mark.parametrize("command,reason", [
+        ("gmail list", "dwd_identity_required"),
+        ("cd /workspace && gmail list", "dwd_identity_required"),
+        ("for i in 1; do gmail list; done", "dwd_identity_required"),
+        ("echo `gmail list`", "dwd_identity_required"),
+        ("timeout 30 gmail list", "dwd_identity_required"),
+        ("bash -c 'gmail list'", "dwd_identity_required"),
+        ("gmail --as michael@synthwave.solutions list", "dwd_identity_mismatch"),
+        ("HERMES_DWD_IDENTITY=x gmail --as iflair@synthwave.solutions list", "dwd_identity_tamper"),
+    ])
+    def test_the_identity_binding_survives_any_structure(self, command, reason):
+        d = self._decide(command)
+        assert not d.allowed and d.reason == reason, (command, d.reason)
+
+    def test_own_identity_passes_inside_a_loop(self):
+        assert self._decide("for i in 1; do gmail --as iflair@synthwave.solutions list; done").allowed
+
+    def test_a_whitelist_account_keeps_the_strict_parser(self):
+        d = self._decide("for i in 1; do ls; done", access=self._access(mode="whitelist"))
+        assert not d.allowed and d.reason == "cli_compound_command_not_allowed"
+
+    def test_approval_selectors_match_by_token_not_by_structure(self):
+        from hermes_cli.dashboard_governance.tool_policy import cli_command_requires_manual_approval
+        access = self._access(approval={"deploy-prod"})
+        assert cli_command_requires_manual_approval(access, "for e in a; do deploy-prod $e; done")
+        assert not cli_command_requires_manual_approval(access, "for e in a; do ls $e; done")
+
+
+class TestOwnStateCacheIsReadable:
+    """22-09-2026: a subagent's live transcript, a spilled tool result and
+    spilled terminal output land under <hermes home>/cache/, inside the
+    `**/.hermes/**` boundary, so the agent that had just delegated a repair
+    could not read why its own worker timed out (Yaser, IvCB) and admins kept
+    approving one-off allow_globs per log. The running turn's own cache is its
+    own output: readable without a grant. Another profile's cache, anything a
+    link inside it points at, and writes stay governed."""
+
+    ME = "marcel@synthwave.solutions"
+
+    @pytest.fixture(autouse=True)
+    def _cache(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes" / "profiles" / "marcel"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_WEBUI_ATTACHMENT_DIR", raising=False)
+        self.log = home / "cache" / "delegation" / "live" / "deleg_d1d0bd42" / "task-0.log"
+        self.log.parent.mkdir(parents=True)
+        self.log.write_text("worker timed out")
+        self.spill = home / "cache" / "spillover" / "call_abc.txt"
+        self.spill.parent.mkdir(parents=True)
+        self.spill.write_text("large result")
+        self.terminal = home / "cache" / "terminal-output" / "out-1.log"
+        self.terminal.parent.mkdir(parents=True)
+        self.terminal.write_text("stdout")
+        self.other = tmp_path / ".hermes" / "profiles" / "yaser" / "cache" / "delegation" / "live" / "deleg_x" / "task-0.log"
+        self.other.parent.mkdir(parents=True)
+        self.other.write_text("someone else's worker")
+        self.secret = home / "auth.json"
+        self.secret.write_text("{}")
+        self.link = home / "cache" / "delegation" / "auth-link.json"
+        self.link.symlink_to(self.secret)
+
+    def _access(self):
+        return EffectiveAccess(
+            subject=GovernanceSubject(email=self.ME),
+            mode="enforce",
+            grants=GrantSet(
+                cli_commands=frozenset({"cat", "head"}),
+                file_read_roots=frozenset({"/home/synthwavehq/work"}),
+                file_write_roots=frozenset({"/home/synthwavehq/work"}),
+                file_denied_globs=frozenset({"**/.hermes/**"}),
+            ),
+        )
+
+    def _decide(self, tool, args):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(self._access(), tool, args, session_id="")
+
+    def test_the_own_delegation_log_is_readable(self):
+        d = self._decide("read_file", {"path": str(self.log), "offset": 1, "limit": 120})
+        assert d.allowed and d.reason == "own_state_cache_allowed"
+
+    def test_spillover_and_terminal_output_are_readable(self):
+        assert self._decide("read_file", {"path": str(self.spill)}).allowed
+        assert self._decide("read_file", {"path": str(self.terminal)}).allowed
+        assert self._decide("search_files", {"path": str(self.log.parent)}).allowed
+
+    def test_the_terminal_may_read_it_too(self):
+        assert self._decide("terminal", {"command": f"head -50 {self.log}"}).allowed
+
+    def test_another_profiles_cache_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.other)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+        assert not self._decide("terminal", {"command": f"cat {self.other}"}).allowed
+
+    def test_a_link_inside_the_cache_resolves_to_its_target_first(self):
+        d = self._decide("read_file", {"path": str(self.link)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_writing_into_the_cache_stays_governed(self):
+        d = self._decide("write_file", {"path": str(self.log), "content": "x"})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_the_rest_of_the_state_directory_stays_governed(self):
+        d = self._decide("read_file", {"path": str(self.secret)})
+        assert not d.allowed and d.reason == "file_denied_glob"
+
+    def test_the_workspace_membership_check_treats_it_as_no_workspace(self):
+        from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
+        from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
+        seen = []
+        access = self._access()
+        ctx = DashboardGovernanceContext(
+            subject=access.subject, access=access, active_profile="marcel", session_id="", request_id="",
+            workspace_path="/home/synthwavehq/work/synthpulse",
+            workspace_access_check=lambda path: seen.append(path) or path == "/home/synthwavehq/work/synthpulse",
+        )
+        d = tool_arguments_allowed_for_context(ctx, "read_file", {"path": str(self.log)})
+        assert d.allowed, d
+        assert str(self.log) not in seen
+
+
+class TestSkillManageBatchNamesEveryTarget:
+    """22-09-2026: skill_manage's advertised shape is {"operations": [{name,
+    action, ...}]} without a top-level name, so the policy judged an empty
+    name and refused every batch edit with skill_manage_not_allowed, for
+    admins with `*` as well (Yaser, Michaël). Each op's target is checked."""
+
+    def _access(self, manage, deny=()):
+        from hermes_cli.dashboard_governance.models import GrantSet as _GrantSet
+        return EffectiveAccess(
+            subject=GovernanceSubject(email="yaser@synthwave.solutions"),
+            mode="enforce",
+            grants=GrantSet(skills_manage=frozenset(manage)),
+            deny=_GrantSet(skills_manage=frozenset(deny)),
+        )
+
+    def _decide(self, access, args):
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "skill_manage", args)
+
+    OPS = {"operations": [{"action": "patch", "name": "docx", "old_string": "a", "new_string": "b"},
+                          {"action": "write_file", "name": "powerpoint", "file_path": "x.md", "file_content": ""}]}
+
+    def test_a_wildcard_grant_allows_a_batch(self):
+        d = self._decide(self._access({"*"}), self.OPS)
+        assert d.allowed, d
+
+    def test_every_op_target_must_be_granted(self):
+        d = self._decide(self._access({"docx"}), self.OPS)
+        assert not d.allowed and d.reason == "skill_manage_not_allowed" and d.detail == "powerpoint"
+        assert self._decide(self._access({"docx", "powerpoint"}), self.OPS).allowed
+
+    def test_a_denied_target_inside_the_batch_is_refused(self):
+        d = self._decide(self._access({"*"}, deny={"powerpoint"}), self.OPS)
+        assert not d.allowed and d.reason == "explicit_deny" and d.detail == "powerpoint"
+
+    def test_a_batch_without_any_target_is_refused(self):
+        d = self._decide(self._access({"*"}), {"operations": []})
+        assert not d.allowed and d.reason == "skill_manage_not_allowed"
+
+    def test_the_legacy_flat_shape_still_works(self):
+        assert self._decide(self._access({"docx"}), {"action": "patch", "name": "docx"}).allowed
+        assert not self._decide(self._access({"docx"}), {"action": "patch", "name": "powerpoint"}).allowed
+
+
+def test_a_refused_skill_edit_becomes_a_grantable_request():
+    """22-09-2026: skill_manage_not_allowed had no request mapping, so the
+    refusal was silent for admins: no row in Approvals, nothing to decide."""
+    from hermes_cli.dashboard_governance.grant_requests import _map_denial
+    assert _map_denial("skill_manage", "skill_manage_not_allowed", "docx") == ("skill_manage", "docx")
+    assert _map_denial("skill_manage", "skill_manage_not_allowed", "synthwave/docx") == ("skill_manage", "docx")
+    assert _map_denial("skill_manage", "skill_manage_not_allowed", "") is None

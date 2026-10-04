@@ -121,6 +121,7 @@ def _current_session_profile() -> str:
 
 
 from tools.approval import (
+    _check_profile_scope_guard,
     check_all_command_guards as _check_all_guards_impl,
 )
 
@@ -146,11 +147,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      cwd: str | None = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  cwd=cwd)
 
 
 from tools.environments.base import EnvironmentConnectionError
@@ -1015,13 +1018,15 @@ class _ApprovalVerdict:
     approved_run: bool = False
 
 
-def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool,
+                         cwd: Optional[str] = None) -> _ApprovalVerdict:
     """Run tirith + dangerous-command guards; ``force`` skips them entirely.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
-    gateway approval)."""
+    gateway approval). ``cwd`` is the command's resolved cwd, threaded into the
+    profile scope guard inside ``check_all_command_guards``."""
     if force:
         return _ApprovalVerdict(approved_run=True)
-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config), cwd=cwd)
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
@@ -1450,9 +1455,32 @@ def terminal_tool(
                 "(process-identity probe wedged); the command was not run. Retry the call.",
                 status="error",
             ))
+        # SynthPulse profile scope: the cwd the command actually runs in (the
+        # same resolution _run_foreground uses), so the guard resolves relative
+        # path tokens against it rather than the gateway process cwd.
+        try:
+            _guard_cwd = _resolve_command_cwd(
+                workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+                mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
+                env=env,
+            )
+        except Exception:
+            _guard_cwd = getattr(env, "cwd", None) or cwd
+
+        # Profile scope guard runs UNCONDITIONALLY, before the force
+        # short-circuit in _run_approval_guards: force=True replays a
+        # user-approved dangerous command, but a scoped profile must not be
+        # able to force its way out of its assigned project folders. No-op
+        # (None) for non-scoped profiles.
+        _scope_block = _check_profile_scope_guard(command, cwd=_guard_cwd)
+        if _scope_block is not None:
+            raise _Rejected(_error_json(
+                _scope_block.get("message", "Blocked by profile scope."), status="blocked",
+            ))
+
         # Pre-exec security checks (tirith + dangerous command detection);
         # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        verdict = _run_approval_guards(command, env_type, plan.config, force=force, cwd=_guard_cwd)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:

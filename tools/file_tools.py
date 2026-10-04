@@ -29,7 +29,7 @@ from tools import file_state
 from agent.redact import _is_secret_file_arg, redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
-    _resolve_path_for_task)
+    _resolve_path_for_task, _uses_container_paths)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
@@ -252,6 +252,199 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
         result.files = [f for f in result.files if _allowed(f)]
     if getattr(result, "counts", None):
         result.counts = {f: c for f, c in result.counts.items() if _allowed(f)}
+    return omitted
+
+
+def _profile_scope_mod():
+    """Lazy-load ~/.hermes/profile_scope.py via the shared bridge
+    (``tools/profile_scope_bridge.py``, cached there). None on failure."""
+    from tools import profile_scope_bridge
+    return profile_scope_bridge.load_profile_scope()
+
+
+def _is_scoped_profile_home() -> bool:
+    """True when HERMES_HOME points inside a SCOPED profile's home (via the
+    bridge: segment-equality parse plus marker-file fallback). Decides
+    fail-closed vs fail-open on guard errors."""
+    try:
+        from tools import profile_scope_bridge
+        return profile_scope_bridge.is_scoped_home()
+    except Exception:
+        return False
+
+
+def _check_profile_scope_path(filepath: str, mode: str = "read",
+                              task_id: str = "default") -> str | None:
+    """Hard-deny a filesystem path that is outside a SCOPED profile's allowed
+    project folders, or that hits secrets / another profile.
+
+    Returns an error string to block, or None to allow. No-op for non-scoped
+    profiles (existing workstation untouched). Unlike _check_cross_profile_path
+    this IS a boundary for the scoped profile: it complements the terminal
+    profile-scope guard for the agent's direct file tools.
+
+    Also the single entry point for the private-actor personal context check
+    and the governance file rules, so read/write/patch/search and every
+    search hit all pass the same three locks.
+    """
+    # Raw NT/device-namespace string: refuse BEFORE any resolution below
+    # (resolving it on a Windows host is the NTLM-leak trigger).
+    nt_err = get_nt_namespace_error(filepath, verb="Read" if mode == "read" else "Write")
+    if nt_err:
+        return nt_err
+    personal = _check_personal_file_path(filepath, task_id)
+    if personal is not None:
+        return personal
+    gov = _check_governance_path(filepath, mode, task_id)
+    if gov is not None:
+        return gov
+    mod = _profile_scope_mod()
+    if mod is None:
+        # Fail-closed only for a scoped profile's home; fail-open otherwise.
+        if _is_scoped_profile_home():
+            return "Blocked: profile-scope guard unavailable (fail-closed)."
+        return None
+    try:
+        profile = mod.resolve_profile()
+        if not mod.is_scoped(profile):
+            return None
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
+        allowed, reason = mod.check_path(profile, resolved, mode)
+        if allowed:
+            return None
+        return (f"Blocked by profile scope ({profile}): {reason}. This profile "
+                f"may only access its assigned project folders.")
+    except Exception:
+        if _is_scoped_profile_home():
+            return "Blocked: profile-scope guard error (fail-closed)."
+        return None
+
+
+def _check_personal_file_path(filepath: str, task_id: str = "default") -> str | None:
+    """Private actor scope: a bound personal memory directory keeps other
+    actors' (and, in shared conversations, the owner's own) personal context
+    out of the file tools. No-op when no personal scope is bound, and for
+    container backends whose paths are not host paths. Fails closed when a
+    scope is bound but the path cannot be checked."""
+    try:
+        from tools.memory_tool import personal_memory_scope_active, require_personal_file_access
+        if not personal_memory_scope_active() or _uses_container_paths(task_id):
+            return None
+        require_personal_file_access(_resolve_path_for_task(filepath, task_id))
+        return None
+    except PermissionError as exc:
+        return f"Blocked: {exc}."
+    except Exception:
+        logger.debug("personal file scope check failed", exc_info=True)
+        return "Blocked: personal context scope check failed (fail-closed)."
+
+
+def _check_governance_path(filepath: str, mode: str = "read",
+                           task_id: str = "default") -> str | None:
+    """Tweede slot: de bestandsregels uit de dashboard-governance.
+
+    De folderguard hierboven kent alleen mappen. De governance kent daarnaast
+    verboden patronen (.env, sleutels, alles met 'secret' in de naam), en die
+    gelden ook binnen een map die iemand verder wel mag openen. Zonder deze
+    controle kon een profiel de .env uit zijn eigen projectmap lezen.
+
+    Geen governance-context (een gewone werkplek, of het beleid is even niet te
+    lezen) betekent geen oordeel: dan blijft alles bij het oude.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.tool_policy import (
+            tool_arguments_allowed_for_context,
+        )
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return None
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
+        naam = "read_file" if mode == "read" else "write_file"
+        if getattr(ctx, "project_workspace", ""):
+            raw = Path(filepath)
+            resolved = str(raw if raw.is_absolute() else _resolve_base_dir(task_id) / raw)
+        besluit = tool_arguments_allowed_for_context(ctx, naam, {"path": resolved})
+        if besluit.allowed:
+            return None
+        return (f"Blocked by governance: {besluit.reason}. Ask Michael if you "
+                f"need this path.")
+    except Exception:
+        logger.debug("governance path check failed", exc_info=True)
+        ctx = locals().get("ctx")
+        if (getattr(ctx, "project_workspace", "") or getattr(ctx, "workspace_path", "")
+                or getattr(getattr(ctx, "access", None), "mode", "") == "enforce" or getattr(ctx, "continuation_contexts", ())):
+            return "Blocked by governance: file scope unavailable."
+        return None
+
+
+def _filter_profile_scope_search_results(result, task_id: str = "default") -> int:
+    """Drop search results that resolve outside a SCOPED profile's allowed
+    folders (matches, files, and counts, in-place). Returns the number
+    omitted; 0 (no-op) for non-scoped profiles.
+
+    Complements the search-root check in ``search_tool``: a search rooted
+    inside scope can still surface out-of-scope paths via symlinks, so each
+    result path is re-checked individually.
+    """
+    # Fast path: nothing to do unless the active profile is scoped, or the
+    # guard is unavailable under a scoped home (then the per-path check
+    # below fails closed and drops everything).
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        ctx = current_governance_context()
+        governed = ctx is not None and (ctx.access.mode == "enforce" or getattr(ctx, "continuation_contexts", ())
+                                        or getattr(ctx, "workspace_path", ""))
+        try:
+            from tools.memory_tool import personal_memory_scope_active
+            governed = governed or personal_memory_scope_active()
+        except Exception:
+            pass
+        mod = _profile_scope_mod()
+        if not governed and mod is not None and not mod.is_scoped(mod.resolve_profile()):
+            return 0
+        if not governed and mod is None and not _is_scoped_profile_home():
+            return 0
+    except Exception:
+        if not locals().get("governed") and not _is_scoped_profile_home():
+            return 0
+
+    omitted = 0
+
+    if hasattr(result, "matches") and result.matches:
+        allowed_matches = []
+        for match in result.matches:
+            if _check_profile_scope_path(match.path, "read", task_id):
+                omitted += 1
+                continue
+            allowed_matches.append(match)
+        result.matches = allowed_matches
+
+    if hasattr(result, "files") and result.files:
+        allowed_files = []
+        for file_path in result.files:
+            if _check_profile_scope_path(file_path, "read", task_id):
+                omitted += 1
+                continue
+            allowed_files.append(file_path)
+        result.files = allowed_files
+
+    if hasattr(result, "counts") and result.counts:
+        allowed_counts = {}
+        for file_path, count in result.counts.items():
+            if _check_profile_scope_path(file_path, "read", task_id):
+                omitted += 1
+                continue
+            allowed_counts[file_path] = count
+        result.counts = allowed_counts
+
     return omitted
 
 
@@ -621,6 +814,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if nt_err:
             return tool_error(nt_err)
 
+        # Profile-scope / governance / private-actor guard (SynthPulse). After the
+        # raw NT-namespace check so resolving the path cannot trigger the NTLM leak.
+        _scope_err = _check_profile_scope_path(path, "read", task_id)
+        if _scope_err:
+            return json.dumps({"error": _scope_err})
+
         device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
             return tool_error(
@@ -868,7 +1067,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     cross-PROFILE guard it was named for no longer exists).
     """
     # write_file checks the binary-document guard before the mirror guard.
-    err = (_check_sensitive_path(path, task_id)
+    err = (_check_profile_scope_path(path, "write", task_id)
+           or _check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
@@ -973,6 +1173,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
         _entry_paths = collected[2]
+    # Profile-scope / governance / private-actor guard (SynthPulse) on every
+    # path the patch names, V4A header paths included.
+    for _p in _paths_to_check:
+        scope_err = _check_profile_scope_path(_p, "write", task_id)
+        if scope_err:
+            return tool_error(scope_err)
     precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
     if precheck_err:
         return tool_error(precheck_err)
@@ -1075,6 +1281,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         nt_err = get_nt_namespace_error(path, verb="Search")
         if nt_err:
             return tool_error(nt_err)
+        # Profile-scope / governance / private-actor guard on the search root (SynthPulse).
+        _scope_err = _check_profile_scope_path(path, "read", task_id)
+        if _scope_err:
+            return json.dumps({"error": _scope_err}, ensure_ascii=False)
         try:
             resolved_search_path = str(_resolve_path_for_task(path, task_id))
         except (OSError, ValueError, RuntimeError) as exc:
@@ -1097,6 +1307,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context, order=order)
         omitted = _filter_read_blocked_search_results(result, task_id)
+        # Per-result profile-scope filter: drop matches that resolve outside
+        # a SCOPED profile's allowed folders (no-op for everyone else).
+        omitted += _filter_profile_scope_search_results(result, task_id)
         for m in getattr(result, "matches", None) or ():
             if getattr(m, "content", None):
                 m.content = redact_sensitive_text(

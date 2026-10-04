@@ -1101,6 +1101,38 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
+def request_governance_action_approval(tool_name, display_target, reason, operation_id):
+    """One governed invocation, with no yolo/session/permanent shortcuts."""
+    session_key = get_current_session_key()
+    from hermes_cli.dashboard_governance.context import current_governance_context
+    governance = current_governance_context()
+    # A delegated child has its own session id but its human review interface
+    # belongs to the authenticated parent run captured in the trusted context.
+    if governance is not None and governance.session_id:
+        session_key = governance.session_id
+    with _lock:
+        notify = _gateway_notify_cbs.get(session_key)
+    data = {"command": display_target, "description": reason,
+            "pattern_key": f"governance_action:{operation_id}",
+            "pattern_keys": [f"governance_action:{operation_id}"],
+            "allow_permanent": False, "allow_session": False,
+            "governance_action": True, "tool": tool_name}
+    if notify is not None:
+        decision = _await_gateway_decision(session_key, notify, data, surface="gateway")
+        if decision.get("resolved") and decision.get("choice") == "once":
+            return {"approved": True, "message": "Approved for this action by the user."}
+        return {"approved": False, "message": str(decision.get("reason") or "Manual approval was denied or did not complete.")}
+    callback = _resolve_cli_approval_callback()
+    if callable(callback):
+        from agent.delegation_context import is_delegated_child_process_context
+        if is_delegated_child_process_context():
+            return {"approved": False, "message": "Delegated manual approval requires the connected parent review interface."}
+        choice = prompt_dangerous_approval(display_target, reason, approval_callback=callback,
+                                          allow_permanent=False, allow_session=False)
+        return {"approved": choice == "once", "message": "Manual approval " + ("accepted." if choice == "once" else "denied or unavailable.")}
+    return {"approved": False, "message": "Manual approval requires a connected approval interface."}
+
+
 def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -1165,13 +1197,76 @@ def _tirith_scan(command: str) -> dict:
         }]}
 
 
+def _load_profile_scope():
+    """Lazy-load ~/.hermes/profile_scope.py via the shared bridge
+    (``tools/profile_scope_bridge.py``, cached there). Returns the module
+    or None if it cannot be loaded."""
+    from tools import profile_scope_bridge
+    return profile_scope_bridge.load_profile_scope()
+
+
+def _check_profile_scope_guard(command: str, cwd: str | None = None):
+    """Return a block-result dict if the active (SCOPED) profile's command is
+    outside its allowed project folders, else None.
+
+    ``cwd`` is the task's tracked terminal cwd, used to resolve relative
+    path tokens against the directory the command actually runs in.
+    Fail-open for non-scoped profiles (the existing workstation is untouched).
+    Fail-closed ONLY for a scoped profile if the check itself errors.
+    """
+    try:
+        mod = _load_profile_scope()
+        if mod is None:
+            raise RuntimeError("profile_scope unavailable")
+        profile = mod.resolve_profile()
+        if not mod.is_scoped(profile):
+            return None
+        allowed, reason = mod.check_command(profile, command, cwd=cwd)
+        if allowed:
+            return None
+        logger.warning("Profile-scope block [%s]: %s (command: %s)",
+                       profile, reason, command[:200])
+        return {"approved": False,
+                "message": (f"Blocked by profile scope ({profile}): {reason}. "
+                            f"This profile may only operate within its assigned "
+                            f"project folders.")}
+    except Exception as e:
+        # Only fail-closed when we can independently tell this is a scoped
+        # profile from HERMES_HOME (segment-equality parse + marker-file
+        # fallback in the bridge); otherwise fail-open so non-scoped
+        # profiles are never impacted by a guard error.
+        try:
+            from tools import profile_scope_bridge
+            scoped = profile_scope_bridge.is_scoped_home()
+        except Exception:
+            scoped = False
+        if scoped:
+            logger.error("Profile-scope guard error (fail-closed): %s", e)
+            return {"approved": False,
+                    "message": "Blocked: profile-scope guard error (fail-closed)."}
+        return None
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             cwd: str | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
-    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow.
+    ``cwd``: the task's resolved terminal cwd, threaded into the profile scope guard so
+    relative path tokens resolve against the directory the command actually runs in."""
+    # == Profile scope guard (SynthPulse) ==
+    # Confines a SCOPED profile (e.g. a freelancer) to its allowed project
+    # folders and hard-denies secrets / other profiles. Profile-keyed, not
+    # environment-keyed, so it fires BEFORE the container skip, the prepared
+    # batch decision AND the yolo bypass: a scoped profile can neither sandbox
+    # nor yolo its way out of scope. No-op (None) for non-scoped profiles.
+    _scope_block = _check_profile_scope_guard(command, cwd=cwd)
+    if _scope_block is not None:
+        return _scope_block
+
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
@@ -1256,6 +1351,52 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     """
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
+
+    # == Profile scope guard ==
+    # A SCOPED profile (e.g. a freelancer) is denied execute_code entirely:
+    # script content cannot be reliably path-scanned, so arbitrary Python is
+    # an open door out of the profile's project folders. Profile-keyed, so it
+    # fires BEFORE the container/yolo skips. Fail-closed on guard error for
+    # scoped homes only; None of this affects non-scoped profiles (fail-open).
+    try:
+        _scope_mod = _load_profile_scope()
+        if _scope_mod is None:
+            raise RuntimeError("profile_scope unavailable")
+        _scope_profile = _scope_mod.resolve_profile()
+        if _scope_mod.is_scoped(_scope_profile):
+            logger.warning("Profile-scope block [%s]: execute_code denied "
+                           "for scoped profile", _scope_profile)
+            return {
+                "approved": False,
+                "message": (
+                    f"Blocked by profile scope ({_scope_profile}): "
+                    "execute_code is not available to this profile because "
+                    "arbitrary scripts cannot be path-scoped. Use the file "
+                    "and terminal tools inside the assigned project folders "
+                    "instead."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
+    except Exception as _scope_err:
+        try:
+            from tools import profile_scope_bridge
+            _scope_home = profile_scope_bridge.is_scoped_home()
+        except Exception:
+            _scope_home = False
+        if _scope_home:
+            logger.error("Profile-scope guard error in execute_code "
+                         "(fail-closed): %s", _scope_err)
+            return {
+                "approved": False,
+                "message": "Blocked: profile-scope guard error (fail-closed).",
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "blocked",
+                "user_consent": False,
+            }
 
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":
