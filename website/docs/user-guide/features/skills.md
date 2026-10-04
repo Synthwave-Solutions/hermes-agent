@@ -72,6 +72,15 @@ All of these paths write a `.no-bundled-skills` marker into the profile director
 
 ## Using Skills
 
+A background self-improvement review can successfully change a skill and then
+encounter an unrelated provider failure. Confirmed tool results remain available
+to completion observers before the review is closed, including on failure and
+cancellation. The review still reports its original failure; observing an earlier
+write does not turn the whole review into a success. Rejected or staged writes
+are not successful changes, and inherited conversation results are excluded.
+The existing review cadence, tool restrictions and notification preferences are
+unchanged. A short turn need not trigger a review or produce a skill change.
+
 Every installed skill is automatically available as a slash command:
 
 ```bash

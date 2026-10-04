@@ -6,7 +6,10 @@ imported lazily from ``agent.conversation_loop`` (no cycle, same logger name).""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import os
 import time
 from contextlib import suppress
@@ -35,6 +38,32 @@ _SESSION_TOKEN_KEYS = (
     "reasoning_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
 )
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
+
+
+_timing_logger = logging.getLogger(__name__)
+
+
+def _trace_finalization_timing(agent, event, started=None):
+    """Observe the native boundary without changing return/exception behavior."""
+    try:
+        now = time.perf_counter()
+        session = getattr(agent, "session_id", None)
+        if event not in {"started", "completed"} or not isinstance(session, str) or not 1 <= len(session) <= 200:
+            return None
+        created_at = time.time()
+        if not math.isfinite(now) or not math.isfinite(created_at):
+            return None
+        row = {"event": event, "session": hashlib.sha256(session.encode()).hexdigest(),
+               "background": getattr(agent, "_memory_write_origin", None) == "background_review",
+               "created_at": created_at}
+        if event == "completed" and started is not None:
+            duration = (now - started) * 1000
+            if math.isfinite(duration) and duration >= 0:
+                row["duration_ms"] = round(duration, 3)
+        _timing_logger.info("Turn finalization timing: %s", json.dumps(row, sort_keys=True))
+        return now
+    except Exception:
+        return None  # Logging/clock failures must never change finalization.
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -524,6 +553,7 @@ def finalize_turn(
     _pending_verification_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
+    _finalization_started = _trace_finalization_timing(agent, "started")
     from agent.conversation_loop import logger
 
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
@@ -746,6 +776,7 @@ def finalize_turn(
     agent._stream_callback = None  # don't leak into future calls
 
     # Skill trigger is checked NOW — based on how many tool iterations THIS turn used.
+    _review_skill_counter = getattr(agent, "_iters_since_skill", None)
     _should_review_skills = (
         agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
@@ -753,6 +784,22 @@ def finalize_turn(
     )
     if _should_review_skills:
         agent._iters_since_skill = 0
+
+    from agent.background_review import trace_background_review
+    trace_background_review(
+        agent, "gate",
+        skill_available="skill_manage" in (getattr(agent, "valid_tool_names", ()) or ()),
+        skill_counter=_review_skill_counter,
+        skill_interval=agent._skill_nudge_interval,
+        review_skills=_should_review_skills,
+        review_memory=bool(_should_review_memory),
+        final_response_present=bool(final_response),
+        interrupted=bool(interrupted),
+        skip_background_review=bool(getattr(agent, "skip_background_review", False)),
+        eligible=bool(final_response and not interrupted
+                      and not getattr(agent, "skip_background_review", False)
+                      and (_should_review_memory or _should_review_skills)),
+    )
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
@@ -794,4 +841,6 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    _trace_finalization_timing(agent, "completed", _finalization_started)
     return result

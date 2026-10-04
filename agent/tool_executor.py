@@ -128,6 +128,10 @@ def _budget_for_agent(agent) -> BudgetConfig:
 
 _MAX_TOOL_WORKERS = 8  # concurrent worker threads per batch
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
+# Each named browser_exec session gets its own harness daemon and its own
+# browser, so a batch of them is a batch of browsers. Eight at once will sink
+# a small host; cap the batch well below the general worker ceiling.
+_MAX_BROWSER_EXEC_PARALLEL = 3
 # Generous: slow-but-valid tool work must never be preempted by the batch guard.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 # Long enough for an approval round-trip, short enough that one wedged dispatch can't starve the batch.
@@ -241,8 +245,11 @@ def _max_workers_for_tool_batch(runnable_calls) -> int:
     if not runnable_calls:
         return 0
     max_workers = _MAX_TOOL_WORKERS
-    if any((call[2] if len(call) >= 3 else None) == "image_generate" for call in runnable_calls):
+    names = {call[2] if len(call) >= 3 else None for call in runnable_calls}
+    if "image_generate" in names:
         max_workers = min(max_workers, _image_generate_parallel_limit())
+    if "browser_exec" in names:
+        max_workers = min(max_workers, _MAX_BROWSER_EXEC_PARALLEL)
     return min(len(runnable_calls), max_workers)
 
 

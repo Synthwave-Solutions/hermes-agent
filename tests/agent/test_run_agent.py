@@ -2451,13 +2451,12 @@ class TestParallelScopePathNormalization:
 class TestMcpParallelToolBatch:
     """Integration test: _should_parallelize_tool_batch respects MCP parallel flag."""
 
-    def test_mcp_tools_default_parallel(self):
-        """Allow-by-default admission (SynthPulse, bdf9b7afd): MCP tools from a
-        server without an explicit serial pin run concurrently."""
+    def test_mcp_tools_default_sequential(self):
+        """MCP tools without supports_parallel_tool_calls are sequential."""
         from agent.tool_dispatch_helpers import _should_parallelize_tool_batch
         tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
         tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
-        assert _should_parallelize_tool_batch([tc1, tc2])
+        assert not _should_parallelize_tool_batch([tc1, tc2])
 
     def test_mcp_tools_sequential_when_server_pinned_serial(self):
         """``supports_parallel_tool_calls: false`` keeps a stateful server serial."""

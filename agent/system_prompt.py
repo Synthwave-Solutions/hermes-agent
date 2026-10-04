@@ -19,8 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.delegation_context import owned_kanban_task
 from agent.prompt_builder import (
-    ASYNC_HANDOFF_GUIDANCE, DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
-    HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
+    ASYNC_HANDOFF_GUIDANCE, DEFAULT_AGENT_IDENTITY, DELEGATION_POLICY_GUIDANCE, EXECUTION_GUIDANCE_MODELS,
+    GOOGLE_MODEL_OPERATIONAL_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
@@ -310,8 +310,18 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    # Usage-aware demotion (fork, 29 Aug 2026), unioned with the coding posture's set: a large
+    # category in which almost nothing has ever been opened renders names-only, so the index stays
+    # proportional to the catalogue actually used. Names are never hidden. Off unless
+    # ``skills.index_mode`` is "usage".
+    _skills_dir = _agent_skills_dir(agent)
+    try:
+        from agent.skill_index_focus import compact_categories as _usage_compact
+        _compact_cats = frozenset(_compact_cats) | _usage_compact(_skills_dir)
+    except Exception:
+        pass
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_skills_dir)
 
 
 def _auto_load_parts(agent: Any) -> List[str]:
@@ -560,6 +570,11 @@ def _guidance_parts(agent: Any) -> List[str]:
                 ("_parallel_tool_call_guidance", PARALLEL_TOOL_CALL_GUIDANCE),
             ) if getattr(agent, flag, True)
         ]
+    # Where delegated work goes (fork, 29 Aug 2026): own subagents and background tasks first, a separate
+    # CLI worker only as a driven, bounded job. Injected only when the tools it names are loaded; a run
+    # without delegation still gets the background-task half, the bigger latency win of the two.
+    if agent.valid_tool_names and ("delegate_task" in agent.valid_tool_names or "terminal" in agent.valid_tool_names):
+        parts.append(DELEGATION_POLICY_GUIDANCE)
     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
     if not agent.valid_tool_names:
         return parts
