@@ -7,6 +7,7 @@ import {
 } from "react";
 import { useLocation, useSearchParams } from "react-router";
 import { api, setManagementProfile } from "@/lib/api";
+import { useGovernance } from "@/contexts/useGovernance";
 import { ProfileContext } from "@/contexts/profile-context";
 import {
   dashboardInitialProfile,
@@ -42,6 +43,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const { pathname } = useLocation();
   const [profiles, setProfiles] = useState<string[]>([]);
+  const { canProfile } = useGovernance();
   const [currentProfile, setCurrentProfile] = useState("default");
   const bootstrapProfile = dashboardInitialProfile();
 
@@ -94,7 +96,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
       .then(([profilesRes, info]) => {
         if (cancelled) return;
 
-        setProfiles(profilesRes.profiles.map((p) => p.name));
+        setProfiles(profilesRes.profiles.map((p) => p.name).filter((name) => canProfile(name)));
 
         const current = info.current || "default";
         const active = info.active || "default";
