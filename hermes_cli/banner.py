@@ -65,6 +65,11 @@ def _skin_color(key: str, fallback: str) -> str:
     return _quiet(lambda: _active_skin().get_color(key, fallback), fallback)
 
 
+def _skin_branding(key: str, fallback: str) -> str:
+    """Get a branding string from the active skin (SynthPulse rebrand), or return fallback."""
+    return _quiet(lambda: _active_skin().get_branding(key, fallback), fallback) or fallback
+
+
 # === ASCII Art & Branding ===
 
 from hermes_cli import __release_date__ as RELEASE_DATE
@@ -187,13 +192,13 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
-_RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
+_RELEASE_URL_BASE = "https://github.com/Synthwave-Solutions/hermes-agent/releases/tag"
 
 
 def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
     """Return ``(tag, release_url)`` for the latest local git tag, or None (a miss is cached too).
 
-    Release URL always points at the canonical NousResearch/hermes-agent repo (forks get no link).
+    Release URL points at the SynthPulse fork (Synthwave-Solutions/hermes-agent).
     """
     def _compute():
         rd = repo_dir or _resolve_repo_dir()
@@ -208,9 +213,10 @@ def format_banner_version_label() -> str:
     from hermes_cli.steward import read_install_stamp
     from hermes_cli.update_channel import is_canary_tag
 
+    agent_name = _skin_branding("agent_name", "Hermes Agent")
     stamp = read_install_stamp(get_project_root())
     if stamp.get("distribution") == "desktop-app":
-        label = f"Hermes Agent v{get_version_info().derived_version}"
+        label = f"{agent_name} v{get_version_info().derived_version}"
         if stamp.get("source") == "commit-build":
             return f"{label} · commit-build · {str(stamp.get('commit') or '')[:12]}"
         if stamp.get("tag"):
@@ -223,7 +229,7 @@ def format_banner_version_label() -> str:
             return f"{label} · installer"
         return label
 
-    base = f"Hermes Agent v{get_version_info().derived_version} ({RELEASE_DATE})"
+    base = f"{agent_name} v{get_version_info().derived_version} ({RELEASE_DATE})"
     from hermes_cli.config import load_config
     from hermes_cli.update_channel import resolve_update_channel
 
@@ -615,7 +621,7 @@ def _banner_left_lines(model: str, cwd: str, session_id, context_length, provide
     lines = []
     pin = " (pinned)" if context_pinned else ""
     ctx_str = _dim_sep(f"{_format_context_length(context_length)} context{pin}") if context_length else ""
-    nous_str = _dim_sep("Nous Research")
+    nous_str = _dim_sep(_skin_branding("provider", "Nous Research"))
     if not (model or "").strip():
         # Credentials resolve lazily on the first message; the banner prints first. Ask the route
         # the same question so a fresh free-tier install shows its model, not a red "unconfigured".

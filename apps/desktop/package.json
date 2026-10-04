@@ -1,9 +1,9 @@
 {
   "name": "hermes",
-  "productName": "Hermes",
+  "productName": "SynthPulse",
   "private": true,
   "version": "0.0.0",
-  "description": "Native desktop shell for Hermes Agent.",
+  "description": "Native desktop shell for SynthPulse.",
   "author": "Nous Research",
   "repository": {
     "type": "git",
