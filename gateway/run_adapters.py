@@ -1291,6 +1291,19 @@ class GatewayAdapterLifecycleMixin:
                     )
             if not adapter:
                 continue
+            # SynthPulse: a person or department profile whose credential is a
+            # copy of the root profile's (another gateway process polls that
+            # bot) must not start a second poller: Telegram answers 409 to the
+            # main gateway and it misses updates. Skip it quietly (never connected,
+            # so nothing to disconnect).
+            from gateway.run import _synthpulse_root_shared_credential
+            if _synthpulse_root_shared_credential(adapter, profile_home):
+                logger.info(
+                    "[MULTIPLEX] Profile '%s': %s credential is the root profile's "
+                    "(served by the main gateway); not starting a duplicate poller",
+                    profile_name, platform.value,
+                )
+                continue
             # Same-token / same-listener conflict detection — refuse a duplicate poll or bind.
             credential_claim = self._adapter_credential_claim(platform, adapter)
             listener_claim = self._adapter_listener_claim(platform, adapter)

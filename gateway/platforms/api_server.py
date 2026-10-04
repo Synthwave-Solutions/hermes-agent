@@ -241,6 +241,84 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 
 
+# ── governance van de aanroeper ───────────────────────────────────────────────
+#
+# De SynthPulse-brug stuurt het geverifieerde adres mee als
+# ``X-Hermes-Session-Key: owui:<email>``. Zonder deze binding draait de agent
+# zonder governance-context, en dan doet de tool-policy (bestandsmappen,
+# skills, MCP) helemaal niets: alleen de folderguard houdt dan nog tegen.
+# Met deze binding staan er twee onafhankelijke sloten op dezelfde deur.
+#
+# Uit te zetten met HERMES_DISABLE_CALLER_GOVERNANCE=1. Faalt de resolutie,
+# dan binden we niets en verandert er niets: nooit een chat laten omvallen
+# omdat het beleid even niet te lezen was.
+
+_CALLER_PREFIX = "owui:"
+
+
+def _beleidspad() -> str:
+    """Het beleid van de machine zelf, los van HOME of HERMES_HOME."""
+    try:
+        import pwd
+
+        thuis = pwd.getpwuid(os.getuid()).pw_dir if hasattr(os, "getuid") else os.path.expanduser("~")
+    except Exception:
+        thuis = os.path.expanduser("~")
+    return os.path.join(thuis, ".hermes", "dashboard-governance.yaml")
+
+
+def _caller_email_from_request(request) -> str:
+    rauw = (request.headers.get("X-Synthpulse-Actor") or "").strip().lower()
+    if rauw:
+        return rauw
+    sleutel = (request.headers.get("X-Hermes-Session-Key") or "").strip().lower()
+    if sleutel.startswith(_CALLER_PREFIX):
+        return sleutel[len(_CALLER_PREFIX):].strip()
+    return ""
+
+
+def _bind_caller_governance(request):
+    if os.environ.get("HERMES_DISABLE_CALLER_GOVERNANCE") == "1":
+        return None
+    email = _caller_email_from_request(request)
+    if not email or "@" not in email:
+        return None
+    try:
+        from hermes_cli.dashboard_governance import (
+            GovernanceSubject,
+            load_governance_policy,
+            resolve_effective_access,
+        )
+        from hermes_cli.dashboard_governance.context import (
+            DashboardGovernanceContext,
+            bind_governance_context,
+        )
+
+        onderwerp = GovernanceSubject(email=email, groups=[])
+        # Het beleidspad expliciet meegeven. Onder de multiplexer wijst
+        # get_hermes_home() naar de profielmap van de beller, en daar staat
+        # geen beleid; dan valt de loader stil terug op "governance uit" en
+        # doet de hele laag niets. Dezelfde val als bij de folderguard.
+        toegang = resolve_effective_access(
+            load_governance_policy(path=_beleidspad()), onderwerp)
+        return bind_governance_context(
+            DashboardGovernanceContext(subject=onderwerp, access=toegang))
+    except Exception:
+        logger.debug("governance van de aanroeper niet te binden", exc_info=True)
+        return None
+
+
+def _release_caller_governance(token) -> None:
+    if token is None:
+        return
+    try:
+        from hermes_cli.dashboard_governance.context import reset_governance_context
+
+        reset_governance_context(token)
+    except Exception:
+        pass
+
+
 class ThreadSafeAsyncQueue(asyncio.Queue):
     """``asyncio.Queue`` a non-loop thread (run_conversation's executor) can push into via
     ``put_threadsafe``; the SSE consumer's ``await get()`` is woken by ``call_soon_threadsafe``."""
@@ -1726,6 +1804,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if profile is _PROFILE_REJECTED:
                 return web.json_response({"error": "Unknown or unconfigured profile"}, status=404)
             token = _api_request_profile.set(profile)
+            gov_token = _bind_caller_governance(request)
             try:
                 with self._profile_scope(profile):
                     resolved_profile = profile or "default"
@@ -1740,6 +1819,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
                 _api_request_profile.reset(token)
+                _release_caller_governance(gov_token)
         return profile_prefix_middleware
 
     def _http_route_table(self) -> List[tuple]:
@@ -3670,6 +3750,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 events.enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
+            from tools.delegation_progress import normalize_subagent_progress
+            subagent = normalize_subagent_progress(event_type, kwargs)
+            if subagent:
+                events.enqueue("subagent", subagent)
+                return
             if event_type == "reasoning.available":
                 events.enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:

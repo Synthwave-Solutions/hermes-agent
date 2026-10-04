@@ -1864,6 +1864,49 @@ async def _async_profile_runtime_scope(profile_home: "Path"):
         yield
 
 
+_ROOT_CREDENTIAL_VARS = (
+    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+    "MATTERMOST_TOKEN", "MATRIX_ACCESS_TOKEN", "WHATSAPP_CLOUD_ACCESS_TOKEN",
+)
+_ROOT_CREDENTIAL_CACHE: dict = {"mtime": None, "values": set()}
+
+
+def _synthpulse_root_shared_credential(adapter: Any, profile_home: Any = None) -> bool:
+    """True when the adapter's credential equals one in the root profile's .env
+    while this process is NOT the root profile's gateway (multiplexer next to
+    the main gateway). The root is derived from the REAL profile directory
+    (<root>/profiles/<name>, symlinks resolved), because a multiplexer runs
+    under its own HERMES_HOME. Compared by the same fingerprint the duplicate
+    detection uses, so plugin adapters that keep the token elsewhere are
+    covered. Fail-open: any error means "not shared"."""
+    try:
+        from hermes_constants import get_hermes_home
+        real = Path(profile_home).resolve() if profile_home else None
+        if real is None or real.parent.name != "profiles":
+            return False
+        root = real.parent.parent
+        if Path(get_hermes_home()).resolve() == root.resolve():
+            return False
+        env_path = root / ".env"
+        st = env_path.stat()
+        if _ROOT_CREDENTIAL_CACHE["mtime"] != st.st_mtime_ns:
+            from agent.secret_scope import load_env_file
+            import hashlib
+            values = load_env_file(env_path)
+            _ROOT_CREDENTIAL_CACHE["values"] = {
+                hashlib.sha256(("hermes-mux:" + str(values.get(k) or "").strip()).encode("utf-8")).hexdigest()[:16]
+                for k in _ROOT_CREDENTIAL_VARS if str(values.get(k) or "").strip()
+            }
+            _ROOT_CREDENTIAL_CACHE["mtime"] = st.st_mtime_ns
+        fingerprint = GatewayRunner._adapter_credential_fingerprint(adapter)
+        shared = bool(fingerprint) and fingerprint in _ROOT_CREDENTIAL_CACHE["values"]
+        logger.info("[MULTIPLEX] root-credential guard: profile_home=%s root=%s shared=%s", profile_home, root, shared)
+        return shared
+    except Exception:
+        logger.warning("[MULTIPLEX] root-credential guard failed open", exc_info=True)
+        return False
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner. An UNSET ``multiplex_profiles`` is
     settled first by ``resolve_multiplex_mode`` (the default is on; the boot guard keeps a fleet that
@@ -4457,13 +4500,17 @@ class GatewayRunner(
         stamps it). Gated on ``multiplex_profiles``, since the scoped run only activates under
         multiplexing; otherwise keys would be profile-namespaced while the agent ran in ``agent:main``.
         ``adapter_profile`` is the profile owning the receiving bot; only routes declaring it as
-        ``bot_profile`` apply (#104933)."""
+        ``bot_profile`` apply (#104933). When no route matches, a SynthPulse-mapped sender on the
+        shared bot is routed to their own profile (``gateway/synthpulse_identity.py``)."""
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return None
+        # SynthPulse: after the configured routes, a sender mapped to a person profile is routed
+        # into it (shared bot only; raises ProfileRouteRejected = fail closed for a bad mapping).
+        from gateway.synthpulse_identity import profile_route_for_source as _sp_person_route
         routes = getattr(config, "profile_routes", None)
         if not routes:
-            return None
+            return _sp_person_route(self, source, adapter_profile)
         if adapter_profile is None:
             # Sources built outside ``build_source`` may still carry the receiving adapter as provenance.
             owner = self._transport_owner(source) if callable(getattr(source, "_transport_adapter_ref", None)) else None
@@ -4499,7 +4546,7 @@ class GatewayRunner(
             "No profile route matched: platform=%s chat_id=%s thread_id=%s parent_chat_id=%s",
             source.platform.value, source.chat_id,
             getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None))
-        return None
+        return _sp_person_route(self, source, adapter_profile)
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME serves this source: the pinned identity's runtime

@@ -1321,6 +1321,55 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """SynthPulse: run the turn as the person mapped to this platform user.
+
+        Governance context plus, when the mapping names a profile, that profile
+        for the whole turn (config, skills, memory, sessions): session lookup,
+        transcript, agent run and persistence all happen inside it. Standalone,
+        ``bind_for_source`` enters the scope here; multiplexed, the routed
+        identity already carries the person's profile (``_profile_name_for_source``)
+        and this wrapper only binds governance. A mapping whose profile cannot be
+        applied drops the event (fail closed). Unmapped senders run exactly as
+        before. See gateway/synthpulse_identity.py.
+        """
+        _sp_handle = None
+        _sp_identity = None
+        _sp_source = getattr(event, "source", None)
+        try:
+            from gateway import synthpulse_identity as _sp_identity
+        except Exception:
+            _sp_identity = None
+        if _sp_identity is not None and _sp_source is not None:
+            _sp_multiplexed = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
+            if _sp_multiplexed:
+                # Identity FIRST (idempotent; ``_hm_admit_event`` repeats it) so the routing step
+                # has placed a mapped sender before the fail-closed check reads ``source.profile``.
+                try:
+                    self._canonicalize(_sp_source)
+                except Exception:
+                    logger.debug("synthpulse identity: canonicalize failed", exc_info=True)
+            _sp_drop = _sp_identity.fail_closed_reason(_sp_source, multiplexed=_sp_multiplexed)
+            if _sp_drop:
+                logger.warning(
+                    "Dropping inbound message from mapped %s user %s: %s",
+                    getattr(getattr(_sp_source, "platform", None), "value", "?"),
+                    getattr(_sp_source, "user_id", None), _sp_drop)
+                return None
+            try:
+                _sp_handle = _sp_identity.bind_for_source(
+                    _sp_source, str(getattr(_sp_source, "chat_id", "") or ""), multiplexed=_sp_multiplexed)
+            except Exception:
+                _sp_handle = None
+        try:
+            return await self._handle_message_unbound(event)
+        finally:
+            if _sp_handle is not None and _sp_identity is not None:
+                try:
+                    _sp_identity.reset(_sp_handle)
+                except Exception:
+                    pass
+
+    async def _handle_message_unbound(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL

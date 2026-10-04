@@ -766,16 +766,23 @@ class OpenAICompatRoutesMixin:
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
 
-            # tool_progress_callback deliberately NOT wired: it would duplicate the structured
-            # start/complete callbacks (which carry the tool_call id).
+            def _on_subagent_progress(event_type, name=None, preview=None, args=None, **kwargs):
+                # SynthPulse: forwards ONLY bounded subagent lifecycle updates (no arguments or
+                # reasoning; see tools/delegation_progress.py). Plain tool events are ignored here,
+                # so the structured start/complete callbacks stay the sole owner of tool progress.
+                from tools.delegation_progress import normalize_subagent_progress
+                subagent = normalize_subagent_progress(event_type, kwargs)
+                if subagent:
+                    _stream_q.put_threadsafe(("__tool_progress__", {"event": "subagent", **subagent}))
+
             # The completion id doubles as the run id; on_done drops the approval mapping once the
             # turn ends (POST /v1/runs/{id}/approval then answers 409) and sets the terminal status.
             approval_notify, end_stream_run = self._register_stream_approval(
                 request, completion_id, _stream_q, session_id)
             agent_task, agent_ref = self._spawn_stream_agent(
                 _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
-                approval_session_key=completion_id, **run_kwargs)
+                tool_complete_callback=_on_tool_complete, tool_progress_callback=_on_subagent_progress,
+                approval_notify_callback=approval_notify, approval_session_key=completion_id, **run_kwargs)
             # #13437 identity contract: an explicit-header client keeps addressing the id it
             # sent; the response echoes that stable id while reads/writes adopt the live tip,
             # so a rotation mid-turn (after these headers are prepared) never changes what the
