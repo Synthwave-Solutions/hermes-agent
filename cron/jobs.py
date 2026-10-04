@@ -1809,6 +1809,41 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+def _creating_owner_email() -> str:
+    """The person whose session is creating this job.
+
+    A cron job outlives the conversation that made it, so without this the
+    run has no identity and acts with the owner's full rights: exactly the
+    hole a governed user would otherwise walk through (29-08-2026). Empty for
+    admins, for the CLI and for ungoverned runs, which keeps every existing
+    job and every job Michael makes behaving as before.
+    """
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+
+        ctx = current_governance_context()
+        if ctx is None or getattr(ctx.access, "mode", "") != "enforce":
+            return ""
+        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+
+        identity = dwd_identity_for(ctx.access)
+        if identity is None:  # admin
+            return ""
+        owner = str(identity or "").strip().lower()
+    except ImportError:
+        logger.debug("cron: governance unavailable, job stays ownerless", exc_info=True)
+        return ""
+    if not owner:
+        # A governed session whose address we cannot read would otherwise
+        # produce an ownerless job, which is the very thing this prevents:
+        # such a job runs unbound. Refuse the create instead.
+        raise ValueError(
+            "Cannot schedule a job for this session: no verified account to run it as. "
+            "Ask your admin."
+        )
+    return owner
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1835,6 +1870,8 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    owner_email: Optional[str] = None,
+    enabled: bool = True,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1845,7 +1882,14 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation)."""
+    (a venv can be rebuilt or moved after creation). owner_email: the person this job runs as
+    (defaults to the creating governed session, see :func:`_creating_owner_email`). enabled:
+    compatibility alias for ``paused`` (``enabled=False`` means ``paused=True``), kept for the
+    SynthPulse frontend's atomic disabled duplicates."""
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    if not enabled:
+        paused = True
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1926,6 +1970,9 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": f["enabled_toolsets"],
         "workdir": f["workdir"],
+        # The person this job runs as. Every fire binds their governance
+        # context, so a job can never do more than the person who made it.
+        "owner_email": (str(owner_email).strip().lower() if owner_email else _creating_owner_email()),
     }
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
     # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature

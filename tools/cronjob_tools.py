@@ -50,7 +50,7 @@ from tools.cronjob_job_args import (
     _apply_continuity,
     _canonical_skills,
     _clean_str_list,
-    _format_job,
+    _format_job as _format_job_base,
     _gateway_liveness_notice,
     _local_delivery_notice,
     _mode_guidance_notes,
@@ -78,6 +78,95 @@ def _notify_provider_jobs_changed_safe() -> None:
         _notify_provider_jobs_changed()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Time context (fork, 27 Aug 2026): a one-shot was scheduled one hour late because the model
+# guessed the clock. The system prompt carries the date only (byte-stable for prompt caching),
+# so the tool owns the time: action='now', now_local/next_run_local on every scheduling reply,
+# and a past one-shot is refused with the current time in the error.
+# ---------------------------------------------------------------------------
+
+def _local_time_string(value: Any, tzinfo=None) -> Optional[str]:
+    """Render an ISO timestamp as local wall-clock text, e.g.
+    ``Thu 2026-08-27 09:40 CEST``. None when the value is not a timestamp."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime as _dt
+
+        dt = _dt.fromisoformat(str(value).replace("Z", "+00:00"))
+        if tzinfo is None:
+            from hermes_time import now as _now
+
+            tzinfo = _now().tzinfo
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tzinfo)
+        return dt.astimezone(tzinfo).strftime("%a %Y-%m-%d %H:%M %Z")
+    except Exception:
+        return None
+
+
+def _time_context(next_run_at: Any = None) -> Dict[str, Any]:
+    """Current wall-clock context for scheduling replies: now_local, now_iso, timezone,
+    utc_offset and (when given) the resolved next run in the configured timezone. The model
+    must repeat both to the user."""
+    from hermes_time import now as _now
+
+    current = _now()
+    zone = getattr(current.tzinfo, "key", None) or current.tzname() or "local"
+    out: Dict[str, Any] = {
+        "now_local": current.strftime("%a %Y-%m-%d %H:%M %Z"),
+        "now_iso": current.isoformat(timespec="seconds"),
+        "timezone": str(zone),
+        "utc_offset": current.strftime("%z"),
+    }
+    if next_run_at:
+        local = _local_time_string(next_run_at, current.tzinfo)
+        if local:
+            out["next_run_local"] = local
+    return out
+
+
+def _one_shot_in_past_error(schedule: str) -> Optional[str]:
+    """A one-shot whose time already passed is a wrong timestamp, never a job.
+    Returns the error text, or None when the schedule is fine/recurring. Stricter and more
+    explanatory than the store's grace-window rejection (cron.jobs): it names the current time."""
+    try:
+        from datetime import datetime as _dt, timedelta
+        from hermes_time import now as _now
+
+        parsed = parse_schedule(schedule)
+        if parsed.get("kind") != "once" or not parsed.get("run_at"):
+            return None
+        run_at = _dt.fromisoformat(str(parsed["run_at"]))
+        current = _now()
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=current.tzinfo)
+        if run_at < current - timedelta(minutes=1):
+            return (
+                f"Requested one-shot time {run_at.astimezone(current.tzinfo).strftime('%a %Y-%m-%d %H:%M %Z')} "
+                "is in the past and cannot be scheduled (it has already passed); "
+                f"it is now {current.strftime('%a %Y-%m-%d %H:%M %Z')} "
+                f"({getattr(current.tzinfo, 'key', None) or current.tzname()}). "
+                "Recompute the intended timestamp from now_local (or ask the user "
+                "whether they meant the next occurrence) and create again."
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """``cronjob_job_args._format_job`` plus ``next_run_local`` right after ``next_run_at``."""
+    base = _format_job_base(job)
+    out: Dict[str, Any] = {}
+    for key, value in base.items():
+        out[key] = value
+        if key == "next_run_at":
+            out["next_run_local"] = _local_time_string(job.get("next_run_at"))
+    out.setdefault("next_run_local", _local_time_string(job.get("next_run_at")))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +733,9 @@ def _action_create(a: Dict[str, Any]) -> str:
     deliver = _normalize_deliver_param(a["deliver"])
     if not a["schedule"]:
         return tool_error("schedule is required for create", success=False)
+    past_error = _one_shot_in_past_error(a["schedule"])
+    if past_error:
+        return tool_error(past_error, success=False, **_time_context())
     canonical_skills = _canonical_skills(a["skill"], a["skills"])
     _no_agent = bool(a["no_agent"])
     # no_agent=True -> the script IS the job (prompt/skills optional); else prompt or skills.
@@ -704,13 +796,20 @@ def _action_create(a: Dict[str, Any]) -> str:
     _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
         "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
         _local_delivery_notice(job, deliver))))
+    _when = _time_context(job.get("next_run_at"))
+    if _when.get("next_run_local"):
+        _create_message = (
+            f"{_create_message} First run: {_when['next_run_local']} "
+            f"({_when['timezone']}); it is now {_when['now_local']}. "
+            "Confirm this exact local date, time and timezone to the user."
+        )
     # The builtin ticker lives in the gateway process: with no gateway running the job is stored
     # but never fires — tell the model (the CLI already warns).
     _result = {
         "success": True, "job_id": job["id"], "name": job["name"], "skill": job.get("skill"),
         "skills": job.get("skills", []), "schedule": job["schedule_display"], "repeat": _repeat_display(job),
-        "deliver": job.get("deliver", "local"), "next_run_at": job["next_run_at"], "job": _format_job(job),
-        "message": _create_message, **_gateway_liveness_notice(),
+        "deliver": job.get("deliver", "local"), "next_run_at": job["next_run_at"], **_when,
+        "job": _format_job(job), "message": _create_message, **_gateway_liveness_notice(),
     }
     return _dumps(_with_guidance(_result, job, deliver))
 
@@ -951,7 +1050,11 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
         {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
 
 
-_JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
+_JOBLESS_ACTIONS = {
+    "create": _action_create, "list": _action_list,
+    # Fork: the model resolves the clock here before computing any specific-time schedule.
+    "now": lambda a: _dumps({"success": True, **_time_context()}),
+}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
@@ -1056,6 +1159,15 @@ CRONJOB_SCHEMA = {
 
 Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
 
+Use action='now' to get the current local time and timezone.
+
+TIME RULE: never assume the current time. Before scheduling anything at a specific clock
+time or relative to now, call action='now' (or use the now_local field every reply carries)
+and compute the timestamp from it in the configured timezone. Every create reply states
+now_local and next_run_local: repeat the exact local date, time and timezone to the user.
+A one-shot whose time has already passed is rejected; recompute or ask which occurrence
+the user meant.
+
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
@@ -1064,7 +1176,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run, now. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. 'now' returns the current local time and timezone; use it before computing any specific-time schedule."
             },
             "job_id": {
                 "type": "string",

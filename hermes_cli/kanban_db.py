@@ -2804,7 +2804,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True, force: bool = False,
+    fire_lifecycle_hook: bool = True, force: bool = False, allow_pending: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2822,6 +2822,11 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    An explicit human completion surface may set ``allow_pending`` to accept
+    ``todo`` and ``triage`` without first queuing a worker. Dependency checks
+    still apply. This opt-in never broadens run-fenced worker completion:
+    when ``expected_run_id`` is supplied, only the original states qualify.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2865,9 +2870,11 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND (status IN ('running', 'ready', 'blocked', 'review')
+                        OR (? AND status IN ('triage', 'todo')))
                 """
-        params: tuple = (result, now, task_id)
+        # ``allow_pending`` is a manual-surface opt-in; a run-fenced worker completion never gains it.
+        params: tuple = (result, now, task_id, bool(allow_pending and expected_run_id is None))
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
@@ -3288,6 +3295,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    allow_todo: bool = False,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3302,9 +3310,15 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    An explicit human surface may opt into blocking ``todo`` with
+    ``allow_todo``. This does not broaden run-fenced worker transitions or
+    dependency-kind routing; unblock still rechecks unfinished parents.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    # Manual (human) opt-in only: a run-fenced worker call never gains ``todo``.
+    manual_todo = bool(allow_todo and expected_run_id is None and kind != "dependency")
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3333,7 +3347,11 @@ def block_task(
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
             return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        source_status = (
+            _retry_status_for_run(conn, task_id)
+            if cur_row["status"] == "running"
+            else "todo" if manual_todo and cur_row["status"] == "todo" else "ready"
+        )
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3358,9 +3376,9 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND (status IN ('running', 'ready') OR (? AND status = 'todo'))
                 """
-        params = (*params, task_id)
+        params = (*params, task_id, manual_todo)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
