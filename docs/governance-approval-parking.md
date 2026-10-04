@@ -1,0 +1,7 @@
+# Denied operation provenance and parking
+
+Grant requests keep the original aggregate key and counters. Each also stores up to 128 immutable operation records keyed by a SHA-256 digest of actor, session, run request, tool-call ID, grant kind/value and tool/reason. Records contain no tool arguments or policy payload. Trigger text is separately redacted. Missing or conflicting IDs are unresolved; absent trusted original-message hashes have unresolved freshness. Overflow is explicit and cannot park an unrecorded call.
+
+A trusted in-process adapter may bind `approval_waiter(operation)` and a canonical `approval_policy_path` on the frozen governance context. Neither capability is serialized. The waiter must return within 300 seconds and honor cancellation. Only a fully bound, persisted operation can reach it. Returning exactly `True` signals approval, not permission to execute: the engine reloads policy and rechecks tool and argument authorization before the same waiting call frame proceeds. No old prompt or tool arguments are replayed. Failure remains a denial and invokes the optional waiter `finish(operation_id, False)` notification. Successful revalidation means resumed, not completed; the normal run outcome establishes completion.
+
+Restart loses the in-memory waiter and call frame. A consumer must mark such intentions as requiring input, never reconstruct an invocation from this spool. The WebUI consumer remains responsible for explicit per-operation consent, matching the active run, one-time signaling and cancellation.
