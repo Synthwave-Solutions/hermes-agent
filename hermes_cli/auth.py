@@ -2178,7 +2178,9 @@ def _get_aws_sdk_auth_status(target: str) -> Dict[str, Any]:
     """AWS SDK providers (Bedrock) — check via boto3 credential chain."""
     try:
         from agent.bedrock_adapter import has_aws_credentials
-        return {"logged_in": has_aws_credentials(), "provider": target}
+        # Status checks are interactive discovery: bound the IMDS probe so an
+        # unreachable metadata endpoint cannot stall the picker/status path.
+        return {"logged_in": has_aws_credentials(metadata_timeout=0.25), "provider": target}
     except ImportError:
         return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
 

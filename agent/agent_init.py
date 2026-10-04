@@ -9,6 +9,9 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 
 from __future__ import annotations
 
+import contextvars
+import functools
+import json
 import logging
 import os
 import re
@@ -29,7 +32,8 @@ from agent.memory_manager import StreamingContextScrubber
 from agent.memory_provider import is_core_memory_provider
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH, fetch_model_metadata, is_local_endpoint, query_ollama_num_ctx
+    MINIMUM_CONTEXT_LENGTH, fetch_model_metadata, is_local_endpoint, is_explicit_remote_router,
+    query_ollama_num_ctx
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -360,6 +364,84 @@ def _parse_config_int(raw: Any, default: int) -> int:
         return default
 
 
+def _enforce_dashboard_governance_model_policy(agent) -> None:
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.model_policy import model_allowed_for_context
+
+        ctx = current_governance_context()
+        if ctx is None:
+            return
+        decision = model_allowed_for_context(ctx, provider=agent.provider, model=agent.model)
+    except Exception as exc:
+        try:
+            ctx = current_governance_context()  # type: ignore[name-defined]
+            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
+                raise PermissionError("dashboard governance denied model: governance_model_policy_error") from exc
+        except NameError:
+            pass
+        return
+    if not decision.allowed:
+        raise PermissionError(f"dashboard governance denied model: {decision.reason}")
+
+
+_CONSTRUCTOR_PHASES = frozenset({
+    "provider_setup", "plugin_discovery", "tool_definitions", "session_setup",
+    "profile_setup", "context_setup", "context_hooks", "finalize",
+})
+_constructor_trace = contextvars.ContextVar("hermes_constructor_trace", default=None)
+
+
+def _constructor_phase(stage: str) -> None:
+    """Advance content-free diagnostics without sharing state between workers."""
+    trace = _constructor_trace.get()
+    if trace is None or stage not in _CONSTRUCTOR_PHASES:
+        return
+    now = time.perf_counter()
+    trace["phases"].append({
+        "stage": trace["stage"], "outcome": "completed",
+        "duration_ms": round(max(0.0, now - trace["started"]) * 1000, 3),
+    })
+    trace.update(stage=stage, started=now)
+
+
+def _trace_constructor(function):
+    """Record only fixed phases for an identified WebUI construction.
+
+    This is diagnostic, not a cache or scheduling change. The validated session
+    id lets an operator select one own QA construction without reading prompts,
+    credentials, model metadata, paths or other users' log content. Nested
+    constructors restore their parent's trace; exceptions remain unchanged.
+    """
+    @functools.wraps(function)
+    def wrapped(agent, *args, **kwargs):
+        sid = kwargs.get("session_id")
+        enabled = kwargs.get("platform") == "webui" and isinstance(sid, str) and bool(
+            re.fullmatch(r"[0-9a-f]{12}|[0-9a-f]{32}", sid)
+        )
+        trace = {"stage": "provider_setup", "started": time.perf_counter(), "phases": []} if enabled else None
+        token = _constructor_trace.set(trace)
+        outcome = "raised"
+        try:
+            result = function(agent, *args, **kwargs)
+            outcome = "completed"
+            return result
+        finally:
+            _constructor_trace.reset(token)
+            if trace is not None:
+                try:
+                    trace["phases"].append({
+                        "stage": trace["stage"], "outcome": outcome,
+                        "duration_ms": round(max(0.0, time.perf_counter() - trace["started"]) * 1000, 3),
+                    })
+                    logger.info("agent_init_timing %s", json.dumps({
+                        "session_id": sid, "outcome": outcome, "phases": trace["phases"],
+                    }, separators=(",", ":"), allow_nan=False))
+                except Exception:
+                    pass  # Optional observation must never mask construction/cancellation.
+    return wrapped
+
+
 def _cfg_flag(cfg: Dict[str, Any], key: str, default: bool) -> bool:
     """Legacy string-set truthiness used by the ``compression`` section."""
     return str(cfg.get(key, default)).lower() in {"true", "1", "yes"}
@@ -475,6 +557,8 @@ def _finalize_routing(agent, api_mode, credential_pool):
     # swap can change the route later, so ``_swap_credential`` applies the same helper again.
     from hermes_cli.anon_auth import pin_model_for_route
     agent.model = pin_model_for_route(agent.provider, agent.base_url, agent.model)
+    # SYNTHWAVE fork: dashboard governance gates the resolved provider/model before any client exists.
+    _enforce_dashboard_governance_model_policy(agent)
 
     # Auto-upgrade to Responses for GPT-5.x-style models and direct OpenAI URLs, unless
     # api_mode was explicit, the runtime is ACP (`acp://` clients route themselves, no
@@ -898,6 +982,9 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             bind_moa_runtime(agent, _fb["model"])
             return None
         agent.provider = _fb["provider"]
+        # SYNTHWAVE fork: the fallback's provider wins over a retained requested-provider label
+        # (hermes_cli.timeouts.provider_timeout_id / is_explicit_remote_router).
+        agent.requested_provider = _fb["provider"]
         agent.model = _fb_model or _fb["model"]
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
@@ -1121,6 +1208,7 @@ def _init_fallback_chain(agent, fallback_model):
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    _constructor_phase("plugin_discovery")
     # A feature that left core for a catalog plugin (Home Assistant) is installed for a home that
     # used it, once per process, before discovery so its tools are in this agent's snapshot.
     from hermes_cli.left_core_migration import recover_at_startup
@@ -1139,11 +1227,13 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    _constructor_phase("tool_definitions")
     import model_tools
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    _constructor_phase("session_setup")
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
     agent.tools = prune_oneshot_tools(agent.tools or [])
@@ -1246,6 +1336,7 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
+    _constructor_phase("profile_setup")
 
 
 def _apply_display_config(agent, _agent_cfg, platform):
@@ -1345,7 +1436,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     )
     if not skip_memory or _memory_toolset_requested:
         # Memory is optional — don't break agent init
-        with suppress(Exception):
+        try:
             from tools.memory_tool import (
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
             )
@@ -1362,15 +1453,24 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                     user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
+        except Exception:
+            # SYNTHWAVE fork: an invalid private scope must never become the shared fallback.
+            from tools.memory_tool import personal_memory_scope_active
+            if personal_memory_scope_active():
+                raise
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None
-    if memory_manager is not None and not skip_memory:
+    from tools.memory_tool import personal_memory_scope_active
+    # SYNTHWAVE fork: external plugins have no guaranteed actor-isolation contract. Do not attach a
+    # shared bot's provider (fresh or handed back) to an authenticated private-memory turn.
+    _private_memory_scope = personal_memory_scope_active()
+    if memory_manager is not None and not skip_memory and not _private_memory_scope:
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead
         # of being re-initialized (#120116). No initialize_all — the providers are already bound.
         agent._memory_manager = memory_manager
-    elif not skip_memory:
+    elif not skip_memory and not _private_memory_scope:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
             if not is_core_memory_provider(_mem_provider_name):
@@ -1448,6 +1548,8 @@ def _apply_agent_section(agent, _agent_cfg):
     for _key in (
         "stall_guards", "task_completion_guidance", "parallel_tool_call_guidance",
         "environment_probe", "bot_mode_protocol",
+        # SYNTHWAVE fork: retry truncated tool-call arguments (agent/turn_tool_validation.py).
+        "truncated_tool_args_retry",
     ):
         setattr(agent, f"_{_key}", bool(_agent_section.get(_key, True)))
     # Warm the probe (~0.5s of subprocesses) off-thread so the first prompt build finds it cached.
@@ -1572,6 +1674,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     # Opt-in idle compaction: compact up front when a session resumes after this many
     # seconds idle (0 = disabled). Consumed by build_turn_context().
     idle_compact_after_seconds = max(0, int(cfg.get("idle_compact_after_seconds", 0)))
+    # SYNTHWAVE fork: window of the router's fallback targets; when a routed primary fails on a
+    # larger request the loop compacts to it and retries (agent/routed_failover.py). None keeps
+    # upstream behavior.
+    from agent.routed_failover import parse_failover_context_length
+    agent._failover_context_length = parse_failover_context_length(cfg.get("failover_context_length"))
     return CompressionSettings(
         threshold=threshold,
         autoraise_notice_enabled=autoraise_notice_enabled,
@@ -1912,6 +2019,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
         from agent.context_pin import warn_once_on_pin_disagreement
         warn_once_on_pin_disagreement(agent.model, agent.base_url or "", _config_context_length)
 
+    _constructor_phase("context_setup")
     _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(_config_context_length)
     if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
         _ra().logger.warning(
@@ -2005,6 +2113,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             agent.model, base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
             config_context_length=_effective_context_length, provider=agent.provider,
             custom_providers=_custom_providers,
+            **({"requested_provider": agent.requested_provider}
+               if is_explicit_remote_router(agent.provider, agent.requested_provider) else {}),
         )
         # Per-model overrides BEFORE the initial update_model() so the first threshold
         # resolution already sees them.
@@ -2031,6 +2141,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
+            metadata_requested_provider=(agent.requested_provider
+                if is_explicit_remote_router(agent.provider, agent.requested_provider) else ""),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -2170,6 +2282,7 @@ def _inject_context_engine_tools(agent):
             for _names in (agent.valid_tool_names, agent._context_engine_tool_names, _existing_tool_names):
                 _names.add(_tname)
 
+    _constructor_phase("context_hooks")
     if agent.context_compressor:
         try:
             agent.context_compressor.on_session_start(
@@ -2192,7 +2305,8 @@ def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
             agent._ollama_num_ctx = int(_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
+    if (agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url)
+            and not is_explicit_remote_router(agent.provider, agent.requested_provider)):
         try:
             # api_key may be a callable (Entra token provider); detection needs a string.
             _key = agent.api_key if isinstance(agent.api_key, str) else ""
@@ -2389,6 +2503,7 @@ _CALLBACK_PARAMS = (
 )
 
 
+@_trace_constructor
 def init_agent(
     agent, base_url: str = None, api_key: str = None, provider: str = None, api_mode: str = None,
     acp_command: str = None, acp_args: list[str] | None = None, command: str = None,
@@ -2518,6 +2633,7 @@ def init_agent(
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)
     _inject_context_engine_tools(agent)
+    _constructor_phase("finalize")
     _init_usage_state(agent)
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)

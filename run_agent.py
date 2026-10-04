@@ -117,7 +117,12 @@ def _gateway_origin_json(agent: "AIAgent") -> Optional[str]:
 
 from agent.iteration_budget import IterationBudget
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    resolve_agent_provider_timeout,
+    uses_local_inference_patience,
+)
 
 _hermes_home = get_hermes_home()  # read by agent_init via _ra()._hermes_home
 _loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).parent / '.env')
@@ -570,7 +575,7 @@ class AIAgent(
     def _resolved_api_call_timeout(self) -> float:
         """Per-call request timeout: per-model ``timeout_seconds`` > provider ``request_timeout_seconds`` >
         ``HERMES_API_TIMEOUT`` > 1800s."""
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = resolve_agent_provider_timeout(self, get_provider_request_timeout)
         return cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
@@ -580,7 +585,7 @@ class AIAgent(
         Returns ``(seconds, uses_implicit_default)``; the implicit flag lets callers auto-disable the detector
         for local endpoints only when the user configured nothing.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = resolve_agent_provider_timeout(self, get_provider_stale_timeout)
         if cfg is not None:
             return cfg, False
         env_timeout = os.getenv("HERMES_API_CALL_STALE_TIMEOUT")
@@ -599,7 +604,7 @@ class AIAgent(
         list), scaled by estimated context size and capped by the run budget."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
-        if uses_implicit_default and base_url and is_local_endpoint(base_url):
+        if uses_implicit_default and uses_local_inference_patience(self, base_url):
             return float("inf")
 
         from agent.chat_completion_helpers import _high_effort_silence_floor, cap_to_run_budget, estimate_request_context_tokens
@@ -619,7 +624,7 @@ class AIAgent(
     def _stale_timeout_is_explicit(self) -> bool:
         """True when the user explicitly configured the stale timeout (config or env var); implicit values
         (reasoning floors, the 90s default) yield to the run-budget cap, explicit ones never do."""
-        return (get_provider_stale_timeout(self.provider, self.model) is not None
+        return (resolve_agent_provider_timeout(self, get_provider_stale_timeout) is not None
                 or os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None)
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
@@ -794,13 +799,16 @@ class AIAgent(
         (/refine) is never deferred but does not touch the ``focus``-keyed delegate/enabled gates.
         """
         # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
+        from agent.background_review import trace_background_review
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
+            trace_background_review(self, "skipped", reason="delegated")
             return
         task_cfg = None
         if focus is None:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
+                trace_background_review(self, "skipped", reason="disabled")
                 return
 
         # Structural clone at the single chokepoint: the fork sanitizes in place, and a shallow copy would
@@ -831,11 +839,13 @@ class AIAgent(
         """
         from agent.background_review import (
             finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
+            trace_background_review,
         )
         from tools.thread_context import propagate_context_to_thread
 
         review_run = prepare_background_review_run(self)
         if review_run is None:
+            trace_background_review(self, "skipped", reason="reservation_unavailable")
             return
         try:
             target, _prompt = spawn_background_review_thread(
@@ -852,8 +862,12 @@ class AIAgent(
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile.
-            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
+            t = threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review")
+            trace_background_review(self, "scheduled", review_run=review_run,
+                                    review_memory=bool(review_memory), review_skills=bool(review_skills))
+            t.start()
         except Exception:
+            trace_background_review(self, "failed", review_run=review_run, reason="startup_exception")
             finish_background_review_run(self, review_run)
             raise
 

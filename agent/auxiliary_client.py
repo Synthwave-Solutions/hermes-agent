@@ -5552,14 +5552,21 @@ _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
 
 
 def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
-    """True when ``provider``/``model`` is known to accept image input; unknown capability → True (attempt the call)."""
+    """True when ``provider``/``model`` is known to accept image input; unknown capability → True (attempt the call).
+
+    Availability probes use only configuration and cached capabilities. Actual
+    image resolution, outside probe mode, retains live capability discovery.
+    """
     try:
         from agent.image_routing import _lookup_supports_vision
         from hermes_cli.config import load_config_readonly
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config_readonly())
+        supports = _lookup_supports_vision(
+            provider, model, load_config_readonly(),
+            allow_network=not _aux_probe_active(),
+        )
     except Exception:  # pragma: no cover - defensive
         return True
     return True if supports is None else bool(supports)

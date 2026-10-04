@@ -188,6 +188,11 @@ DEFAULT_CONFIG = {
         # read-only commands) into one batched turn; the runtime already runs them concurrently. ~70
         # cached tokens. False disables.
         "parallel_tool_call_guidance": True,
+        # SYNTHWAVE fork. Retry tool calls whose JSON arguments were cut off even when the router
+        # reported finish_reason=tool_calls (hiding an output-cap truncation): up to 4 re-issues of
+        # the same request with a doubled output budget before refusing to execute incomplete
+        # arguments. False restores upstream's immediate refusal (#91717).
+        "truncated_tool_args_retry": True,
         # Toolchain probe: surfaces Python/pip/uv/PEP-668 state in the system prompt only when
         # something non-default is detected (no pip module, pip/python mismatch, PEP 668 without
         # uv); zero tokens when clean. Skipped for docker/modal/ssh backends (own probe).
@@ -691,6 +696,11 @@ DEFAULT_CONFIG = {
         # scope it to one route ({"openai-codex:astra": 0.85} leaves Astra on OpenRouter/Nous at the
         # global value). The <512K floor (0.75) still applies raise-only on top.
         "model_thresholds": {},
+        # SYNTHWAVE fork. Context window of the router's fallback targets (e.g. 272000 when Codex
+        # models back a 1M Opus route). When a routed primary fails for a transient reason on a
+        # request larger than that window, the router has already filtered the fallbacks out;
+        # compact to this window once and retry. None = off (upstream behavior).
+        "failover_context_length": None,
         # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts
         # up front, before the first reply. Time-based complement to `threshold`; skipped when
         # already at/below threshold × target_ratio; honors the same cooldown/ anti-thrash/lock

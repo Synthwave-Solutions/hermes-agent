@@ -25,6 +25,7 @@ from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 from tui_gateway import server as tui_server
+from tests.agent.raw_response_mock import wire_raw_response
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,9 @@ def agent():
             skip_context_files=True,
             skip_memory=True,
         )
-        a.client = MagicMock()
+        # SynthPulse captures OmniRoute routing headers through the SDK raw
+        # response API; retain each test's configured parsed-response mock.
+        a.client = wire_raw_response(MagicMock())
         return a
 
 
@@ -2448,12 +2451,31 @@ class TestParallelScopePathNormalization:
 class TestMcpParallelToolBatch:
     """Integration test: _should_parallelize_tool_batch respects MCP parallel flag."""
 
-    def test_mcp_tools_default_sequential(self):
-        """MCP tools without supports_parallel_tool_calls are sequential."""
+    def test_mcp_tools_default_parallel(self):
+        """Allow-by-default admission (SynthPulse, bdf9b7afd): MCP tools from a
+        server without an explicit serial pin run concurrently."""
         from agent.tool_dispatch_helpers import _should_parallelize_tool_batch
         tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
         tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
-        assert not _should_parallelize_tool_batch([tc1, tc2])
+        assert _should_parallelize_tool_batch([tc1, tc2])
+
+    def test_mcp_tools_sequential_when_server_pinned_serial(self):
+        """``supports_parallel_tool_calls: false`` keeps a stateful server serial."""
+        from agent.tool_dispatch_helpers import _should_parallelize_tool_batch
+        from tools.mcp_tool import _lock, _mcp_tool_server_names, _parallel_blocked_servers
+        with _lock:
+            _parallel_blocked_servers.add("github")
+            _mcp_tool_server_names["mcp__github__list_repos"] = "github"
+            _mcp_tool_server_names["mcp__github__search_code"] = "github"
+        try:
+            tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
+            tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
+            assert not _should_parallelize_tool_batch([tc1, tc2])
+        finally:
+            with _lock:
+                _parallel_blocked_servers.discard("github")
+                _mcp_tool_server_names.pop("mcp__github__list_repos", None)
+                _mcp_tool_server_names.pop("mcp__github__search_code", None)
 
     def test_mcp_tools_parallel_when_server_opted_in(self):
         """MCP tools from a parallel-safe server can run concurrently."""
@@ -4354,6 +4376,92 @@ class TestRunConversation:
         assert result["final_response"] == "Part 1 Part 2"
         assert requested_caps == [65536, 131072]
 
+    def test_truncated_tool_args_with_tool_calls_finish_reason_retries(self, agent):
+        """Routers can hide output-cap truncation behind finish_reason='tool_calls'.
+
+        If tool arguments are cut off but the router reports ``tool_calls``
+        instead of ``length``, Hermes must retry with a larger output budget
+        rather than surfacing the recurring "Response truncated..." error.
+        """
+        self._setup_agent(agent)
+        requested_caps = []
+
+        def _fake_build_api_kwargs(api_messages):
+            ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+            if ephemeral is not None:
+                agent._ephemeral_max_output_tokens = None
+            cap = ephemeral if ephemeral is not None else 4096
+            requested_caps.append(cap)
+            return {"model": agent.model, "messages": api_messages, "max_tokens": cap}
+
+        truncated_tool = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="web_search",
+                    arguments='{"query": "long diagnostic output',
+                    call_id="c1",
+                )
+            ],
+        )
+        retried_tool = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="web_search",
+                    arguments='{"query": "long diagnostic output"}',
+                    call_id="c2",
+                )
+            ],
+        )
+        final = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            truncated_tool,
+            retried_tool,
+            final,
+        ]
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=_fake_build_api_kwargs),
+            patch("model_tools.handle_function_call", return_value="search result") as handle_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert agent.client.chat.completions.create.call_count == 3
+        handle_call.assert_called_once()
+        assert requested_caps[:2] == [4096, 8192]
+
+    def test_truncated_tool_args_retry_disabled_refuses_immediately(self, agent):
+        """agent.truncated_tool_args_retry: false restores upstream's refusal (#91717)."""
+        self._setup_agent(agent)
+        agent._truncated_tool_args_retry = False
+        truncated_tool = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments='{"query": "cut', call_id="c1")],
+        )
+        agent.client.chat.completions.create.side_effect = [truncated_tool]
+
+        with (
+            patch("model_tools.handle_function_call", return_value="search result") as handle_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert agent.client.chat.completions.create.call_count == 1
+        handle_call.assert_not_called()
+
     def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
         """Local Ollama-hosted GLM (no :cloud suffix) misreports truncated output as stop."""
         self._setup_agent(agent)
@@ -4673,7 +4781,8 @@ class TestRunConversation:
         bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+        # The fork retries truncated arguments four times before closing the tail.
+        agent.client.chat.completions.create.side_effect = [good_resp] + [bad_resp] * 5
 
         with (
             patch("model_tools.handle_function_call", return_value='{"success":true}'),

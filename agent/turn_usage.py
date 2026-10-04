@@ -78,6 +78,12 @@ def record_response_usage(
     and the API-call log line (see module docstring). No-usage responses only
     consume a pending compaction verdict. Returns the loop-visible outcome."""
     rearmed = False
+    # SYNTHWAVE fork: dynamic router context window. OmniRoute and similar routers
+    # report the model they actually routed to (response headers / response.model);
+    # retarget the compressor after every successful response, streaming or not,
+    # even when the provider omitted usage accounting for this completion.
+    from agent.chat_completion_helpers import capture_omniroute_route
+    capture_omniroute_route(agent, response)
     compressor = agent.context_compressor
     # Count every completed provider attempt, including providers that omit usage.
     # Token/cost accounting below stays gated on real usage, but the request itself
@@ -225,6 +231,9 @@ def record_response_usage(
     cost_result = estimate_usage_cost(
         _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
+        # SYNTHWAVE fork: accounting must not block delivery on a cold /models probe.
+        # Missing cached pricing remains unknown, never fabricated zero.
+        cached_only=True,
     )
     # Cost delta = aggregator + MoA advisor cost (already priced per-advisor at each
     # advisor's own model rate), so state.db's estimated_cost_usd matches the folded

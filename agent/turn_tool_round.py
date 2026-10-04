@@ -48,7 +48,7 @@ def run_tool_round(
     conversation_history: Any, api_call_count: Any, effective_task_id: Any, user_message: Any,
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
-    truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    truncated_tool_call_retries: Any, current_turn_user_idx: Any, api_kwargs: Any = None,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -78,7 +78,10 @@ def run_tool_round(
         agent, assistant_message, finish_reason, messages=messages,
         conversation_history=conversation_history, api_call_count=api_call_count,
         effective_task_id=effective_task_id,
+        truncated_tool_call_retries=truncated_tool_call_retries, api_kwargs=api_kwargs,
     )
+    # SYNTHWAVE fork: truncated tool-call arguments are retried (and counted) here.
+    truncated_tool_call_retries = _tvv.truncated_tool_call_retries
     if _tvv.action == "return":
         return _verdict("return", _tvv.result)
     if _tvv.action == "continue":

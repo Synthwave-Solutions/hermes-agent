@@ -491,9 +491,9 @@ def _anthropic_fast_mode_entry(model: str) -> Optional[PricingEntry]:
         _normalize_anthropic_model_name(name))
 
 
-def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+def _openrouter_pricing_entry(route: BillingRoute, *, cached_only: bool = False) -> Optional[PricingEntry]:
     return _pricing_entry_from_metadata(
-        fetch_model_metadata(), route.model,
+        fetch_model_metadata(cached_only=True) if cached_only else fetch_model_metadata(), route.model,
         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
         pricing_version="openrouter-models-api",
     )
@@ -555,19 +555,24 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    cached_only: bool = False,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
     if route.provider == "openrouter":
-        return _openrouter_pricing_entry(route)
+        return _openrouter_pricing_entry(route, cached_only=True) if cached_only else _openrouter_pricing_entry(route)
 
     bundled_entry = _lookup_official_docs_pricing(route)
     if bundled_entry:
         return bundled_entry
     if route.base_url:
+        # cached_only (response accounting) never starts a cold /models probe;
+        # missing cached pricing stays unknown rather than blocking delivery.
+        metadata_kwargs = {"cached_only": True} if cached_only else {}
         entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""), route.model,
+            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or "", **metadata_kwargs), route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
         )
@@ -665,7 +670,7 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
 
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
-    base_url: Optional[str] = None, api_key: Optional[str] = None,
+    base_url: Optional[str] = None, api_key: Optional[str] = None, cached_only: bool = False,
 ) -> CostResult:
     from providers import get_provider_profile
     profile = get_provider_profile(provider or '')
@@ -679,7 +684,10 @@ def estimate_usage_cost(
             pricing_version="included-route", notes=(_INCLUDED_NOTE,),
         )
 
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = get_pricing_entry(
+        model_name, provider=provider, base_url=base_url, api_key=api_key,
+        **({"cached_only": True} if cached_only else {}),
+    )
     if route.provider == "anthropic" and _served_fast(usage):
         entry = _anthropic_fast_mode_entry(route.model)
         if not entry:

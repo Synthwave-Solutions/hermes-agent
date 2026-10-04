@@ -4,7 +4,7 @@ import time
 from types import SimpleNamespace
 
 from agent import chat_completion_wait_notice as wn
-from agent.model_metadata import is_local_endpoint
+from hermes_cli.timeouts import uses_local_inference_patience
 
 
 class StreamingWaitMonitor:
@@ -63,7 +63,9 @@ class StreamingWaitMonitor:
             load_notice_shown=False, load_notice_misses=0, wait_notice_started_ts=None,
             wait_notice=wn.WaitNoticeState(),
         )
-        _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
+        # SYNTHWAVE fork: a named router on loopback (custom:omniroute) forwards remote inference;
+        # its load-notice liveness must not suspend the bounded stale watchdog.
+        _is_local_base = uses_local_inference_patience(self.agent)
         while not self._call_done.is_set():
             self._call_done.wait(timeout=0.3)
             _hb_now = time.time()

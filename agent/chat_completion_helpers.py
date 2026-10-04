@@ -24,7 +24,12 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    uses_local_inference_patience,
+    resolve_agent_provider_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
@@ -52,6 +57,9 @@ from agent.reasoning_summaries import (
 )
 from agent.repetition_guard import RunawayStreamWatch, is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_diag import (
+    stream_diag_start_timing, stream_diag_mark_timing, log_stream_attempt_timing,
+)
 from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -72,6 +80,70 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # outer retry loop (up to ~3 attempts x backoff, well under 60s) so an outage doesn't
 # double traffic every attempt, while later turns re-arm automatically.
 _STREAM_5XX_PROBE_WINDOW_S = 60.0
+
+
+def _extract_omniroute_route(http_response) -> tuple[str, str] | None:
+    """Extract the provider and model routed by OmniRoute response headers."""
+    headers = getattr(http_response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        model = headers.get("x-omniroute-model")
+        provider = headers.get("x-omniroute-provider")
+    except Exception:
+        return None
+    if model and provider:
+        return provider, model
+    return None
+
+
+def capture_omniroute_route(agent, response) -> None:
+    """Update context compression for the model actually selected by OmniRoute."""
+    route_info = getattr(agent, "_omniroute_route_info", None)
+    agent._omniroute_route_info = None
+    if route_info:
+        provider, model = route_info
+        resolved_model = f"{provider}/{model}"
+    else:
+        resolved_model = getattr(response, "model", None) if response else None
+    if not resolved_model or resolved_model == agent.model:
+        return
+    # OmniRoute's response header uses the short provider id "cx" for
+    # requests addressed to "codex". This is the same model, not a route
+    # change. Preserve the compressor's already-resolved context window;
+    # probing the unrecognized alias here blocks terminal delivery on HTTP
+    # metadata timeouts after the answer has already streamed to the user.
+    def canonical_route(model):
+        if isinstance(model, str) and model.startswith("cx/"):
+            return "codex/" + model[3:]
+        return model
+
+    compressor = getattr(agent, "context_compressor", None)
+    current_model = getattr(compressor, "model", None)
+    if canonical_route(resolved_model) == canonical_route(current_model):
+        return
+    if getattr(agent, "_effective_routed_model", None) == resolved_model:
+        return
+    from agent.model_metadata import get_model_context_length
+    try:
+        context_length = get_model_context_length(
+            resolved_model, base_url=agent.base_url, api_key=agent.api_key,
+            provider=agent.provider,
+        )
+    except Exception:
+        logger.debug("Failed to resolve context length for routed model %r", resolved_model, exc_info=True)
+        return
+    if context_length is None:
+        logger.debug("No context length resolved for routed model %r", resolved_model)
+        return
+    agent._effective_routed_model = resolved_model
+    agent._effective_context_length = context_length
+    agent.context_compressor.update_model(
+        model=resolved_model, context_length=context_length,
+        base_url=agent.base_url or "", api_key=agent.api_key or "",
+        provider=agent.provider or "", api_mode=agent.api_mode or "",
+        max_tokens=getattr(agent, "max_tokens", None),
+    )
 
 
 def _context_thread_target(callback):
@@ -628,7 +700,7 @@ def _stream_env_stale_base() -> "tuple[float, bool]":
 
 def _configured_stale_base(agent) -> float:
     """Per-provider ``stale_timeout_seconds`` config, else HERMES_STREAM_STALE_TIMEOUT (180s)."""
-    cfg = get_provider_stale_timeout(agent.provider, agent.model)
+    cfg = resolve_agent_provider_timeout(agent, get_provider_stale_timeout)
     return cfg if cfg is not None else _stream_env_stale_base()[0]
 
 
@@ -693,7 +765,7 @@ def _cloud_stale_timeout_for(agent, api_kwargs: dict) -> float:
     wins over every implicit floor — the context-size tier as well as the reasoning-model
     floor — so it can SHORTEN patience for a hung stream (#115024). Only the 180s default
     is scaled and floored."""
-    explicit = get_provider_stale_timeout(agent.provider, agent.model)
+    explicit = resolve_agent_provider_timeout(agent, get_provider_stale_timeout)
     if explicit is not None:
         return explicit
     base, explicit_env = _stream_env_stale_base()
@@ -791,7 +863,24 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     # request transform. No-op unless this really is the OpenAI SDK, so the
     # MoA facade above and the suite's stand-in clients are unaffected.
     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
-    return request_client.chat.completions.create(**api_kwargs)
+    # SYNTHWAVE fork: read OmniRoute's routing headers (x-omniroute-provider/-model) through the
+    # SDK raw-response API so compression can follow the model that actually answered
+    # (capture_omniroute_route). Gated on the real OpenAI SDK like the transform bypass above:
+    # facades and test stand-ins script ``create`` and keep that path.
+    completions = request_client.chat.completions
+    if type(completions).__module__.startswith("openai.") and hasattr(completions, "with_raw_response"):
+        raw_response = completions.with_raw_response.create(**api_kwargs)
+        # ``with_raw_response`` wraps whatever ``Completions.create`` currently is; when that
+        # has been replaced (instrumentation, the suite's SDK-boundary capture) the wrapper
+        # hands back an already-parsed object with no ``parse()`` and no headers to read.
+        parse = getattr(raw_response, "parse", None)
+        if not callable(parse):
+            return raw_response
+        omniroute_route = _extract_omniroute_route(raw_response)
+        if omniroute_route:
+            agent._omniroute_route_info = omniroute_route
+        return parse()
+    return completions.create(**api_kwargs)
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -875,7 +964,7 @@ def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return float("inf")
     base_url = getattr(agent, "base_url", None)
-    if getattr(agent, "api_mode", None) == "codex_responses" and not (base_url and is_local_endpoint(base_url)):
+    if getattr(agent, "api_mode", None) == "codex_responses" and not uses_local_inference_patience(agent, base_url):
         return _bound_openai_codex_stale_timeout(float(value), estimate_request_context_tokens(api_kwargs))
     return float(value)
 
@@ -1020,6 +1109,8 @@ def direct_api_call(agent, api_kwargs: dict):
     aborts in-flight sockets via the registered hook, and a per-call ``timeout``
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
+    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    _enforce_dashboard_governance_model_policy(agent)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Resolve the budget BEFORE the heartbeat starts: the resolver may raise
@@ -1219,7 +1310,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     # Local Responses servers keep their configured local stale/TTFB grace: the hosted
     # large-context floor, hard ceiling and TTFB scale-up/cap below must not tighten it.
     base_url = getattr(agent, "base_url", None)
-    local = bool(base_url) and is_local_endpoint(base_url)
+    local = uses_local_inference_patience(agent, base_url)
     if codex and not local:
         codex_floor = openai_codex_stale_timeout_floor(est_tokens)
         stale_timeout = _bound_openai_codex_stale_timeout(stale_timeout, est_tokens)
@@ -1296,6 +1387,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
+    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    _enforce_dashboard_governance_model_policy(agent)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
@@ -1543,13 +1636,21 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """
     from agent.opencode_affinity import merge_session_affinity_headers
 
-    kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
-    return merge_session_affinity_headers(
-        kwargs,
+    kwargs = merge_session_affinity_headers(
+        _build_api_kwargs_for_mode(agent, api_messages, tools_for_api),
         getattr(agent, "provider", None),
         getattr(agent, "base_url", None),
         getattr(agent, "session_id", None),
     )
+    # SYNTHWAVE fork: per-turn model tiering (``agent.model_tiering``). When the session model is
+    # the synthwave-auto combo, each turn picks a tier (luna/terra/sol) and reasoning effort from
+    # the question. Fail-open by design.
+    try:
+        from agent.model_tiering import apply_model_tiering
+        apply_model_tiering(agent, kwargs, api_messages)
+    except Exception:
+        logger.debug("model tiering unavailable", exc_info=True)
+    return kwargs
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -2974,6 +3075,7 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _emit_text(self, text: str) -> None:
         self._fire_first_delta()
+        stream_diag_mark_timing(self.clients.diag, "first_text_dispatch")
         self.agent._fire_stream_delta(text)
         self.deltas_were_sent["yes"] = True
 
@@ -2997,6 +3099,7 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback:
+            stream_diag_mark_timing(self.clients.diag, "first_text_dispatch")
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:
@@ -3012,6 +3115,7 @@ class _StreamingCall(StreamingWaitMonitor):
             diag["chunks"] = int(diag.get("chunks", 0)) + 1
             if diag.get("first_chunk_at") is None:
                 diag["first_chunk_at"] = self.last_chunk_time["t"]
+                stream_diag_mark_timing(diag, "first_chunk")
             # Delta-length estimate: ~3x cheaper than repr() per chunk.
             diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
 
@@ -3028,13 +3132,13 @@ class _StreamingCall(StreamingWaitMonitor):
         ``request_timeout_seconds`` wins over HERMES_API_TIMEOUT (1800s) and
         HERMES_STREAM_READ_TIMEOUT (120s); connect/pool cover the handshake, not
         inference: 30s, or capped at 60s when configured."""
-        cfg = get_provider_request_timeout(self.agent.provider, self.agent.model)
+        cfg = resolve_agent_provider_timeout(self.agent, get_provider_request_timeout)
         base = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
         if cfg is not None:
             return base, cfg, min(base, 60.0)
         read = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
         stale = self._stream_stale_timeout
-        if read == 120.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
+        if read == 120.0 and uses_local_inference_patience(self.agent):
             read = base  # local providers prefill for minutes
             logger.debug("Local provider detected (%s) — stream read timeout raised to %.0fs", self.agent.base_url, read)
         elif read == 120.0 and stale is not None and stale != float("inf") and stale > read:
@@ -3082,15 +3186,22 @@ class _StreamingCall(StreamingWaitMonitor):
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
+        stream_diag_mark_timing(self.clients.diag, "sdk_dispatch")
         return request_client.chat.completions.create(**stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
+        if response is not None:
+            stream_diag_mark_timing(self.clients.diag, "response_headers")
         self.agent._capture_rate_limits(response)
         self.agent._capture_credits(response)
         self.agent._capture_nous_model_switch(response)
         self.agent._stream_diag_capture_response(self.clients.diag, response)
         self.agent._check_openrouter_cache_status(response)
+        # SYNTHWAVE fork: remember OmniRoute's routed provider/model for capture_omniroute_route.
+        omniroute_route = _extract_omniroute_route(response)
+        if omniroute_route:
+            self.agent._omniroute_route_info = omniroute_route
         self._writer_token = claim_stream_writer(self.agent)
         self._reabort_if_cancelled(response)
 
@@ -3169,6 +3280,7 @@ class _StreamingCall(StreamingWaitMonitor):
         response_id = upstream_provider = None  # the provider's own id / serving upstream, from the chunks
         role = "assistant"
         _diag = self._new_diag()
+        stream_diag_start_timing(self.agent, _diag)
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
         from agent.chat_completion_helpers_relay import RelayChatAccumulator
         relay_response = RelayChatAccumulator()
@@ -3250,6 +3362,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 # Summary-part models omit the separator between markdown blocks; re-insert it.
                 reasoning_text = separate_glued_reasoning_blocks(
                     reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
+                stream_diag_mark_timing(_diag, "first_reasoning_chunk")
                 reasoning_parts.append(reasoning_text)
             # Structured reasoning_details deltas carry the provider's replay data; the
             # non-streaming path already keeps them, so dropping them here lost
@@ -3353,10 +3466,13 @@ class _StreamingCall(StreamingWaitMonitor):
             "switching %s/%s to non-streaming for this session.", self.agent.provider or "unknown",
             self.agent.model or "unknown")
         self.agent._disable_streaming = True
-        return self._replay_final_response(final_response)
+        return self._replay_final_response(final_response, mark_text_dispatch=True)
 
-    def _replay_final_response(self, final_response):
-        """Replay a completed chat-completions response's reasoning/content as deltas."""
+    def _replay_final_response(self, final_response, *, mark_text_dispatch: bool = False):
+        """Replay a completed chat-completions response's reasoning/content as deltas.
+
+        ``mark_text_dispatch`` stamps the attempt's content-free ``first_text_dispatch`` boundary
+        (the adopted stream=True attempt); chunk and header marks are never invented."""
         choices = final_response.choices
         message = getattr(choices[0] if isinstance(choices, (list, tuple)) and choices else None, "message", None)
         if message is not None:
@@ -3368,6 +3484,8 @@ class _StreamingCall(StreamingWaitMonitor):
             content = getattr(message, "content", None)
             if isinstance(content, str) and content:
                 self._fire_first_delta()
+                if mark_text_dispatch:
+                    stream_diag_mark_timing(self.clients.diag, "first_text_dispatch")
                 self.agent._fire_stream_delta(content)  # not _emit_text: deltas_were_sent stays False here
         return final_response
 
@@ -3848,6 +3966,16 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_anthropic_client(reason="anthropic_stream_request"), kind="anthropic_messages")
         return self._call_anthropic(request_client)
 
+    def _log_attempt_timing(self, stream_attempt: int, error: "BaseException | None") -> None:
+        """SYNTHWAVE fork: one content-free ``stream_attempt_timing`` row per chat-completions
+        attempt (``agent.stream_diag``); the anthropic wire records no timing boundaries."""
+        if self.agent.api_mode == "anthropic_messages":
+            return
+        cancelled = bool(self.agent._interrupt_requested) or (error is not None and (
+            self._request_cancelled["value"] or isinstance(error, InterruptedError)))
+        outcome = "cancelled" if cancelled else ("success" if error is None else "error")
+        log_stream_attempt_timing(self.clients.diag, attempt=stream_attempt + 1, outcome=outcome)
+
     def _call(self):
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
         # The one stream_options compatibility retry (#9705) is not a network retry and must not
@@ -3867,8 +3995,10 @@ class _StreamingCall(StreamingWaitMonitor):
                 try:
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
+                    self._log_attempt_timing(_stream_attempt, None)
                     return  # success
                 except Exception as e:
+                    self._log_attempt_timing(_stream_attempt, e)
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
@@ -3998,7 +4128,7 @@ class _StreamingCall(StreamingWaitMonitor):
         crashed endpoint forever. Cloud values scale with context size and are
         floored for known reasoning models (else BrokenPipeError from the gateway)."""
         base = _configured_stale_base(self.agent)
-        if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
+        if base == 180.0 and uses_local_inference_patience(self.agent):
             self._stream_stale_timeout = _local_stream_stale_timeout_default()
             logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs",
                 self.agent.base_url, self._stream_stale_timeout)
@@ -4107,6 +4237,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
+    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    _enforce_dashboard_governance_model_policy(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":
