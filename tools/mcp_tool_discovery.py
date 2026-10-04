@@ -341,6 +341,48 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     return registered_names
 
 
+def _apply_parallel_call_flags(own_key, srv_cfg: dict) -> None:
+    """Per-config parallel-call policy for one server key (caller holds ``_core._lock``): an
+    opt-in joins ``_parallel_safe_servers``; an EXPLICIT ``supports_parallel_tool_calls: false``
+    joins ``_parallel_blocked_servers`` (``is_mcp_tool_parallel_blocked``), an explicit serial
+    pin kept next to the opt-in batch admission for MCP tools (SYNTHWAVE fork)."""
+    if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
+        _core._parallel_safe_servers.add(own_key)
+        _core._parallel_blocked_servers.discard(own_key)
+    else:
+        _core._parallel_safe_servers.discard(own_key)
+        if "supports_parallel_tool_calls" in (srv_cfg or {}):
+            _core._parallel_blocked_servers.add(own_key)
+        else:
+            _core._parallel_blocked_servers.discard(own_key)
+
+
+def _reuse_live_registry(servers: Dict[str, dict]) -> Optional[List[str]]:
+    """SYNTHWAVE fork (docs/mcp-discovery-reuse.md): the cross-process lock serializes connection
+    CREATION, not reads of an already-live local registry. When every configured server has the
+    exact same config, a live session, no connect error and no connect in progress, return the
+    registered tool names without taking the lock (refreshing the per-config parallel-call flags).
+    Anything else (missing, changed, lazy, parked, reconnecting, filtered by the resolved-config
+    security check, a multiplexed profile scope, pending orphaned adopters) returns None so the
+    guarded registration path runs. Never creates a connection."""
+    if _config._filter_suspicious_mcp_servers(servers) != servers:
+        return None
+    with _core._lock:
+        # Profile-scoped registries heal per-scope overlays during registration; keep them on the
+        # guarded path, which this shortcut must never bypass.
+        if _core._mcp_registry_scope() is not None or _core._orphaned_adopters:
+            return None
+        for name, cfg in servers.items():
+            server = _core._servers.get(name)
+            if (server is None or name in _core._server_connecting or name in _core._server_connect_errors
+                    or getattr(server, "session", None) is None or getattr(server, "_error", None) is not None
+                    or getattr(server, "_config", None) != cfg):
+                return None
+        for name, cfg in servers.items():
+            _apply_parallel_call_flags(name, cfg)
+    return _registration._existing_tool_names()
+
+
 def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     """Pick connect candidates (enabled, not connected/connecting/lazy, not in backoff) and
     refresh per-server bookkeeping. Known servers without a live session are parked or
@@ -370,11 +412,7 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
         # key: the opt-in is the calling profile's policy, so B's parallel-safe `x` never makes A's
         # same-named serial `x` (own connection or adopted) run two calls at once.
         for srv_name, srv_cfg in servers.items():
-            own_key = _server_key(srv_name, current_scope, current=False)
-            if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
-                _core._parallel_safe_servers.add(own_key)
-            else:
-                _core._parallel_safe_servers.discard(own_key)
+            _apply_parallel_call_flags(_server_key(srv_name, current_scope, current=False), srv_cfg)
     for srv in stale_cached:
         _loop._signal_reconnect(srv)
     return new_servers
@@ -604,6 +642,9 @@ def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[st
     if not _core._ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
+    reused = _reuse_live_registry(servers)  # SYNTHWAVE fork: skip the lock for a live registry
+    if reused is not None:
+        return reused
     cookie = _acquire_discovery_lock_with_retry()
     try:
         with _core._lock:

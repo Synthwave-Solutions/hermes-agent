@@ -743,6 +743,12 @@ _HEADER_VISION = (
     "with your own vision — never send browser screenshots to a separate vision tool."
 )
 
+_HEADER_AUTO_VISION = (
+    " Work text-first with page_info() and DOM extraction. Screenshots may be "
+    "attached directly when the active model supports them; image routing is "
+    "resolved when the screenshot is requested."
+)
+
 _HEADER_TEXT_ONLY = (
     " Your model cannot view images, so work text-first: page_info() for state, js() for "
     "reading/extracting DOM text, fill_input(selector, text) for inputs, and "
@@ -780,8 +786,14 @@ def _description_header() -> str:
     if _lazy_call("tools.browser_tool_lightpanda_fallback", "lightpanda_engine_status", (False, ""),
                   "lightpanda engine status unavailable")[0]:  # no screenshots, whatever the model sees
         return _HEADER_BASE + _HEADER_TEXT_ONLY + _HEADER_LIGHTPANDA
-    vision = _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, "")
-    return _HEADER_BASE + (_HEADER_VISION if vision else _HEADER_TEXT_ONLY)
+    # Schema text must never wait on capability discovery: cached capabilities and explicit
+    # config only. Unknown → neutral wording (not "cannot view images"); the screenshot path
+    # re-resolves routing with live lookup when a capture is actually returned.
+    vision = _quiet(
+        lambda: importlib.import_module("tools.vision_tools")._should_use_native_vision_fast_path(
+            allow_network=False),
+        False, "")
+    return _HEADER_BASE + (_HEADER_VISION if vision else _HEADER_AUTO_VISION)
 
 
 def _dynamic_schema_overrides() -> dict:

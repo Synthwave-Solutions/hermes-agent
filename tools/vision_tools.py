@@ -521,27 +521,41 @@ _TOOL_RESULT_MEDIA_PROVIDERS = frozenset({
 _GEMINI_PROVIDERS = frozenset({"google", "gemini", "google-gemini", "google-vertex-gemini"})
 
 
-def _profile_rejects_tool_media(provider: str, model: str = "") -> bool:
+def _profile_rejects_tool_media(provider: str, model: str = "", *, allow_network: bool = True) -> bool:
     """Hard veto: the provider's ``ProviderProfile`` declares
     ``supports_vision_tool_messages=False`` — images are accepted in user
     messages but list-type tool-result content is rejected with 400
     (xiaomi/MiMo "text is not set"). ``supports_vision`` alone must not
     override this, or the multimodal tool-result envelope 400s every turn
     and the image never enters context (#89981).
+
+    ``allow_network=False`` (tool availability / schema wording): the routed-aggregator check
+    resolves the provider through the models.dev catalog, so approximate it locally and
+    conservatively instead: the transport profile's veto, or the veto of a ``vendor/`` model
+    prefix's profile. Image dispatch keeps the full catalog-backed check.
     """
     try:
-        from providers import routed_model_rejects_vision_tool_messages
-        return routed_model_rejects_vision_tool_messages(provider, model)
+        if allow_network:
+            from providers import routed_model_rejects_vision_tool_messages
+            return routed_model_rejects_vision_tool_messages(provider, model)
+        from providers import get_provider_profile
+        target, separator, _ = str(model or "").strip().partition("/")
+        for name in (provider, target if separator else ""):
+            name = str(name or "").strip().lower()
+            profile = get_provider_profile(name) if name else None
+            if profile is not None and profile.supports_vision_tool_messages is False:
+                return True
+        return False
     except Exception:
         return False
 
 
-def _supports_media_in_tool_results(provider: str, model: str) -> bool:
+def _supports_media_in_tool_results(provider: str, model: str, *, allow_network: bool = True) -> bool:
     """Whether provider+model accepts image content inside a tool-result message. Unknown
     providers are False (caller falls back to aux-LLM text) unless their ``ProviderProfile``
     declares ``supports_vision``; ``supports_vision_tool_messages=False`` is a hard veto."""
     p = provider.strip().lower() if isinstance(provider, str) else ""
-    if not p or _profile_rejects_tool_media(p, model):
+    if not p or _profile_rejects_tool_media(p, model, **({} if allow_network else {"allow_network": False})):
         return False
     if p in _TOOL_RESULT_MEDIA_PROVIDERS:
         return True
@@ -556,23 +570,28 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
         return False
 
 
-def _accepts_tool_result_images(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> bool:
+def _accepts_tool_result_images(
+    provider: str, model: str, cfg: Optional[Dict[str, Any]], *, allow_network: bool = True,
+) -> bool:
     """One gate for both native lanes — the ``vision_analyze`` fast path and the ``computer_use`` capture route
     (#115248): the profile's ``supports_vision_tool_messages=False`` veto first, then either the provider's tool
     results are known to carry media or the capability lookup (config override → catalog → probes → profile)
-    attests the model as vision-capable."""
-    if _profile_rejects_tool_media(provider, model):
+    attests the model as vision-capable. ``allow_network=False`` (schema/description callers) restricts the
+    lookup to cached capabilities so describing a tool never waits on models.dev or endpoint probes."""
+    lookup_kwargs = {} if allow_network else {"allow_network": False}
+    if _profile_rejects_tool_media(provider, model, **lookup_kwargs):
         return False
-    if _supports_media_in_tool_results(provider, model):
+    if _supports_media_in_tool_results(provider, model, **lookup_kwargs):
         return True
     from agent.image_routing import _lookup_supports_vision
-    return _lookup_supports_vision(provider, model, cfg) is True
+    return _lookup_supports_vision(provider, model, cfg, **lookup_kwargs) is True
 
 
-def _should_use_native_vision_fast_path() -> bool:
+def _should_use_native_vision_fast_path(*, allow_network: bool = True) -> bool:
     """True when image routing resolves to ``native`` AND the provider accepts images in tool
     results, or the user set the ``model.supports_vision`` override (escape hatch for
-    custom/local providers). Any failure → False."""
+    custom/local providers). Any failure → False. ``allow_network=False`` is for schema and
+    description callers: cached capabilities and explicit config only, no network probes."""
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
         from agent.image_routing import decide_image_input_mode
@@ -580,9 +599,10 @@ def _should_use_native_vision_fast_path() -> bool:
         provider = _read_main_provider()
         model = _read_main_model()
         cfg = load_config()
-        if decide_image_input_mode(provider, model, cfg) != "native":
+        lookup_kwargs = {} if allow_network else {"allow_network": False}
+        if decide_image_input_mode(provider, model, cfg, **lookup_kwargs) != "native":
             return False
-        return _accepts_tool_result_images(provider, model, cfg)
+        return _accepts_tool_result_images(provider, model, cfg, **lookup_kwargs)
     except Exception as exc:
         logger.debug("Native vision fast-path check failed: %s", exc)
         return False
@@ -946,8 +966,10 @@ def check_vision_requirements() -> bool:
     path. Both handlers attach pixels straight to a vision-capable main model, so a main model on a
     provider the aux resolver does not know (OAuth, local vLLM) must not hide a working tool (#47149).
     ``video_analyze`` keeps the aux-only gate — its handler has no native path.
+    Availability never waits on vision metadata: the native check uses config and cached
+    capabilities only; the handler re-resolves with live lookup when an image is dispatched.
     """
-    return _should_use_native_vision_fast_path() or check_video_requirements()
+    return _should_use_native_vision_fast_path(allow_network=False) or check_video_requirements()
 
 
 from tools.registry import registry, tool_error

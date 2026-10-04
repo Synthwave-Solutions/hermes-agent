@@ -514,6 +514,11 @@ def _reset_server_error(server_name: str) -> None:
 # Servers opted into parallel tool calls, keyed by the consuming profile's own key (``foo-bar``/
 # ``foo_bar`` sanitize alike but must not share policy; neither do two profiles' same-named servers).
 _parallel_safe_servers: set = set()
+# Servers whose config sets ``supports_parallel_tool_calls: false`` EXPLICITLY, same keying as
+# ``_parallel_safe_servers``. MCP batch admission is opt-in (agent.tool_dispatch_helpers), so this
+# explicit pin is a belt-and-braces barrier for a stateful server (the next call depends on the
+# state the previous one left behind). Populated where ``_parallel_safe_servers`` is.
+_parallel_blocked_servers: set = set()
 # registry tool name -> raw server name (the generated name is lossy; never re-parse it).
 _mcp_tool_server_names: Dict[str, str] = {}
 
@@ -522,6 +527,20 @@ _mcp_tool_server_names: Dict[str, str] = {}
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 _lock = threading.Lock()
+
+
+def is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
+    """True only when the tool's server config carries an explicit
+    ``supports_parallel_tool_calls: false`` (provenance captured at registration, never the
+    ambiguous ``mcp__{server}__{tool}`` shape). MCP batch admission is opt-in, so the flag is an
+    explicit, belt-and-braces serial pin for a stateful server (a browser, a build session)."""
+    from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
+    from tools.mcp_tool_scope import _server_key
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+        return bool(server_name and _server_key(server_name) in _parallel_blocked_servers)
 
 
 # ---- Shared parent-death supervisor (state lives HERE: tests rebind ``_death_supervisor``) ----

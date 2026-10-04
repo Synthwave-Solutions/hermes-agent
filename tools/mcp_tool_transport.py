@@ -453,21 +453,33 @@ class MCPServerTransportMixin:
         _build_client = _make_redirect_header_stripper(
             _httpx, _httpx.URL(url), strict=strict_redirect_headers,
             configured_header_names={key.lower() for key in probe_headers})
+        # SYNTHWAVE fork (docs/mcp-preflight-budget.md): httpx timeouts apply per I/O phase, not to
+        # the combined HEAD -> GET -> POST probe. One deadline over the client lifetime keeps this
+        # optional diagnosis from stacking those waits before the real handshake.
+        deadline = asyncio.timeout(timeout)
         try:
-            async with _build_client(
+            async with deadline, _build_client(
                     follow_redirects=True, timeout=_httpx.Timeout(timeout), transport=probe_transport,
                     **_present(mounts=_mcp_proxy_mounts(_httpx, url, ssl_verify, client_cert, self.name))) as client:
                 resp = await client.head(url, headers=probe_headers)  # cheapest; GET on 405/501
                 if resp.status_code in (405, 501):
-                    resp = await client.get(url, headers=probe_headers)
+                    # SYNTHWAVE fork (docs/mcp-preflight-header-latency.md): judge headers only; an
+                    # MCP GET may be a valid SSE stream that intentionally never finishes its body.
+                    async with client.stream("GET", url, headers=probe_headers) as resp:
+                        pass
                 # Non-MCP content type on HEAD/GET: try a JSON-RPC POST so POST-only servers pass.
                 if _non_mcp_2xx(resp):
-                    post_resp = await client.post(
-                        url, content=_PROBE_INITIALIZE_BODY,
-                        headers={**probe_headers, "Content-Type": "application/json",
-                                 "Accept": "application/json, text/event-stream"})
+                    async with client.stream(
+                            "POST", url, content=_PROBE_INITIALIZE_BODY,
+                            headers={**probe_headers, "Content-Type": "application/json",
+                                     "Accept": "application/json, text/event-stream"}) as post_resp:
+                        pass  # initialize may answer with an open SSE stream: close it before the SDK.
                     if _is_2xx(post_resp) and _content_type_base(post_resp) in self._MCP_CONTENT_TYPES:
                         resp = post_resp
+        except TimeoutError:
+            if not deadline.expired():
+                raise  # an unrelated TimeoutError, not this probe's budget
+            return  # Probe budget exhausted: let the real SDK handshake try.
         except _httpx.HTTPError:
             return  # DNS/connect/timeout/transport error — let the SDK try.
         if not _non_mcp_2xx(resp):
