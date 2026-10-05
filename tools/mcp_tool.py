@@ -112,7 +112,18 @@ _MCP_SDK_LAZY_SYMBOLS = frozenset(
     | {n for _mod, names, _msg in _OPTIONAL_TYPE_FAMILIES for n in names})
 
 
+# SynthPulse WebUI compatibility: entry points that moved into split modules, resolved lazily
+# because those modules import this one.
+_SPLIT_MODULE_EXPORTS = {
+    "discover_mcp_tools": "tools.mcp_tool_discovery",
+    "get_mcp_status": "tools.mcp_tool_discovery",
+    "shutdown_mcp_servers": "tools.mcp_tool_lifecycle",
+}
+
+
 def __getattr__(name: str):
+    if name in _SPLIT_MODULE_EXPORTS:
+        return getattr(importlib.import_module(_SPLIT_MODULE_EXPORTS[name]), name)
     if name in _MCP_SDK_LAZY_SYMBOLS:
         _ensure_mcp_sdk()
         try:
