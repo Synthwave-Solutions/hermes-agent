@@ -420,8 +420,19 @@ class EffectiveAccess:
             if not denied:
                 continue
             exception = any(grant_matches(self.grants.file_allow_globs, value) for value in values)
-            if not exception or (self.access_mode == "blacklist" and denied - {"**/.hermes/**"}):
+            if not exception:
                 return True
+            if self.access_mode == "blacklist" and denied - {"**/.hermes/**"}:
+                # 07-10-2026 (Michael): an approved per-person exception for ONE concrete
+                # path (a file, or one folder as "<dir>" / "<dir>/**") reopens a FOLDER deny
+                # it lies inside (e.g. ".../clients/**"); an approval that the engine then
+                # refused kept people blocked (Yaser, IvCB and CCC key folders). Name and type
+                # denies ("**/.env", "*bunq*", "*/credentials/*") and wildcard exceptions
+                # still never reopen anything.
+                for pattern in denied - {"**/.hermes/**"}:
+                    if not any(_concrete_exception_reopens(pattern, allow, value)
+                               for allow in self.grants.file_allow_globs for value in values):
+                        return True
         return False
 
     def _allowed_by_set(self, values: frozenset[str], value: str) -> bool:
@@ -443,3 +454,21 @@ class EffectiveAccess:
         if self.has_permission(permission):
             return AccessDecision(True, "allowed", tuple(self.permission_sources.get(permission) or self.permission_sources.get("*") or ()))
         return AccessDecision(False, "explicit_deny" if grant_matches(self.deny.permissions, permission) else "not_whitelisted", ())
+
+
+def _concrete_base(pattern: str) -> str | None:
+    """"<abs dir>" for "<abs dir>" or "<abs dir>/**" without other wildcards, else None."""
+    base = pattern[:-3] if pattern.endswith("/**") else pattern
+    if not base.startswith("/") or any(ch in base for ch in "*?["):
+        return None
+    return base.rstrip("/") or "/"
+
+
+def _concrete_exception_reopens(deny: str, allow: str, value: str) -> bool:
+    """A concrete exception covering *value* reopens a concrete folder deny it lies inside."""
+    deny_base, allow_base = _concrete_base(deny), _concrete_base(allow)
+    if deny_base is None or allow_base is None:
+        return False
+    covers = value == allow_base or (allow.endswith("/**") and value.startswith(allow_base + "/"))
+    inside = allow_base == deny_base or allow_base.startswith(deny_base.rstrip("/") + "/")
+    return covers and inside
