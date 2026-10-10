@@ -2740,9 +2740,8 @@ DEFAULT_CONFIG = {
     # SynthPulse model gateway contract. On a managed installation every
     # model call goes through the installation's own gateway, and the
     # installation renders this block (base_url, enforce, organisation,
-    # installation and module). These are inert defaults: nothing reads the
-    # block yet, and with enforce false every provider path works exactly as
-    # before. Fields:
+    # installation and module). These defaults are inert: with enforce
+    # false and no gateway URL every provider path works as before. Fields:
     #   base_url         the gateway's OpenAI-compatible base URL ("" = none)
     #   enforce          refuse any model route that is not the gateway
     #   org_id           organisation id stamped on traces

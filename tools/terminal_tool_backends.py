@@ -376,12 +376,8 @@ def _model_gateway_child_env() -> Dict[str, str]:
     layer's force prefix; identity and ceiling variables are not touched and
     keep whatever that layer injects. ``{}`` when enforcement is off.
     """
-    try:
-        from agent import model_gateway
-        from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+    from agent import model_gateway
+    from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 
-        return model_gateway.terminal_child_env(force_prefix=_HERMES_PROVIDER_ENV_FORCE_PREFIX)
-    except Exception:
-        logger.warning("model gateway child environment unavailable", exc_info=True)
-        return {}
-
+    # Missing keys or broken enforcement must prevent the child from starting.
+    return model_gateway.terminal_child_env(force_prefix=_HERMES_PROVIDER_ENV_FORCE_PREFIX)

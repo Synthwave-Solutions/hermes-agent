@@ -3,7 +3,7 @@
 Activated via ``plugins.enabled``; hooks are inert without the ``langfuse`` SDK
 and credentials. Env: HERMES_LANGFUSE_PUBLIC_KEY / SECRET_KEY (required),
 BASE_URL, ENV, RELEASE, SAMPLE_RATE, MAX_CHARS (12000), MAX_DEPTH (4), DEBUG, and CAPTURE =
-metadata (sizes/ids/usage only) | sanitized (default: secret redaction +
+metadata (default: sizes/ids/usage only) | sanitized (secret/personal-data redaction +
 truncation) | full (truncated raw content). See README.md.
 """
 from __future__ import annotations

@@ -47,7 +47,7 @@ HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag
 HERMES_LANGFUSE_SAMPLE_RATE=0.5      # sample 50% of traces
 HERMES_LANGFUSE_MAX_CHARS=12000      # max chars per field (default: 12000)
 HERMES_LANGFUSE_MAX_DEPTH=4          # max payload depth (default: 4)
-HERMES_LANGFUSE_CAPTURE=sanitized    # content capture mode (see below)
+HERMES_LANGFUSE_CAPTURE=metadata    # content capture mode (see below)
 HERMES_LANGFUSE_DEBUG=true           # verbose plugin logging
 ```
 
@@ -70,8 +70,8 @@ names, token usage, cost, timing — is always captured in every mode.
 
 | mode | behavior |
 |------|----------|
-| `metadata` | No content. Each content field is replaced by a shape/size stub (`{"omitted": true, "type": "text", "chars": N}`). |
-| `sanitized` | **(default)** Content is exported after secret-pattern redaction (API keys, tokens, JWTs, private keys, `password=`-style assignments) and truncation. Redaction runs *before* truncation. |
+| `metadata` | **(default)** No content. Each content field is replaced by a shape/size stub (`{"omitted": true, "type": "text", "chars": N}`). |
+| `sanitized` | Content is exported after secret and personal-data redaction (email, IBAN, validated card/BSN numbers, phone numbers; API keys, tokens, JWTs, private keys, `password=`-style assignments) and truncation. Redaction runs *before* truncation. |
 | `full` | Raw content, truncated only. Explicit opt-in — traces will contain whatever passed through the conversation, including injected memory and file contents. |
 
 The active mode is recorded on every trace as `metadata.capture_mode`.

@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tools import tts_tool_openai
+
 GATEWAY_KEY = "sk-gw-engine-test-0002"
 PROVIDER_KEY = "sk-provider-must-not-leak"
 
@@ -155,7 +157,7 @@ def test_nous_and_use_gateway_selections_are_refused(gateway, key_file):
     _assert_refusal(tts_tool.text_to_speech_tool("hello"), "tts", "nous")
     _enforce(gateway, tts={"provider": "openai", "use_gateway": True})
     with pytest.raises(ModelGatewayRefused):
-        tts_tool._resolve_openai_audio_client_config()
+        tts_tool_openai._resolve_openai_audio_client_config()
 
 
 def test_openai_speech_reaches_only_the_gateway(gateway, key_file, no_outbound, monkeypatch, tmp_path):
@@ -164,7 +166,7 @@ def test_openai_speech_reaches_only_the_gateway(gateway, key_file, no_outbound, 
     monkeypatch.setenv("OPENAI_API_KEY", PROVIDER_KEY)
     monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", PROVIDER_KEY)
     _enforce(gateway, tts={"provider": "openai"})
-    assert tts_tool._resolve_openai_audio_client_config() == (GATEWAY_KEY, gateway.base_url, False)
+    assert tts_tool_openai._resolve_openai_audio_client_config() == (GATEWAY_KEY, gateway.base_url, False)
     out = tmp_path / "speech.mp3"
     tts_tool.text_to_speech_tool("hello there", output_path=str(out))
     speech = [r for r in gateway.requests if r["path"] == "/v1/audio/speech"]
@@ -179,7 +181,7 @@ def test_openai_speech_on_a_provider_url_is_refused(gateway, key_file):
 
     _enforce(gateway, tts={"provider": "openai", "openai": {"base_url": "https://api.openai.com/v1"}})
     with pytest.raises(ModelGatewayRefused):
-        tts_tool._resolve_openai_audio_client_config()
+        tts_tool_openai._resolve_openai_audio_client_config()
     _assert_refusal(tts_tool.text_to_speech_tool("hello"), "tts", "openai")
 
 
@@ -382,7 +384,7 @@ def test_nous_tool_gateway_refused_unless_named(gateway, key_file, monkeypatch):
     assert mtg.resolve_managed_tool_gateway("firecrawl") is None
     with pytest.raises(ModelGatewayRefused):
         mtg.build_vendor_gateway_url("fal-queue")
-    assert mtg.managed_vendor_endpoints("krea") is None
+    assert mtg.resolve_managed_tool_gateway("krea") is None
     assert tbh.managed_nous_tools_enabled(capability="tts") is False
     _write_config({"model_gateway": {"base_url": gateway.base_url, "enforce": True,
                                      "tool_exceptions": ["nous:openai-audio"]}})
@@ -425,7 +427,7 @@ except urllib.error.HTTPError as exc:
 
 
 def test_terminal_child_sees_only_the_gateway(gateway, key_file, monkeypatch, tmp_path):
-    from tools import terminal_tool
+    from tools import terminal_tool_backends as terminal_tool
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -447,7 +449,8 @@ def test_terminal_child_sees_only_the_gateway(gateway, key_file, monkeypatch, tm
         assert lines["ANTHROPIC_BASE_URL"] == gateway.base_url[: -len("/v1")]
         assert lines["ANTHROPIC_AUTH_TOKEN"] == GATEWAY_KEY
         assert PROVIDER_KEY not in result["output"]
-        assert lines.get("HERMES_DWD_IDENTITY") == "alice@acme.example"
+        # Untrusted ambient DWD identity remains stripped by upstream governance.
+        assert not lines.get("HERMES_DWD_IDENTITY")
         # Absolute paths: the fake CLIs, never a real provider CLI on PATH.
         assert "200" in env.execute(f"{bin_dir}/codex", timeout=30)["output"]
         assert "404" in env.execute(f"{bin_dir}/claude", timeout=30)["output"]
@@ -460,7 +463,7 @@ def test_terminal_child_sees_only_the_gateway(gateway, key_file, monkeypatch, tm
 
 
 def test_terminal_child_unchanged_without_enforcement(tmp_path):
-    from tools import terminal_tool
+    from tools import terminal_tool_backends as terminal_tool
 
     _write_config({})
     env = terminal_tool._create_environment("local", "", str(tmp_path), 30, task_id="r2-terminal-off")
@@ -468,3 +471,17 @@ def test_terminal_child_unchanged_without_enforcement(tmp_path):
         assert env.env == {}
     finally:
         env.cleanup()
+
+
+@pytest.mark.parametrize("module,capability", [("image_gen_registry", "image_gen"), ("video_gen_registry", "video_gen")])
+def test_direct_registry_availability_is_not_probed_under_enforcement(gateway, key_file, monkeypatch, module, capability):
+    from agent import image_gen_registry, video_gen_registry
+
+    registry = {"image_gen_registry": image_gen_registry, "video_gen_registry": video_gen_registry}[module]
+    class DirectProvider:
+        name = "fal"
+        def is_available(self):
+            pytest.fail("a refused provider must never perform an availability probe")
+    _enforce(gateway)
+    monkeypatch.setattr(registry._registry, "merged", lambda: {"fal": DirectProvider()})
+    assert registry.get_active_provider() is None

@@ -39,7 +39,7 @@ def _resolve_active_provider() -> Optional[ImageGenProvider]:
         logger.debug("image_gen.provider='%s' configured but not registered; falling back", configured)
 
     def _available(p: ImageGenProvider) -> bool:
-        return is_available_safe(p, logger, "image_gen provider %s.is_available() raised %s")
+        return is_available_safe(_gateway_checked(p), logger, "image_gen provider %s.is_available() raised %s")
 
     available = [p for p in snapshot.values() if _available(p)]
     if len(available) == 1:

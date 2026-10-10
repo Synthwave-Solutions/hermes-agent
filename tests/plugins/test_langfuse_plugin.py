@@ -11,6 +11,12 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture
+def sanitized_capture(monkeypatch):
+    """Content-shape regressions explicitly opt in to sanitized payload capture."""
+    monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "sanitized")
+
+
 # ---------------------------------------------------------------------------
 # Plugin discovery: langfuse is opt-in (not loaded unless explicitly enabled).
 # This guards against someone accidentally re-introducing a per-hook
@@ -100,6 +106,7 @@ class TestHooksInert:
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
 
 
+@pytest.mark.usefixtures("sanitized_capture")
 class TestPayloadSanitization:
     def test_safe_value_redacts_base64_data_uri_instead_of_truncating(self):
         sys.modules.pop("plugins.observability.langfuse", None)
@@ -520,6 +527,7 @@ class TestRequestMessageCoercion:
         assert mod._coerce_request_messages(user_message="u") == [{"role": "user", "content": "u"}]
 
 
+@pytest.mark.usefixtures("sanitized_capture")
 class TestAssistantMessageSerialization:
     def test_serialize_assistant_message_prefers_reasoning(self):
         sys.modules.pop("plugins.observability.langfuse", None)
@@ -576,6 +584,7 @@ class TestAssistantMessageSerialization:
         assert mod._serialize_assistant_message(message)["reasoning"] is None
 
 
+@pytest.mark.usefixtures("sanitized_capture")
 class TestToolCallOutputBackfill:
     def test_post_tool_call_backfills_matching_turn_tool_call_output(self, monkeypatch):
         sys.modules.pop("plugins.observability.langfuse", None)
@@ -642,6 +651,7 @@ class TestToolCallOutputBackfill:
         }]
 
 
+@pytest.mark.usefixtures("sanitized_capture")
 class TestToolObservationKeying:
     """Tests for pre/post tool_call observation matching when tool_call_id is absent."""
 
@@ -1033,17 +1043,17 @@ class TestCaptureModes:
         sys.modules.pop("plugins.observability.langfuse", None)
         return importlib.import_module("plugins.observability.langfuse")
 
-    def test_default_mode_is_sanitized(self, monkeypatch):
+    def test_default_mode_is_metadata(self, monkeypatch):
         mod = self._fresh_plugin()
         monkeypatch.delenv("HERMES_LANGFUSE_CAPTURE", raising=False)
-        assert mod._capture_mode() == "sanitized"
+        assert mod._capture_mode() == "metadata"
 
     def test_invalid_mode_falls_back_and_warns_once(self, monkeypatch, caplog):
         mod = self._fresh_plugin()
         monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "everything")
         with caplog.at_level(logging.WARNING):
-            assert mod._capture_mode() == "sanitized"
-            assert mod._capture_mode() == "sanitized"
+            assert mod._capture_mode() == "metadata"
+            assert mod._capture_mode() == "metadata"
         warnings = [r for r in caplog.records if "HERMES_LANGFUSE_CAPTURE" in r.getMessage()]
         assert len(warnings) == 1
 
@@ -1651,6 +1661,7 @@ class TestAtexitFinalization(TestTurnTraceIsolation):
         assert mod._TRACE_STATE == {} and mod._LANGFUSE_CLIENT is None
 
 
+@pytest.mark.usefixtures("sanitized_capture")
 class TestSystemPromptInGenerationInput:
     """The generation input must carry the system prompt even for providers
     that move it out of ``messages``: Anthropic Messages (``system`` kwarg)
@@ -1739,6 +1750,7 @@ class TestSystemPromptInGenerationInput:
         assert captured["input"][0]["content"] == "SYS"
 
 
+@pytest.mark.usefixtures("sanitized_capture")
 class TestSystemPromptCrossesHookBoundary:
     """End-to-end across the hook seam with real transport-built kwargs —
     the regression coverage PR #32175's review asked for: verify the

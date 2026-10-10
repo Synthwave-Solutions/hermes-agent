@@ -328,15 +328,12 @@ def _read_secret_file(path: str) -> str:
 def _scoped_env(name: str) -> str:
     if not name:
         return ""
-    try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+    from agent.secret_scope import UnscopedSecretError, get_secret
 
-        try:
-            return (get_secret(name, "") or "").strip()
-        except UnscopedSecretError:
-            return ""
-    except Exception:
-        return (os.environ.get(name) or "").strip()
+    try:
+        return (get_secret(name, "") or "").strip()
+    except UnscopedSecretError:
+        return ""
 
 
 def _custom_provider_entries(config: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
@@ -379,13 +376,20 @@ def gateway_api_key(*, fallback: str = "", config: Optional[Mapping[str, Any]] =
 
     Order: ``SP_MODEL_GATEWAY_KEY_FILE``, ``model_gateway.key_file``,
     ``model_gateway.key_env``, a custom provider entry on the gateway, then
-    ``fallback`` (a key the caller already holds for the gateway URL).
+    ``fallback`` (a key the caller already holds for the gateway URL, only
+    outside routed/multiplexed profile execution).
     """
     if config is None:
         config = _load_config()
     s = settings(config)
+    from agent.secret_scope import serves_routed_profile
+
+    # A caller-held key may belong to the launching installation. Routed tasks
+    # must resolve their credential from their own config/secret scope.
+    if serves_routed_profile():
+        fallback = ""
     for candidate in (
-        _read_secret_file(_text(os.environ.get("SP_MODEL_GATEWAY_KEY_FILE"))),
+        _read_secret_file(_scoped_env("SP_MODEL_GATEWAY_KEY_FILE")),
         _read_secret_file(s.key_file),
         _scoped_env(s.key_env),
         _key_from_gateway_provider_entry(config),
@@ -810,14 +814,16 @@ def terminal_child_env(
 
 
 def cache_token(config: Optional[Mapping[str, Any]] = None) -> Tuple[str, ...]:
-    """A cache-key suffix that changes when enforcement or the gateway changes.
+    """A cache-key suffix for enforcement, endpoint and the scoped credential.
 
     Empty while enforcement is off, so cache keys stay exactly as before.
     """
     s = settings(config)
     if not s.enforce:
         return ()
-    return (GATEWAY_LABEL, s.base_url)
+    key = gateway_api_key(config=config)
+    fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest() if key else ""
+    return (GATEWAY_LABEL, s.base_url, fingerprint)
 
 
 def reset_for_tests() -> None:

@@ -41,7 +41,7 @@ def _resolve_active_provider() -> Optional[VideoGenProvider]:
 
     available = [
         p for p in snapshot.values()
-        if is_available_safe(p, logger, "video_gen provider %s.is_available() raised %s")
+        if is_available_safe(_gateway_checked(p), logger, "video_gen provider %s.is_available() raised %s")
     ]
     return available[0] if len(available) == 1 else None
 

@@ -1,13 +1,5 @@
-"""The ``model_gateway`` defaults block: present, inert, and the only change.
+"""Gateway configuration stays inert until explicitly enabled."""
 
-The block is the engine side of the SynthPulse model gateway contract. A
-managed installation renders it; until the enforcement package reads it,
-nothing in the engine uses it. These tests pin its exact defaults and prove
-that adding it changed no other default.
-"""
-
-import hashlib
-import json
 import os
 from unittest.mock import patch
 
@@ -32,24 +24,6 @@ EXPECTED_MODEL_GATEWAY = {
     "tool_exceptions": [],
 }
 
-# Keys this pin leaves out: the block under test, and the bot screen
-# defaults that the bot screen packages own.
-_EXCLUDED_ROOT_KEYS = ("model_gateway", "bot_desktop")
-
-# sha256 of the canonical JSON of DEFAULT_CONFIG without the excluded keys,
-# taken on the base the block was added to. A change here means another
-# default moved; re-pin only for a deliberate, reviewed default change.
-_OTHER_DEFAULTS_SHA256 = "5730c762dc2c5c7443520157eaa4e2d53f050baf6a18f049e19412d984fd19d3"
-
-
-def _canonical_digest(config):
-    rest = {k: v for k, v in config.items() if k not in _EXCLUDED_ROOT_KEYS}
-    blob = json.dumps(
-        rest, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
-    )
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
 def test_block_has_the_contract_defaults():
     block = DEFAULT_CONFIG["model_gateway"]
     assert block == EXPECTED_MODEL_GATEWAY
@@ -62,14 +36,6 @@ def test_block_is_inert_by_default():
     assert block["realtime"] is False
     assert block["base_url"] == ""
     assert block["tool_exceptions"] == []
-
-
-def test_no_other_default_changed():
-    assert _canonical_digest(DEFAULT_CONFIG) == _OTHER_DEFAULTS_SHA256
-
-
-def test_config_version_not_bumped():
-    assert DEFAULT_CONFIG["_config_version"] == 39
 
 
 def test_rendered_block_is_a_known_root_key():

@@ -602,10 +602,9 @@ def test_cache_key_shape_is_unchanged_without_enforcement():
     _write_config({"model_gateway": {"base_url": "http://gw/v1", "enforce": False}})
     _reset_engine_caches()
     plain = aux._client_cache_key("openrouter", async_mode=False, model="m")
-    assert len(plain) == 10
     _write_config({"model_gateway": {"base_url": "http://gw/v1", "enforce": True}})
     enforced_key = aux._client_cache_key("openrouter", async_mode=False, model="m")
-    assert enforced_key[:10] == plain and enforced_key[10:] == ("gateway", "http://gw/v1")
+    assert enforced_key[:len(plain)] == plain and enforced_key[len(plain):len(plain)+2] == ("gateway", "http://gw/v1")
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +712,7 @@ def test_a_turn_reaches_the_gateway_with_identity(enforced, socket_guard):
 
 
 def test_with_the_gateway_down_the_turn_fails_and_nothing_else_is_called(enforced, socket_guard, monkeypatch):
-    import agent.conversation_loop as loop
+    import agent.retry_utils as loop
 
     monkeypatch.setattr(loop, "jittered_backoff", lambda *a, **k: 0.01)
     agent = _agent(
@@ -729,3 +728,90 @@ def test_with_the_gateway_down_the_turn_fails_and_nothing_else_is_called(enforce
     assert result.get("failed") or result.get("error") or not final
     assert socket_guard.outbound(port) == []
     assert all(host in {"127.0.0.1", "::1", "localhost", None} for host in socket_guard.lookups)
+
+
+def test_routed_profile_never_borrows_installation_key(tmp_path, monkeypatch):
+    from agent import model_gateway, secret_scope
+
+    root_key = tmp_path / "installation.key"
+    root_key.write_text("installation-secret")
+    profile_key = tmp_path / "profile.key"
+    profile_key.write_text("own-profile-secret")
+    monkeypatch.setenv("SP_MODEL_GATEWAY_KEY_FILE", str(root_key))
+    monkeypatch.setenv("OWN_GATEWAY_KEY", "process-secret")
+    config = {"model_gateway": {"base_url": "http://gateway.test/v1", "enforce": True,
+                                 "key_env": "OWN_GATEWAY_KEY"}}
+    mode = secret_scope.set_multiplex_context(True)
+    scope = secret_scope.set_secret_scope({})
+    try:
+        assert model_gateway.gateway_api_key(config=config, fallback="installation-fallback") == ""
+        with pytest.raises(model_gateway.ModelGatewayUnavailable):
+            model_gateway.require_gateway(config=config, fallback_key="installation-fallback")
+        own = secret_scope.set_secret_scope({"SP_MODEL_GATEWAY_KEY_FILE": str(profile_key)})
+        try:
+            assert model_gateway.gateway_api_key(config=config) == "own-profile-secret"
+        finally:
+            secret_scope.reset_secret_scope(own)
+        own = secret_scope.set_secret_scope({"OWN_GATEWAY_KEY": "own-env-secret"})
+        try:
+            assert model_gateway.gateway_api_key(config=config) == "own-env-secret"
+        finally:
+            secret_scope.reset_secret_scope(own)
+    finally:
+        secret_scope.reset_secret_scope(scope)
+        secret_scope.reset_multiplex_context(mode)
+
+
+def test_terminal_cannot_launch_when_gateway_key_is_missing(monkeypatch):
+    from agent import model_gateway
+    from tools import terminal_tool_backends
+
+    def missing(**kwargs):
+        raise model_gateway.ModelGatewayUnavailable("gateway key missing")
+    monkeypatch.setattr(model_gateway, "terminal_child_env", missing)
+    with pytest.raises(model_gateway.ModelGatewayUnavailable):
+        terminal_tool_backends._model_gateway_child_env()
+
+
+def test_auxiliary_cache_follows_scoped_gateway_key(monkeypatch):
+    from agent import model_gateway, secret_scope
+    import agent.auxiliary_client as aux
+
+    _write_config({"model_gateway": {"base_url": "http://gateway.test/v1", "enforce": True,
+                                     "key_env": "OWN_GATEWAY_KEY"}})
+    mode = secret_scope.set_multiplex_context(True)
+    scope = secret_scope.set_secret_scope({"OWN_GATEWAY_KEY": "profile-one"})
+    try:
+        first, _ = aux._get_cached_client("auto", "model", False)
+        assert first.api_key == "profile-one"
+        second_scope = secret_scope.set_secret_scope({"OWN_GATEWAY_KEY": "profile-two"})
+        try:
+            second, _ = aux._get_cached_client("auto", "model", False)
+            assert second is not first
+            assert second.api_key == "profile-two"
+        finally:
+            secret_scope.reset_secret_scope(second_scope)
+        empty = secret_scope.set_secret_scope({})
+        try:
+            with pytest.raises(model_gateway.ModelGatewayUnavailable):
+                aux._get_cached_client("auto", "model", False)
+        finally:
+            secret_scope.reset_secret_scope(empty)
+    finally:
+        aux.shutdown_cached_clients()
+        secret_scope.reset_secret_scope(scope)
+        secret_scope.reset_multiplex_context(mode)
+
+
+@pytest.mark.asyncio
+async def test_async_auxiliary_request_uses_gateway_identity(enforced, socket_guard):
+    import agent.auxiliary_client as aux
+
+    response = await aux.async_call_llm(task="compression", messages=[{"role": "user", "content": "hello"}])
+    assert response.choices[0].message.content == "gateway reply"
+    requests = [item for item in enforced.requests if item["path"] == "/v1/chat/completions"]
+    assert requests
+    assert requests[-1]["body"]["user"] == PSEUDONYM
+    assert requests[-1]["headers"]["authorization"] == f"Bearer {GATEWAY_KEY}"
+    assert socket_guard.outbound(enforced.port) == []
+    aux.shutdown_cached_clients()
