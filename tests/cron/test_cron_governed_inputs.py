@@ -379,3 +379,15 @@ def test_administrators_and_ungoverned_callers_keep_the_environment_origin(polic
         origin = _origin_from_env()
     assert origin["platform"] == "telegram" and origin["chat_id"] == "-100999"
     assert origin["chat_name"] == "Board room"
+
+
+@pytest.mark.parametrize("fields", [{"managed_by":"synthwave"}, {"notify":{"in_app":"off"}}, {"notify":{"delivery":"off"}}])
+def test_managed_attribution_and_admin_mute_need_admin(as_governed, fields):
+    from cron.jobs import CronJobAccessDenied, create_job, update_job
+    with as_governed(ALICE):
+        job = create_job("normal task", "every 1h", notify={"in_app":"quiet"}, managed_by="client")
+        assert job["owner_email"] == ALICE
+        with pytest.raises(CronJobAccessDenied):
+            update_job(job["id"], fields)
+        with pytest.raises(CronJobAccessDenied):
+            create_job("restricted task", "every 1h", **fields)

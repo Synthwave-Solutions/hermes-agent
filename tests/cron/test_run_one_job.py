@@ -155,7 +155,7 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     assert not delivered[0][1].lstrip("⚠️ ").startswith("Gemini HTTP 503")
     assert "hermes cron run j3" in delivered[0][1]
     assert marked == [
-        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"), {"delivery_error": None})
+        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"), {"delivery_error": None, "delivery_outcome": "delivered"})
     ]
     assert finished == [
         (
@@ -193,7 +193,7 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
 
     assert s.run_one_job({"id": "j4", "deliver": "telegram"}) is False
     assert marked == [
-        (("j4", False, "provider failed"), {"delivery_error": "send failed: 502"})
+        (("j4", False, "provider failed"), {"delivery_error": "send failed: 502", "delivery_outcome": "failed"})
     ]
 
 
@@ -308,10 +308,10 @@ def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
 
     assert ok is False
     assert delivered == [("j5", "final response")]
-    assert mark_calls[0] == (("j5", True, None), {"delivery_error": None})
+    assert mark_calls[0] == (("j5", True, None), {"delivery_error": None, "delivery_outcome": "delivered"})
     assert mark_calls[1] == (
         ("j5", False, "bookkeeping boom"),
-        {"delivery_error": None},
+        {"delivery_error": None, "delivery_outcome": "suppressed"},
     )
 
 
@@ -351,7 +351,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
         s.run_one_job({"id": "j6", "name": "interrupt", "deliver": "telegram"})
 
     assert delivered == []
-    assert marked == [(("j6", False, "KeyboardInterrupt"), {})]
+    assert marked == [(("j6", False, "KeyboardInterrupt"), {"delivery_outcome": "suppressed"})]
     assert finished == [
         (
             ("exec-j6",),

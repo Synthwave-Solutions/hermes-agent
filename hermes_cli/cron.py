@@ -721,7 +721,22 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
     """Collect the create/update kwargs shared by ``cron create`` and ``cron edit``."""
-    return {api_key: getattr(args, attr, None) for api_key, attr in _JOB_ARG_FIELDS}
+    result = {api_key: getattr(args, attr, None) for api_key, attr in _JOB_ARG_FIELDS}
+    notify = {key: getattr(args, attr, None) for key, attr in
+              (("in_app", "notify_in_app"), ("delivery", "notify_delivery"))
+              if getattr(args, attr, None) is not None}
+    if notify:
+        if getattr(args, "cron_command", None) == "edit":
+            from cron.jobs import resolve_job_ref
+            from cron.notify_policy import resolve_notify
+            prior = resolve_job_ref(args.job_id)
+            if prior:
+                levels = resolve_notify(prior)
+                notify = {"in_app": levels["in_app"], "delivery": levels["delivery"], **notify}
+        result["notify"] = notify
+    if getattr(args, "managed_by", None) is not None:
+        result["managed_by"] = args.managed_by
+    return result
 
 
 _JOB_DETAIL_LINES = (

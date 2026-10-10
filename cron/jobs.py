@@ -2369,6 +2369,13 @@ def _ensure_no_admin_only_values(values: Dict[str, Any], stored: Optional[Dict[s
     administrator already gave the job (``stored``).
     """
     refused = []
+    if "managed_by" in values and (values["managed_by"] or "client") != ((stored or {}).get("managed_by") or "client"):
+        refused.append("managed_by")
+    notify = values.get("notify")
+    if isinstance(notify, dict):
+        prior = (stored or {}).get("notify") or {}
+        if any(value == "off" and prior.get(key) != "off" for key, value in notify.items()):
+            refused.append("notify.off")
     for field in _ADMIN_ONLY_JOB_FIELDS:
         if field not in values:
             continue
@@ -2908,7 +2915,7 @@ def create_job(
     job_owner = _resolve_creating_owner(owner_email)
     _ensure_no_bot_ceiling()
     if governed is not None:
-        _ensure_no_admin_only_values(f, None)
+        _ensure_no_admin_only_values({**f, "managed_by": normalized_managed_by, "notify": normalized_notify}, None)
         _ensure_own_delivery_targets(deliver, origin=origin)
         _ensure_own_delivery_targets(f["failure_deliver"], origin=origin)
         _ensure_viewable_skills(normalized_skills, None)
@@ -2978,6 +2985,7 @@ def create_job(
         # context, so a job can never do more than the person who made it.
         "owner_email": job_owner,
         "notify": normalized_notify,
+        "toast_notifications": normalized_notify["in_app"] in ("all", "failures"),
         "managed_by": normalized_managed_by,
     }
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
@@ -3167,12 +3175,14 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
     updated["next_run_at"] = next_run
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(job_id: str, updates: Dict[str, Any], *, _trusted_run_context: bool = False) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Refuse the entire payload before mutation so an identity edit cannot
     # partly apply unrelated changes.
 
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
+    from cron.run_context import RUN_CONTEXT_FIELDS
+    run_fields = RUN_CONTEXT_FIELDS.intersection(updates or {}) if not _trusted_run_context else set()
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
 
@@ -3180,6 +3190,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     from cron.notify_policy import normalize_notify, normalize_managed_by
     if "notify" in updates:
         updates["notify"] = normalize_notify(updates["notify"])
+        if updates["notify"] is not None:
+            updates["toast_notifications"] = updates["notify"]["in_app"] in ("all", "failures")
     if "managed_by" in updates:
         updates["managed_by"] = normalize_managed_by(updates["managed_by"])
     if "category" in updates and updates["category"] is not None and not isinstance(updates["category"], str):
@@ -3191,6 +3203,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _ensure_owned_by_caller(job, governed)
         if ceiled and not _update_only_pauses(updates):
             raise CronJobAccessDenied(_BOT_CEILING_ERROR)
+        if run_fields:
+            raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(run_fields))}")
         if "context_from" in updates:
             _check_context_sources(updates["context_from"], jobs, governed)
         if governed is not None:
@@ -3292,7 +3306,8 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     })
 
 
-def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def trigger_job(job_id: str, extra_prompt: Optional[str] = None, *, trigger: str = "manual",
+                trigger_actor: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Schedule a job for the next tick (ID or name). ``extra_prompt`` is stamped as
     ``manual_run_prompt`` for that single fire only; ``mark_job_run`` clears it."""
     job = resolve_job_ref(job_id)
@@ -3305,6 +3320,8 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
             f"Cannot run: job '{name}' is {job.get('state')} (terminal). "
             f"Create a new occurrence with 'hermes cron resume {name} "
             "--run-now' or '--at <ISO-8601>'.")
+    from cron.run_context import normalize_context, governed_trigger_actor
+    context = normalize_context(trigger, trigger_actor if trigger_actor is not None else governed_trigger_actor(), extra_prompt)
     manual_run_at = _hermes_now().isoformat()
     return update_job(job["id"], {
         "enabled": True,
@@ -3314,8 +3331,10 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
         "next_run_at": manual_run_at,
         # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state.
         "manual_run_at": manual_run_at,
-        "manual_run_prompt": (extra_prompt or None),
-    })
+        "manual_run_prompt": (context["run_prompt"] or None),
+        "manual_run_trigger": context["trigger"],
+        "manual_run_actor": context["trigger_actor"],
+    }, _trusted_run_context=True)
 
 
 def _claim_owner_is_dead(claim: Dict[str, Any]) -> bool:
@@ -3481,6 +3500,8 @@ def _record_run_outcome(
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
+    job.pop("manual_run_trigger", None)
+    job.pop("manual_run_actor", None)
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
@@ -3573,6 +3594,7 @@ def mark_job_run(
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
     counts_toward_repeat: bool = True,
+    delivery_outcome: Optional[str] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -3608,6 +3630,8 @@ def mark_job_run(
                 return False
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
+        if delivery_outcome is not None:
+            job["last_delivery_outcome"] = delivery_outcome
         _advance_after_run(job, now, ladder_rung=ladder_rung or not counts_toward_repeat)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
@@ -4777,6 +4801,8 @@ def mark_job_refused(
                     now = _hermes_now().isoformat()
                     job.pop("manual_run_at", None)
                     job.pop("manual_run_prompt", None)
+                    job.pop("manual_run_trigger", None)
+                    job.pop("manual_run_actor", None)
                     job["fire_claim"] = None
                     if job.get("run_claim") is not None:
                         job["run_claim"] = None

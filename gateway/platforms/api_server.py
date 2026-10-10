@@ -4083,12 +4083,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             raw_prompt = body.get("prompt")
             if raw_prompt is not None:
                 extra_prompt = str(raw_prompt)
+                from cron.run_context import normalize_context
+                try:
+                    normalize_context("api", run_prompt=extra_prompt)
+                except ValueError as exc:
+                    return web.json_response({"error": str(exc)}, status=400)
                 prompt_err = self._validate_cron_prompt(extra_prompt)
                 if prompt_err:
                     return prompt_err
                 extra_prompt = extra_prompt or None
         return self._job_response(
-            lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt), job_id, notify=False)
+            lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt, trigger="api",
+                                      trigger_actor=f"api_server:{_api_request_profile.get() or 'default'}"),
+            job_id, notify=False)
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
         """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a

@@ -1594,8 +1594,13 @@ def _run_no_agent_job(
         ok, output = _run_job_script_with_claim_heartbeat(
             job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
     except Exception as exc:
-        logger.exception("Job '%s': script execution raised unexpectedly", job_id)
-        ok, output = False, f"Script execution failed: {exc}"
+        logger.error("Job '%s': script execution failed (%s)", job_id, type(exc).__name__)
+        try:
+            from agent.redact import redact_sensitive_text
+            output = redact_sensitive_text(f"Script execution failed: {exc}", force=True)
+        except Exception:
+            output = "Script execution failed [details redacted]"
+        ok = False
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
@@ -2564,6 +2569,30 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+    trigger: Optional[str] = None, trigger_actor: Optional[str] = None, run_prompt: Optional[str] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Run with server-owned per-fire metadata; preserve the owner's existing governance."""
+    from cron.run_context import context_for_job
+    if run_prompt is not None and extra_prompt is not None and run_prompt != extra_prompt:
+        raise ValueError("run_prompt and extra_prompt disagree")
+    context = context_for_job(job, trigger=trigger, trigger_actor=trigger_actor,
+                              run_prompt=run_prompt if run_prompt is not None else extra_prompt)
+    previous = job.get("_cron_run_context")
+    job["_cron_run_context"] = context
+    try:
+        return _run_job_impl(job, defer_agent_teardown=defer_agent_teardown,
+                             extra_prompt=(context["run_prompt"] or None) if run_prompt is not None else extra_prompt,
+                             cancel_event=cancel_event, execution_id=execution_id)
+    finally:
+        if previous is None:
+            job.pop("_cron_run_context", None)
+        else:
+            job["_cron_run_context"] = previous
+
+
+def _run_job_impl(
+    job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
     ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
@@ -3145,6 +3174,30 @@ def run_job_governed(
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    trigger: Optional[str] = None, trigger_actor: Optional[str] = None, run_prompt: Optional[str] = None,
+) -> bool:
+    """Carry trusted trigger metadata through the real fire and detached-worker handoff."""
+    from cron.run_context import context_for_job
+    if run_prompt is not None and extra_prompt is not None and run_prompt != extra_prompt:
+        raise ValueError("run_prompt and extra_prompt disagree")
+    context = context_for_job(job, trigger=trigger, trigger_actor=trigger_actor,
+                              run_prompt=run_prompt if run_prompt is not None else extra_prompt)
+    previous = job.get("_cron_run_context")
+    job["_cron_run_context"] = context
+    try:
+        return _run_one_job_impl(job, adapters=adapters, loop=loop, verbose=verbose,
+                                 extra_prompt=context["run_prompt"] or extra_prompt,
+                                 cancel_event=cancel_event)
+    finally:
+        if previous is None:
+            job.pop("_cron_run_context", None)
+        else:
+            job["_cron_run_context"] = previous
+
+
+def _run_one_job_impl(
+    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
@@ -3535,7 +3588,19 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
-    mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    delivery_outcome = _classify_delivery_outcome(
+        delivery_error=d.delivery_error,
+        delivery_queued=job.get("last_delivery_queued"),
+        notification_muted=bool(job.get("_notification_policy_muted")),
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        should_deliver=d.should_deliver,
+        unresolved_origin=d.unresolved_origin,
+        # Read the lane the notice was actually routed through (failure_deliver on failure).
+        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
+        incident_acked=d.incident_acked,
+        success=d.success,
+    )
+    mark_kwargs: dict = {"delivery_error": d.delivery_error, "delivery_outcome": delivery_outcome}
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
@@ -3563,18 +3628,6 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
-    delivery_outcome = _classify_delivery_outcome(
-        delivery_error=d.delivery_error,
-        delivery_queued=job.get("last_delivery_queued"),
-        notification_muted=bool(job.get("_notification_policy_muted")),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
-        should_deliver=d.should_deliver,
-        unresolved_origin=d.unresolved_origin,
-        # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
-        incident_acked=d.incident_acked,
-        success=d.success,
-    )
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
@@ -3847,12 +3900,12 @@ def _run_one_job_body(
         # "scheduled" until the run-claim TTL expires and the dispatch-limit guard removes it with no output
         # and no error. Owner fencing still applies: a stale worker must not record over a replacement claim
         # owner.
-        _err_text = str(e) or type(e).__name__
-        logger.error(
-            "Error processing job %s: %s",
-            job["id"],
-            _err_text,
-            exc_info=(type(e), e, e.__traceback__))
+        try:
+            from agent.redact import redact_sensitive_text
+            _err_text = redact_sensitive_text(str(e) or type(e).__name__, force=True)
+        except Exception:
+            _err_text = "Cron execution failed [details redacted]"
+        logger.error("Error processing job %s (%s): %s", job["id"], type(e).__name__, _err_text)
         delivery_outcome = "suppressed"
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
         # send a failure alert on top of the replacement run's; fall through to fenced bookkeeping.
@@ -3878,7 +3931,7 @@ def _run_one_job_body(
                 if is_retry_run(job):
                     # A crashed ladder re-run: its occurrence already counted toward repeat.
                     mark_kwargs["ladder_rung"] = True
-                mark_job_run(job["id"], False, _err_text, **mark_kwargs)
+                mark_job_run(job["id"], False, _err_text, delivery_outcome=delivery_outcome, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)

@@ -432,6 +432,22 @@ def _script_argv(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cron_env: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """All script output and failures cross the same forced redaction boundary."""
+    ok, output = _run_job_script_impl(script_path, workdir=workdir, cancel_event=cancel_event,
+                                      interpreter=interpreter, cron_env=cron_env)
+    try:
+        from agent.redact import redact_sensitive_text
+        return ok, redact_sensitive_text(output, force=True)
+    except Exception:
+        return ok, "[REDACTED - redaction failed]"
+
+
+def _run_job_script_impl(
+    script_path: str, workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cron_env: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -480,6 +496,9 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        if cron_env is not None:
+            from cron.run_context import validate_script_overlay
+            env.update(validate_script_overlay(cron_env))
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -518,10 +537,10 @@ def _run_job_script(
         # Redact secrets before ANY return path.
         try:
             from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
+            stdout = redact_sensitive_text(stdout, force=True)
+            stderr = redact_sensitive_text(stderr, force=True)
         except Exception as e:
-            logger.warning("Failed to redact sensitive text from output: %s", e)
+            logger.warning("Failed to redact sensitive text from output: %s", type(e).__name__)
             stdout = stderr = "[REDACTED - redaction failed]"
 
         if proc.returncode != 0:
@@ -533,7 +552,11 @@ def _run_job_script(
             return False, "\n".join(parts)
         return True, stdout
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        try:
+            from agent.redact import redact_sensitive_text
+            return False, redact_sensitive_text(f"Script execution failed: {exc}", force=True)
+        except Exception:
+            return False, "Script execution failed [details redacted]"
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
@@ -559,8 +582,9 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
+        from cron.run_context import script_environment
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), cron_env=script_environment(job))
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

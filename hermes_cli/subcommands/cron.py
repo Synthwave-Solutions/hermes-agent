@@ -95,6 +95,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_edit = cron_subparsers.add_parser("edit", help="Edit an existing scheduled job")
     cron_edit.add_argument("job_id", help="Job ID to edit")
+    for parser in (cron_create, cron_edit):
+        parser.add_argument("--notify-in-app", choices=("all", "failures", "quiet", "off"),
+                            help="In-app notification level (off requires cron admin).")
+        parser.add_argument("--notify-delivery", choices=("all", "failures", "off"),
+                            help="External delivery notification level (off requires cron admin).")
+        parser.add_argument("--managed-by", choices=("synthwave", "client"),
+                            help="Managed-service attribution (cron admin only).")
+
     cron_edit.add_argument("--schedule", help="New schedule")
     cron_edit.add_argument("--prompt", help="New prompt/task instruction")
     cron_edit.add_argument("--name", help="New job name")

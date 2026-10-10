@@ -308,6 +308,8 @@ class SessionPrune(BaseModel):
     dry_run: bool = False
 
 class CronJobCreate(BaseModel):
+    notify: Optional[Dict[str, str]] = None
+    managed_by: Optional[str] = None
     paused: StrictBool = False
     paused_reason: Optional[str] = None
     prompt: str = ""

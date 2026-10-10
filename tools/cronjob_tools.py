@@ -468,7 +468,9 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             # run_one_job records last_run_at/last_status via mark_job_run; `job` is the
             # owner-bearing claimed snapshot, so terminal writes stay fenced by that owner.
             with _run_heartbeat(str(job.get("name") or job_id)):
-                processed = run_one_job(job, adapters=adapters, loop=gateway_loop, extra_prompt=extra_prompt)
+                from cron.run_context import governed_trigger_actor
+                processed = run_one_job(job, adapters=adapters, loop=gateway_loop, extra_prompt=extra_prompt,
+                                        trigger="manual", trigger_actor=governed_trigger_actor())
         finally:
             _registered = False
             release_running_job(job_id, owner=registration_owner)
@@ -787,6 +789,8 @@ def _action_create(a: Dict[str, Any]) -> str:
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
             pinned=bool(a["pinned"]),
+            **({"notify": a["notify"]} if a.get("notify") is not None else {}),
+            **({"managed_by": a["managed_by"]} if a.get("managed_by") is not None else {}),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
@@ -1040,6 +1044,9 @@ _UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_fro
 
 def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     updates: Dict[str, Any] = {}
+    for field in ("notify", "managed_by"):
+        if a.get(field) is not None:
+            updates[field] = a[field]
     for step in _UPDATE_STEPS:
         error = step(job, a, updates)
         if error:
@@ -1117,7 +1124,8 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    notify: Optional[dict] = None, managed_by: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1214,6 +1222,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
             },
+            "notify": {
+                "type": "object",
+                "description": "In-app and delivery notification levels; off requires a cron administrator.",
+                "properties": {
+                    "in_app": {"type": "string", "enum": ["all", "failures", "quiet", "off"]},
+                    "delivery": {"type": "string", "enum": ["all", "failures", "off"]}},
+                "additionalProperties": False},
+            "managed_by": {"type": "string", "enum": ["synthwave", "client"],
+                           "description": "Managed-service attribution; administrators only."},
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1282,7 +1299,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "notify", "managed_by")
 
 
 def _cronjob_handler(args, **kw):
