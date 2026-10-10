@@ -1339,7 +1339,12 @@ class GatewayInboundMixin:
             from gateway import synthpulse_identity as _sp_identity
         except Exception:
             _sp_identity = None
-        if _sp_identity is not None and _sp_source is not None:
+        _sp_platform = getattr(_sp_source, "platform", None)
+        if str(getattr(_sp_platform, "value", _sp_platform) or "").lower() == "a2a":
+            from gateway import synthpulse_identity as _sp_identity
+            _sp_handle = _sp_identity.bind_for_a2a_event(
+                event, str(getattr(_sp_source, "chat_id", "") or ""))
+        elif _sp_identity is not None and _sp_source is not None:
             _sp_multiplexed = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
             if _sp_multiplexed:
                 # Identity FIRST (idempotent; ``_hm_admit_event`` repeats it) so the routing step

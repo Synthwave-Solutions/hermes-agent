@@ -28,7 +28,8 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
-from . import protocol, security
+from . import protocol, security, synthpulse_governance
+from gateway.synthpulse_identity import A2A_BINDING_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -201,15 +202,46 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         if subpath in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
             return self._json(200, adapter._build_card(public_url, agent=agent))
         if subpath == "/metrics":
+            if self._admitted_peer() is None:
+                return self._json(401, {"error": "unauthorized"})
             return self._json(200, protocol.metrics.snapshot())
         if subpath not in ("/", "/health"):
             return self._json(404, {"error": "not found"})
         payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
         # Agent Cards are public; profile/tenant topology is not leaked on remote unauthenticated GETs.
         sec = adapter._security_context
-        if sec.localhost_only() or sec.authenticate(self.headers.get("Authorization"), self._client_ip()) is not None:
+        if self._admitted_peer() is not None:
             payload["served_agents"] = adapter._served_agent_summary(public_url=public_url)
         self._json(200, payload)
+
+    def _admitted_peer(self) -> Optional["synthpulse_governance.PeerAdmission"]:
+        """The admission of this request's caller, or None (no audit row)."""
+        client_ip = self.client_address[0] if self.client_address else ""
+        identity = self.adapter._security_context.authenticate(self.headers.get("Authorization"), client_ip)
+        if identity is None:
+            return None
+        admission = synthpulse_governance.admit_peer(
+            identity,
+            auth_header=self.headers.get("Authorization"),
+            client_ip=client_ip,
+            headers=self.headers,
+            bind_host=self.adapter.host, security_context=self.adapter._security_context,
+        )
+        return None if isinstance(admission, synthpulse_governance.Refusal) else admission
+
+
+    def _refuse(self, refusal: "synthpulse_governance.Refusal", req_id: Any = None, *,
+                peer: str = "", actor: str = "", agent: str = "", task_id: str = "",
+                rpc_method: str = "", mode: str = "", org_scope: str = "",
+                caller_installation: str = "") -> None:
+        synthpulse_governance.record_decision(
+            "refuse", refusal.reason, peer=peer, actor=actor, agent=agent, task_id=task_id,
+            rpc_method=rpc_method, path=urllib.parse.urlsplit(self.path or "/").path,
+            mode=mode, org_scope=org_scope, caller_installation=caller_installation,
+            http_status=refusal.http_status,
+        )
+        self._json(refusal.http_status, refusal.jsonrpc(req_id))
+
 
     def do_POST(self):  # noqa: N802
         adapter = self.adapter
@@ -217,6 +249,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
         if identity is None:
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
+        admission = synthpulse_governance.admit_peer(
+            identity, auth_header=self.headers.get("Authorization"), client_ip=self._client_ip(),
+            headers=self.headers, bind_host=adapter.host, security_context=adapter._security_context)
+        if isinstance(admission, synthpulse_governance.Refusal):
+            return self._refuse(admission, peer="" if identity.startswith("ip:") else identity)
         try:
             length = int(self.headers.get("Content-Length", 0))
             if length > _MAX_BODY:
@@ -239,7 +276,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             (lambda: route.get("error"), 400, protocol.ERR_INVALID_PARAMS, route.get("error")),
             (lambda: not adapter._rate_limiter.allow(identity), 429, protocol.ERR_RATE_LIMITED, "rate limit exceeded"),
             (lambda: not adapter._security_context.is_trusted_peer(identity), 403, protocol.ERR_UNTRUSTED_PEER, f"peer '{identity}' not trusted"),
-            (lambda: not handler_name, 200, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"),
         )
         for failed, http, code, msg in checks:
             if failed():
@@ -247,14 +283,42 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                     protocol.metrics.rate_limit_triggers += 1
                 return self._error(http, req_id, code, msg)
         agent = route["agent"]
-        if handler_name == "_rpc_message_send":
-            self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
-        elif handler_name == "_rpc_message_stream":
-            adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
-        elif handler_name == "_rpc_tasks_subscribe":
-            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
-        else:  # plain JSON task / push-config queries
-            self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
+        operations = {
+            "_rpc_message_send": "send", "_rpc_message_stream": "stream", "_rpc_tasks_get": "get",
+            "_rpc_tasks_list": "list", "_rpc_tasks_cancel": "cancel", "_rpc_tasks_subscribe": "subscribe",
+            "_rpc_push_config_create": "push_create", "_rpc_push_config_get": "push_get",
+            "_rpc_push_config_list": "push_list", "_rpc_push_config_delete": "push_delete",
+        }
+        operation = operations.get(handler_name, "unknown")
+        binding = synthpulse_governance.authorize_call(
+            admission, rpc_method=method, operation=operation, params=params, agent=agent,
+            headers=self.headers, tasks=adapter.tasks,
+            max_depth=synthpulse_governance.max_actor_depth(getattr(adapter.config, "extra", None)))
+        audit = {"peer": admission.peer, "agent": synthpulse_governance.agent_name(agent),
+                 "task_id": protocol.request_task_id(operation, params), "rpc_method": method,
+                 "mode": admission.policy_mode, "org_scope": admission.org_scope,
+                 "caller_installation": admission.caller_installation}
+        if isinstance(binding, synthpulse_governance.Refusal):
+            return self._refuse(binding, req_id, **audit)
+        if not handler_name:
+            return self._error(200, req_id, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}")
+        if operation in protocol.PUSH_CONFIG_OPERATIONS or (
+                operation in protocol.SEND_OPERATIONS and protocol.has_inline_push_config(params)):
+            return self._refuse(synthpulse_governance.Refusal(
+                200, protocol.ERR_PUSH_NOT_SUPPORTED, "push_disabled", "Push notifications not supported"),
+                req_id, actor=binding.actor_email, **audit)
+        synthpulse_governance.record_decision("allow", "authorized", actor=binding.actor_email,
+                                             depth=binding.depth, **audit)
+        with adapter.tasks.peer_scope(admission.peer):
+            if handler_name == "_rpc_message_send":
+                self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1, binding=binding))
+            elif handler_name == "_rpc_message_stream":
+                adapter._rpc_message_stream(self, req_id, params, identity, agent=agent, binding=binding)
+            elif handler_name == "_rpc_tasks_subscribe":
+                adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
+            else:  # plain JSON task / push-config queries
+                self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
+
 
 
 class A2AAdapter(BasePlatformAdapter):
@@ -460,8 +524,8 @@ class A2AAdapter(BasePlatformAdapter):
         return protocol.build_agent_card(
             name=agent.get("name") or self.agent_name, url=_join_url(self._base_url(public_url), agent.get("path", "")),
             description=agent.get("description") or _DEFAULT_DESCRIPTION, skills=self._advertised_skills(agent),
-            streaming=bool(agent.get("local", True)), push_notifications=True,
-            auth_required=not self._security_context.localhost_only(), tenant=str(agent.get("tenant") or ""),
+            streaming=bool(agent.get("local", True)), push_notifications=protocol.push_notifications_enabled(),
+            auth_required=not (self._security_context.localhost_only() and synthpulse_governance.dev_flag_enabled()), tenant=str(agent.get("tenant") or ""),
         )
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
@@ -529,7 +593,7 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
-    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
+    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None, binding: Any = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
         (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
         agent = agent or self._agents[""]
@@ -563,7 +627,8 @@ class A2AAdapter(BasePlatformAdapter):
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
         fut = self._add_pending(task_id, context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer),
+                             metadata={A2A_BINDING_KEY: binding} if binding is not None else {})
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
@@ -664,8 +729,8 @@ class A2AAdapter(BasePlatformAdapter):
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
-    def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
-        task, pending = self._prepare_task(params, peer, agent=agent)
+    def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False, binding: Any = None) -> dict:
+        task, pending = self._prepare_task(params, peer, agent=agent, binding=binding)
         if task is None:
             state, reply = self._finalize_task(pending, *self._await_reply(pending))
             task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
@@ -698,13 +763,13 @@ class A2AAdapter(BasePlatformAdapter):
             self._sse_write(handler, protocol.sse_data(ev, req_id))
         self._sse_write(handler, protocol.sse_done())
 
-    def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
+    def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, binding: Any = None) -> None:
         """message/stream as an SSE response of JSON-RPC-wrapped StreamResponse events (§9.4)."""
         protocol.metrics.streams_started += 1
         self._sse_headers(handler)
         pending = None
         try:
-            terminal, pending = self._prepare_task(params, peer, agent=agent)
+            terminal, pending = self._prepare_task(params, peer, agent=agent, binding=binding)
             if terminal is not None:
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)

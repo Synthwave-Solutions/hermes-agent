@@ -4,6 +4,8 @@ discriminated by member presence (no ``kind``/``final``); SSE closure signals th
 Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import json
 import os
@@ -289,20 +291,72 @@ class Metrics:
 metrics = Metrics()
 
 
+_request_peer: ContextVar[Optional[str]] = ContextVar("a2a_request_peer", default=None)
+
+def current_request_peer():
+    return _request_peer.get()
+
 class TaskStore:
     """In-memory A2A tasks, kept after completion for tasks/get. Records carry agent slug +
     tenant; readers pass a scope and get not-found outside it (spec authz rule)."""
 
     _MAX_TERMINAL = 500
 
+    _MAX_CONTEXT_OWNERS = 10000
+
+    @contextmanager
+    def peer_scope(self, peer: str):
+        """Limit every task read on this thread to ``peer``'s own tasks."""
+        token = _request_peer.set(str(peer))
+        try:
+            yield
+        finally:
+            _request_peer.reset(token)
+
+
+    def _remember_context_locked(self, context_id: str, peer: str) -> str:
+        owner = self._context_owners.get(context_id)
+        if owner is None:
+            owner = peer
+            self._context_owners[context_id] = owner
+            while len(self._context_owners) > self._MAX_CONTEXT_OWNERS:
+                self._context_owners.popitem(last=False)
+        else:
+            self._context_owners.move_to_end(context_id)
+        return owner
+
+
+    def claim_context(self, context_id: str, peer: str) -> bool:
+        """Claim ``context_id`` for ``peer``; False when another peer owns it."""
+        if not context_id:
+            return True
+        with self._lock:
+            return self._remember_context_locked(str(context_id), str(peer)) == str(peer)
+
+
+    def context_owner(self, context_id: str) -> Optional[str]:
+        with self._lock:
+            return self._context_owners.get(str(context_id))
+
+
     def __init__(self) -> None:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
+        self._context_owners: "OrderedDict[str, str]" = OrderedDict()
         self._lock = threading.Lock()
 
     @staticmethod
-    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
-        return not ((agent_slug and rec.get("agent_slug", "") != agent_slug) or (tenant and rec.get("tenant", "") != tenant))
+    def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "",
+                  peer: Optional[str] = None) -> bool:
+        if agent_slug and rec.get("agent_slug", "") != agent_slug:
+            return False
+        if tenant and rec.get("tenant", "") != tenant:
+            return False
+        if peer is None:
+            peer = _request_peer.get()
+        if peer is not None and rec.get("peer", "") != peer:
+            return False
+        return True
 
     def _scoped(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
         """Live record if visible in scope. Caller holds the lock."""
@@ -321,11 +375,25 @@ class TaskStore:
         return {"configId": rec.get("push_config_id") or "", "taskId": rec["task_id"],
                 "createdAt": rec.get("created_iso", ""), "pushNotificationConfig": {"url": rec.get("push_url") or ""}}
 
-    def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
-        rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+    def create(self, task_id: str, context_id: str, peer: str,
+               agent_slug: str = "", tenant: str = "") -> dict:
+        rec = {
+            "task_id": task_id,
+            "context_id": context_id,
+            "peer": peer,
+            "agent_slug": agent_slug or "",
+            "tenant": tenant or "",
+            "state": STATE_SUBMITTED,
+            "reply": "",
+            "created_at": time.time(),
+            "created_iso": now_iso(),
+            "push_url": "",
+            "push_config_id": "",
+        }
         with self._lock:
             self._tasks[task_id] = rec
+            if context_id:
+                self._remember_context_locked(str(context_id), str(peer or ""))
         return dict(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
@@ -333,28 +401,49 @@ class TaskStore:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
 
-    def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def set_push_config(self, task_id: str, url: str,
+                        agent_slug: str = "", tenant: str = "",
+                        peer: Optional[str] = None) -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
         with self._lock:
-            if not (rec := self._scoped(task_id, agent_slug, tenant)):
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
                 return None
-            rec["push_url"], rec["push_config_id"] = url, "cfg-" + uuid.uuid4().hex[:12]
+            rec["push_url"] = url
+            rec["push_config_id"] = "cfg-" + uuid.uuid4().hex[:12]
             return self._push_config_view(rec)
 
-    def get_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get_push_config(self, task_id: str, config_id: str = "",
+                        agent_slug: str = "", tenant: str = "",
+                        peer: Optional[str] = None) -> Optional[dict]:
         with self._lock:
-            return self._push_config_view(rec) if (rec := self._push_rec(task_id, config_id, agent_slug, tenant)) else None
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
+                return None
+            if config_id and rec.get("push_config_id") != config_id:
+                return None
+            return self._push_config_view(rec)
 
-    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "") -> list[dict]:
-        cfg = self.get_push_config(task_id, "", agent_slug, tenant)
-        return [cfg] if cfg else []
-
-    def delete_push_config(self, task_id: str, config_id: str = "", agent_slug: str = "", tenant: str = "") -> bool:
+    def list_push_configs(self, task_id: str, agent_slug: str = "", tenant: str = "",
+                          peer: Optional[str] = None) -> list[dict]:
         with self._lock:
-            rec = self._push_rec(task_id, config_id, agent_slug, tenant)
-            if rec:
-                rec["push_url"] = rec["push_config_id"] = ""
-            return rec is not None
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
+                return []
+            return [self._push_config_view(rec)]
+
+    def delete_push_config(self, task_id: str, config_id: str = "",
+                           agent_slug: str = "", tenant: str = "",
+                           peer: Optional[str] = None) -> bool:
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
+                return False
+            if config_id and rec.get("push_config_id") != config_id:
+                return False
+            rec["push_url"] = ""
+            rec["push_config_id"] = ""
+            return True
 
     def pop_push_url(self, task_id: str) -> str:
         with self._lock:
@@ -363,9 +452,13 @@ class TaskStore:
                 url, rec["push_url"] = rec["push_url"], ""
             return url if rec else ""
 
-    def get(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
+    def get(self, task_id: str, agent_slug: str = "", tenant: str = "",
+            peer: Optional[str] = None) -> Optional[dict]:
         with self._lock:
-            return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
+                return None
+            return dict(rec)
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
@@ -382,9 +475,11 @@ class TaskStore:
                 fut.set_result((state, reply))
         return out
 
-    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
+    def watch(self, task_id: str, agent_slug: str = "", tenant: str = "",
+              peer: Optional[str] = None) -> Optional[Future]:
         with self._lock:
-            if not (rec := self._scoped(task_id, agent_slug, tenant)):
+            rec = self._tasks.get(task_id)
+            if not rec or not self._in_scope(rec, agent_slug, tenant, peer):
                 return None
             fut: Future = Future()
             if rec["state"] in TERMINAL_STATES:
@@ -393,19 +488,36 @@ class TaskStore:
                 self._watchers.setdefault(task_id, []).append(fut)
             return fut
 
-    def list(self, context_id: str = "", state: str = "", page_size: int = 50, offset: int = 0,
-             agent_slug: str = "", tenant: str = "", with_total: bool = False):
-        """Filtered task page (newest first) as ``(records, next_offset)``, or
-        ``(records, next_offset, total)`` with ``with_total`` (v1.0 ListTasks totalSize)."""
+    def list(
+        self,
+        context_id: str = "",
+        state: str = "",
+        page_size: int = 50,
+        offset: int = 0,
+        agent_slug: str = "",
+        tenant: str = "",
+        with_total: bool = False,
+        peer: Optional[str] = None,
+    ):
+        """Filtered task page (newest first).
+
+        Historical API returns ``(records, next_offset)``. v1.0 ListTasks needs
+        ``totalSize``, so callers can opt into ``(records, next_offset, total)``.
+        """
         page_size = max(1, min(int(page_size or 50), 100))
         with self._lock:
-            recs = [dict(r) for r in reversed(self._tasks.values())
-                    if self._in_scope(r, agent_slug, tenant)
-                    and (not context_id or r["context_id"] == context_id) and (not state or r["state"] == state)]
+            recs = [dict(r) for r in reversed(self._tasks.values())]
+        recs = [r for r in recs if self._in_scope(r, agent_slug, tenant, peer)]
+        if context_id:
+            recs = [r for r in recs if r["context_id"] == context_id]
+        if state:
+            recs = [r for r in recs if r["state"] == state]
         total = len(recs)
         page = recs[offset:offset + page_size]
         next_offset = offset + page_size if offset + page_size < total else 0
-        return (page, next_offset, total) if with_total else (page, next_offset)
+        if with_total:
+            return page, next_offset, total
+        return page, next_offset
 
     def fail_orphans(self, timeout_seconds: float = 300, *, exclude: set[str] | None = None) -> list[str]:
         excluded = exclude or set()
@@ -467,3 +579,52 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
 def list_conversations() -> list[str]:
     """Context-ids that have persisted conversations."""
     return sorted(p.stem for p in (get_hermes_home() / "a2a_conversations").glob("*.jsonl"))
+
+
+def push_notifications_enabled() -> bool:
+    """Whether this server accepts push notification configs at all."""
+    return PUSH_NOTIFICATIONS_ENABLED
+
+
+
+def request_task_id(operation: str, params: Any) -> str:
+    """The task id a JSON-RPC request names, or "" when it names none.
+
+    Task methods carry ``taskId`` (v1.0) or ``id`` (legacy); push-config
+    methods carry ``taskId`` only (their ``id`` is the config id). A send
+    names a task only when it continues one (``message.taskId``).
+    """
+    if not isinstance(params, dict):
+        return ""
+    if operation in PUSH_CONFIG_OPERATIONS:
+        value = params.get("taskId")
+    elif operation in TASK_OPERATIONS:
+        value = params.get("taskId") or params.get("id")
+    elif operation in SEND_OPERATIONS:
+        message = params.get("message")
+        value = message.get("taskId") if isinstance(message, dict) else None
+        value = value or params.get("taskId")
+    else:
+        value = None
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return str(value).strip()
+
+
+ERR_PUSH_NOT_SUPPORTED = -32003
+ERR_ACTOR_ASSERTION = -32053
+ERR_FORBIDDEN = -32054
+SEND_OPERATIONS = frozenset({"send", "stream"})
+
+def has_inline_push_config(params: Any) -> bool:
+    """True when a send carries ``configuration.taskPushNotificationConfig``."""
+    if not isinstance(params, dict):
+        return False
+    configuration = params.get("configuration")
+    if not isinstance(configuration, dict):
+        return False
+    return configuration.get("taskPushNotificationConfig") not in (None, "", {})
+
+PUSH_NOTIFICATIONS_ENABLED = False
+PUSH_CONFIG_OPERATIONS = frozenset({"push_create", "push_get", "push_list", "push_delete"})
+TASK_OPERATIONS = frozenset({"get", "cancel", "subscribe"}) | PUSH_CONFIG_OPERATIONS

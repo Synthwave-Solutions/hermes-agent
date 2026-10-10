@@ -48,6 +48,7 @@ normal allowlists), and governance binding fails open and logs once per error
 type, so a broken map can never take the gateway down.
 """
 from __future__ import annotations
+from dataclasses import dataclass, field
 
 import json
 import logging
@@ -64,6 +65,11 @@ _WARNED = set()
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9@._:+\-]{1,120}$")
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _ROUTE_NAME = "synthpulse-identity"
+_A2A_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_A2A_PEER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
+_EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,253}$")
+A2A_PLATFORM = "a2a"
+A2A_BINDING_KEY = "synthpulse_a2a_binding"
 
 
 def _identities_path() -> Path:
@@ -282,6 +288,8 @@ def bind_for_source(source, session_key: str = "", *, multiplexed: bool = False)
     entered here: the routed identity already scopes the turn (see module doc),
     and governance names that runtime profile as the active one.
     """
+    if is_a2a_source(source):
+        return None  # A2A requires the authenticated event binding, never a sender-map fallback.
     try:
         platform = getattr(source, "platform", None)
         user_id = getattr(source, "user_id", None)
@@ -376,3 +384,195 @@ def reset(handle) -> None:
             scope.__exit__(None, None, None)
         except Exception:
             logger.debug("synthpulse identity profile scope exit failed", exc_info=True)
+
+
+class A2ABindingRefused(PermissionError):
+    """An A2A turn has no valid principal binding and must not run."""
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        super().__init__(message or f"A2A turn refused: {reason}")
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class A2ABinding:
+    """The principal an admitted A2A call runs under.
+
+    Built by the A2A adapter in ``do_POST`` after the pair token, the peer
+    mapping, the organisation check and the actor assertion passed. ``access``
+    is the effective principal (the actor's access in this installation's
+    policy intersected with the service principal's); ``service_access`` is
+    the service principal's own access, bound as the ceiling. A binding with
+    ``unauthenticated_local`` is the explicit local development mode
+    (``A2A_ALLOW_UNAUTHENTICATED_LOCAL=1``): no principal is bound and it is
+    refused under an enforced policy.
+    """
+
+    peer: str
+    agent: str
+    service_email: str = ""
+    actor_email: str = ""
+    org_id: Optional[str] = None
+    org_scope: str = ""
+    caller_installation: str = ""
+    depth: int = 0
+    task_id: str = ""
+    profile: str = ""
+    unauthenticated_local: bool = False
+    access: Any = field(default=None, repr=False, compare=False)
+    service_access: Any = field(default=None, repr=False, compare=False)
+
+
+def is_a2a_source(source) -> bool:
+    """True when ``source`` comes from the A2A platform adapter."""
+    return _platform_name(getattr(source, "platform", None)) == A2A_PLATFORM
+
+
+def a2a_mapping_for(peer) -> dict:
+    """The validated ``gateway-identities.json["a2a"][peer]`` row, or {}.
+
+    The key is the peer's token name in ``A2A_PEER_TOKENS``. A row needs a
+    service ``email`` and a ``caller_installation``; ``org_id`` is optional
+    (absent only at HQ), ``profile`` optional, and ``serve`` the list of agent
+    slugs this peer may call. Anything malformed reads as unmapped.
+    """
+    name = str(peer or "").strip()
+    if not name or not _A2A_PEER_RE.match(name):
+        return {}
+    rows = _load().get(A2A_PLATFORM)
+    if not isinstance(rows, dict):
+        return {}
+    entry = rows.get(name)
+    if not isinstance(entry, dict):
+        return {}
+    email = entry.get("email")
+    email = email.strip().lower() if isinstance(email, str) else ""
+    if not _EMAIL_RE.match(email):
+        return {}
+    caller = entry.get("caller_installation")
+    if not isinstance(caller, str) or not _A2A_ID_RE.match(caller):
+        return {}
+    org_id = entry.get("org_id")
+    if org_id in (None, ""):
+        org_id = None
+    elif not isinstance(org_id, str) or not _A2A_ID_RE.match(org_id):
+        return {}
+    serve_raw = entry.get("serve") or []
+    if isinstance(serve_raw, str) or not isinstance(serve_raw, (list, tuple)):
+        return {}
+    serve = tuple(str(slug).strip() for slug in serve_raw
+                  if isinstance(slug, str) and _A2A_ID_RE.match(str(slug).strip()))
+    profile = str(entry.get("profile") or "").strip().lower()
+    return {
+        "peer": name,
+        "email": email,
+        "caller_installation": caller,
+        "org_id": org_id,
+        "serve": serve,
+        "profile": profile if _PROFILE_RE.match(profile) else "",
+    }
+
+
+def a2a_binding_still_valid(binding: A2ABinding) -> bool:
+    """Live check: the peer mapping behind ``binding`` has not changed.
+
+    Used as the ceiling callback of the bound governance context, so removing
+    or re-pointing a peer's mapping stops its running turn at the next tool
+    call.
+    """
+    try:
+        current = a2a_mapping_for(binding.peer)
+        return bool(current) and (
+            current["email"] == binding.service_email
+            and current["caller_installation"] == binding.caller_installation
+            and current["org_id"] == binding.org_id
+            and binding.agent in current["serve"]
+            and current["profile"] == binding.profile
+        )
+    except Exception:
+        return False
+
+
+def _enter_profile_scope(source, profile: str, email: str):
+    """Enter the admitted profile, refusing mismatched or unavailable scopes."""
+    runtime_profile = _runtime_profile(source)
+    if not profile or profile == runtime_profile:
+        return None
+    source_profile = str(getattr(source, "profile", "") or "").strip()
+    if source_profile:
+        raise A2ABindingRefused("profile_mismatch", "A2A turn refused: the event belongs to another profile")
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        if profile != "default" and not profile_exists(profile):
+            raise A2ABindingRefused("profile_missing", "A2A turn refused: the admitted profile is unavailable")
+        from gateway.run import _profile_runtime_scope
+        scope = _profile_runtime_scope(get_profile_dir(profile))
+        scope.__enter__()
+        source.profile = profile
+        return scope
+    except A2ABindingRefused:
+        raise
+    except Exception as exc:
+        raise A2ABindingRefused("profile_unavailable", "A2A turn refused: the admitted profile could not be entered") from exc
+
+
+def bind_for_a2a_event(event, session_key: str = ""):
+    """Bind the principal the A2A adapter resolved for this event.
+
+    Returns a Handle for ``reset``. Raises A2ABindingRefused (never returns
+    None) when the event carries no binding, a binding of the wrong type, a
+    binding for another peer, a binding whose peer mapping changed since the
+    call was admitted, or an unauthenticated local binding while the policy
+    is enforced.
+    """
+    source = getattr(event, "source", None)
+    metadata = getattr(event, "metadata", None)
+    binding = metadata.get(A2A_BINDING_KEY) if isinstance(metadata, dict) else None
+    if not isinstance(binding, A2ABinding):
+        raise A2ABindingRefused("binding_missing", "A2A turn refused: no principal binding on the event")
+    peer = str(getattr(source, "user_id", "") or "")
+    if not peer or peer != binding.peer:
+        raise A2ABindingRefused("binding_peer_mismatch", "A2A turn refused: the binding belongs to another peer")
+
+    from hermes_cli.dashboard_governance.loader import load_governance_policy
+
+    if binding.unauthenticated_local:
+        policy = load_governance_policy()
+        if policy.enforce:
+            raise A2ABindingRefused("dev_flag_under_enforce",
+                                    "A2A turn refused: unauthenticated local calls are not allowed under an enforced policy")
+        logger.warning("A2A turn for %s runs without authentication (A2A_ALLOW_UNAUTHENTICATED_LOCAL)", peer)
+        return Handle(None, None, "", "")
+
+    access = binding.access
+    service_access = binding.service_access
+    if access is None or service_access is None or not binding.actor_email or not binding.service_email:
+        raise A2ABindingRefused("binding_incomplete", "A2A turn refused: the binding has no principal")
+    if not a2a_binding_still_valid(binding):
+        raise A2ABindingRefused("mapping_changed", "A2A turn refused: the peer mapping changed")
+
+    from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, bind_governance_context
+
+    scope = _enter_profile_scope(source, binding.profile, binding.service_email)
+    try:
+        ctx = DashboardGovernanceContext(
+            subject=access.subject,
+            access=access,
+            active_profile=(binding.profile if scope is not None else _runtime_profile(source)),
+            session_id=str(session_key or ""),
+            request_id=str(binding.task_id or getattr(event, "message_id", "") or ""),
+            bot_access_ceiling=service_access,
+            bot_access_check=lambda: a2a_binding_still_valid(binding),
+        )
+        token = bind_governance_context(ctx)
+    except BaseException:
+        if scope is not None:
+            try:
+                scope.__exit__(None, None, None)
+            except Exception:
+                logger.debug("synthpulse identity profile scope exit failed", exc_info=True)
+        raise
+    logger.info("governance bound: a2a peer %s actor %s via %s (mode=%s, profile=%s, depth=%s)",
+                peer, binding.actor_email, binding.service_email, getattr(access, "mode", "?"),
+                binding.profile if scope is not None else "gateway", binding.depth)
+    return Handle(token, scope, binding.actor_email, binding.profile if scope is not None else "")

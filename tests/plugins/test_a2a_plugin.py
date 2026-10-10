@@ -1439,6 +1439,8 @@ class TestV1SpecRegressionFixes:
     def test_rpc_send_message_v1_returns_send_message_response_wrapper(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        monkeypatch.setenv("A2A_ALLOW_UNAUTHENTICATED_LOCAL", "1")
+        monkeypatch.setenv("A2A_PUBLIC_URL", "http://127.0.0.1/")
         adapter, base = _make_live_adapter(monkeypatch)
 
         async def run():
@@ -1534,6 +1536,8 @@ class TestV1SpecRegressionFixes:
     def test_malformed_params_returns_jsonrpc_error_not_500(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        monkeypatch.setenv("A2A_ALLOW_UNAUTHENTICATED_LOCAL", "1")
+        monkeypatch.setenv("A2A_PUBLIC_URL", "http://127.0.0.1/")
         adapter, base = _make_live_adapter(monkeypatch)
 
         async def run():
@@ -1556,7 +1560,8 @@ class TestV1SpecRegressionFixes:
             assert payload["status"] == "ok"
             assert "served_agents" not in payload
             payload2 = await asyncio.to_thread(_get_json, base + "/health", {"Authorization": "Bearer secret"})
-            assert "served_agents" in payload2
+            # A shared bearer is not an admitted installation pair.
+            assert "served_agents" not in payload2
             await adapter.disconnect()
 
         asyncio.run(run())
