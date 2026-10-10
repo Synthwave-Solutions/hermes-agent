@@ -175,12 +175,12 @@ class TestBlacklistCarriesOnlyItsOwnFileBlacklist:
         a = self._access(access_mode="blacklist", access_level="elevated")
         assert a.grants.file_denied_globs == frozenset({"**/bunq*"})
 
-    def test_its_own_blacklist_still_closes(self):
+    def test_its_own_blacklist_still_closes(self, tmp_path):
         from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
         a = self._access(access_mode="blacklist", access_level="elevated")
-        assert decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/clients/x/.env"}).allowed
-        assert decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/.hermes/skills/x/SKILL.md"}).allowed
-        assert not decide_tool_argument_access(a, "read_file", {"path": "/home/synthwavehq/bunq-agentic/bunq_cli.py"}).allowed
+        assert decide_tool_argument_access(a, "read_file", {"path": str(tmp_path / "clients/x/.env")}).allowed
+        assert decide_tool_argument_access(a, "read_file", {"path": str(tmp_path / ".hermes/skills/x/SKILL.md")}).allowed
+        assert not decide_tool_argument_access(a, "read_file", {"path": str(tmp_path / "bunq-agentic/bunq_cli.py")}).allowed
 
     def test_whitelist_and_legacy_accounts_keep_the_role_rules(self):
         for entry in ({"access_mode": "whitelist", "access_level": "elevated"}, {}):

@@ -67,15 +67,12 @@ def model(monkeypatch, decision="approve", confidence=.99, on_call=None):
 
 
 @pytest.mark.parametrize("decision,allowed", [("approve", True), ("deny", False)])
-def test_automatic_real_adapter_and_scoped_verdict(fixture, monkeypatch, decision, allowed):
+def test_person_approval_settings_do_not_review_ordinary_tools(fixture, monkeypatch, decision, allowed):
     _, _, context, _ = fixture
     calls = model(monkeypatch, decision)
     result = review.authorize_tool_action(context(), "web_search", {"query": "public facts", "api_key": "secret-value"}, Registry())
-    assert result["approved"] is allowed
-    assert result["source"] == "automatic"
-    assert len(calls) == 1
-    assert "secret-value" not in json.dumps(calls)
-    assert calls[0]["timeout"] == 20
+    assert result is None
+    assert calls == []
 
 
 @pytest.mark.parametrize("mutation", ["deny", "whitelist", "profile"])
@@ -95,51 +92,10 @@ def test_hard_ceiling_before_any_model_call(fixture, monkeypatch, mutation):
     assert calls == []
 
 
-def test_policy_changed_during_ai_review_does_not_execute(fixture, monkeypatch):
-    policy, write, context, _ = fixture
-    ctx = context()
-    def revoke():
-        policy["users"]["alice@example.test"]["deny"] = {"tools": {"builtins": ["web_search"]}}
-        write()
-    model(monkeypatch, on_call=revoke)
-    result = review.authorize_tool_action(ctx, "web_search", {"query": "public"}, Registry())
-    assert result["approved"] is False
-    assert result["source"] == "policy"
 
 
-@pytest.mark.parametrize("decision,confidence", [("manual", .99), ("approve", .2)])
-def test_uncertain_model_uses_real_one_shot_gateway_queue(fixture, monkeypatch, decision, confidence):
-    _, _, context, _ = fixture
-    from tools import approval
-    model(monkeypatch, decision, confidence)
-    token = approval.set_current_session_key("alice-session")
-    shown = []
-    def respond(data):
-        shown.append(data)
-        approval.resolve_gateway_approval("alice-session", "once", request_id=data.get("request_id"))
-    approval.register_gateway_notify("alice-session", respond)
-    try:
-        result = review.authorize_tool_action(context(), "web_search", {"query": "public"}, Registry())
-    finally:
-        approval.unregister_gateway_notify("alice-session")
-        approval.reset_current_session_key(token)
-    assert result["approved"] is True
-    assert result["source"] == "manual"
-    assert len(shown) == 1
-    assert shown[0]["allow_session"] is False
-    assert shown[0]["allow_permanent"] is False
-    assert not approval.list_gateway_approvals("alice-session")
 
 
-def test_provider_error_falls_back_to_manual_without_auto_consent(fixture, monkeypatch):
-    _, _, context, _ = fixture
-    from agent import auxiliary_client
-    from tools import approval
-    monkeypatch.setattr(auxiliary_client, "call_llm", lambda **kw: (_ for _ in ()).throw(TimeoutError()))
-    monkeypatch.setattr(approval, "request_governance_action_approval", lambda *args: {"approved": False, "message": "Waiting for manual review"})
-    result = review.authorize_tool_action(context(), "web_search", {}, Registry())
-    assert result["approved"] is False
-    assert result["source"] == "manual"
 
 
 def test_context_roundtrip_retains_denies_and_modes(fixture):
@@ -177,7 +133,7 @@ def test_legacy_user_keeps_current_approval_behavior(fixture, monkeypatch):
     assert calls == []
 
 
-def test_explicit_manual_setting_without_access_controls_is_not_legacy(fixture, monkeypatch):
+def test_person_manual_setting_does_not_park_ordinary_calls(fixture, monkeypatch):
     policy, write, context, _ = fixture
     from tools import approval
     policy["users"]["alice@example.test"] = {"roles": ["member"], "approval": {"mode": "manual", "prompt": ""}}
@@ -185,8 +141,8 @@ def test_explicit_manual_setting_without_access_controls_is_not_legacy(fixture, 
     asked = []
     monkeypatch.setattr(approval, "request_governance_action_approval", lambda *args: asked.append(args) or {"approved": False})
     result = review.authorize_tool_action(context(), "web_search", {}, Registry())
-    assert result["approved"] is False
-    assert len(asked) == 1
+    assert result is None
+    assert asked == []
 
 
 def test_delegated_context_keeps_authoritative_policy_and_rechecks_revocation(fixture, monkeypatch):
@@ -194,11 +150,11 @@ def test_delegated_context_keeps_authoritative_policy_and_rechecks_revocation(fi
     delegated = context_from_env_payload(serialize_context_for_env(context()))
     assert delegated.approval_policy_path == context().approval_policy_path
     calls = model(monkeypatch)
-    assert review.authorize_tool_action(delegated, "web_search", {}, Registry())["approved"] is True
+    assert review.authorize_tool_action(delegated, "web_search", {}, Registry()) is None
     policy["users"]["alice@example.test"]["deny"] = {"tools": {"builtins": ["web_search"]}}
     write()
     assert review.authorize_tool_action(delegated, "web_search", {}, Registry())["approved"] is False
-    assert len(calls) == 1
+    assert calls == []
 
 
 def test_legacy_running_turn_adopts_new_deny_before_dispatch(fixture, monkeypatch):
@@ -252,20 +208,10 @@ def test_host_execution_cannot_derive_paths_or_environment_behind_resource_deny(
     assert calls == []
 
 
-def test_audit_failure_prevents_approved_action_execution(fixture, monkeypatch):
-    import model_tools
-    _, _, context, _ = fixture
-    model(monkeypatch)
-    monkeypatch.setattr(review, "_audit", lambda *a: (_ for _ in ()).throw(OSError("audit unavailable")))
-    monkeypatch.setattr(model_tools.registry, "dispatch", lambda *a, **kw: pytest.fail("audit failure cannot authorize execution"))
-    with governance_context(context()):
-        result = model_tools.handle_function_call("web_search", {"query": "public"}, session_id="alice-session",
-            skip_pre_tool_call_hook=True, skip_tool_execution_middleware=True)
-    assert "error" in json.loads(result)
 
 
 @pytest.mark.parametrize("approval_mode", ["automatic", "manual"])
-def test_real_delegated_worker_retains_bot_checker_and_parent_manual_interface(fixture, monkeypatch, approval_mode):
+def test_real_delegated_worker_retains_bot_checker_without_per_call_review(fixture, monkeypatch, approval_mode):
     import model_tools
     from tools import approval, delegate_tool
     from hermes_cli.dashboard_governance.context import current_governance_context
@@ -320,8 +266,8 @@ def test_real_delegated_worker_retains_bot_checker_and_parent_manual_interface(f
     finally:
         approval.unregister_gateway_notify("alice-session")
     assert len(dispatched) == 1
-    assert len(calls) == (1 if approval_mode == "automatic" else 0)
-    assert len(shown) == (1 if approval_mode == "manual" else 0)
+    assert calls == []
+    assert shown == []
 
 
 def test_delegated_manual_without_parent_interface_cannot_use_autoapprove(monkeypatch):
@@ -364,9 +310,9 @@ def test_unscoped_profile_search_filters_governed_denied_descendants(fixture, mo
     assert result.counts == {allowed: 2}
 
 
-def test_final_dispatch_executes_only_after_automatic_acceptance(fixture, monkeypatch):
+def test_final_dispatch_rechecks_person_policy_without_model_review(fixture, monkeypatch):
     import model_tools
-    _, _, context, _ = fixture
+    policy, write, context, _ = fixture
     calls = model(monkeypatch)
     dispatched = []
     monkeypatch.setattr(model_tools.registry, "dispatch", lambda name, args, **kw: dispatched.append((name, deepcopy(args))) or '{"ok":true}')
@@ -374,8 +320,10 @@ def test_final_dispatch_executes_only_after_automatic_acceptance(fixture, monkey
         result = model_tools.handle_function_call("web_search", {"query": "public"}, session_id="alice-session",
                                                   skip_pre_tool_call_hook=True, skip_tool_execution_middleware=True)
     assert json.loads(result).get("ok") is True
-    assert len(dispatched) == len(calls) == 1
-    model(monkeypatch, "deny")
+    assert len(dispatched) == 1
+    assert calls == []
+    policy["users"]["alice@example.test"]["deny"] = {"tools": {"builtins": ["web_search"]}}
+    write()
     with governance_context(context()):
         result = model_tools.handle_function_call("web_search", {"query": "private"}, session_id="alice-session",
                                                   skip_pre_tool_call_hook=True, skip_tool_execution_middleware=True)

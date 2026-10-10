@@ -270,3 +270,11 @@ def test_concurrent_launches_take_turns_and_all_rerun_from_the_restored_tree(tmp
     assert _git(root, "status", "--porcelain", "--untracked-files=all") == f"M {names[-1]}"
     assert (root / names[-1]).read_text(encoding="utf-8") == "user edit\n"
     assert not marker.exists()
+
+
+def test_test_checkout_refuses_recovery_before_reading_git_metadata(monkeypatch):
+    """A worktree gitdir can belong to the real installation protected by the I/O guard."""
+    root = Path(er.__file__).resolve().parent.parent
+    monkeypatch.setattr(er, "interrupted_pull_marker", lambda root: pytest.fail(
+        "The suite must not inspect its live checkout's recovery marker"))
+    assert er.restore_interrupted_pull(root) is False

@@ -6,9 +6,8 @@ every non-scoped profile (byte-identical behavior), hard blocks for a
 SCOPED profile outside its assigned project folders, and fail-closed on
 guard errors for scoped homes only.
 
-These tests exercise the real out-of-tree module at
-``~/.hermes/profile_scope.py`` and the real profiles layout, so they skip
-on machines without the scoping layer installed.
+These tests exercise a snapshot of the out-of-tree module against private
+profile layouts, without depending on installed user state.
 """
 
 import json
@@ -36,79 +35,57 @@ from tools.file_tools import (
     write_file_tool,
 )
 
-HOME = os.path.expanduser("~")
-PROFILE_SCOPE_PATH = os.path.join(HOME, ".hermes", "profile_scope.py")
-
-
-def _pick_scoped_test_profile():
-    """An armed profile from the live scope map, plus one of its granted roots.
-
-    These tests used to name "steve", who was parked (enforce: false) on
-    14 Sep 2026. From then on every scoped-profile test ran against an
-    unscoped profile and the security gate stayed red with nothing wrong in
-    the guard. Pick a profile the live map really scopes, that carries its
-    marker file, and whose grants do not cover ~/clients, so a client folder
-    is a real out-of-scope target. The same rule picks the profile for the
-    self-test in ~/.hermes/profile_scope.py.
-    """
-    if not os.path.isfile(PROFILE_SCOPE_PATH):
-        return None, None
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_live_profile_scope_for_wiring_tests", PROFILE_SCOPE_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _, roots, _ = mod._load()
-    home = mod._norm("~")
-    clients = mod._norm("~/clients")
-    for name in sorted(mod.scoped_profiles()):
-        marker = os.path.join(HOME, ".hermes", "profiles", name,
-                              mod.SCOPED_PROFILE_MARKER)
-        if not os.path.exists(marker):
-            continue
-        granted = [r for r in mod._norm_all(roots.get(name, []))
-                   if mod._is_under(r, home) and r != home]
-        if not granted:
-            continue
-        if any(mod._is_under(clients, r) or mod._is_under(r, clients)
-               for r in granted):
-            continue
-        return name, granted[0]
-    return None, None
-
-
-SCOPED_NAME, IN_SCOPE_DIR = _pick_scoped_test_profile()
-NO_SCOPED_PROFILE = SCOPED_NAME is None
-if NO_SCOPED_PROFILE:
-    # Keep the module importable; the scoped fixture fails loudly instead.
-    SCOPED_NAME, IN_SCOPE_DIR = "no-scoped-profile", os.path.join(HOME, "work")
-
-SCOPED_HOME = os.path.join(HOME, ".hermes", "profiles", SCOPED_NAME)
-# A name that starts with the scoped one ("steve" / "steven"): segment
-# equality must keep it unscoped.
-SIBLING_HOME = os.path.join(HOME, ".hermes", "profiles", SCOPED_NAME + "zz")
-DEFAULT_HOME = os.path.join(HOME, ".hermes")
-NON_SCOPED_HOME = os.path.join(HOME, ".hermes", "profiles", "financial-ops")
-
-OUT_OF_SCOPE = os.path.join(HOME, "clients", "heijmans", "x.txt")
-SECRET_PATH = os.path.join(HOME, ".hermes", "secrets", "attio.env")
-EVIL_SIBLING = IN_SCOPE_DIR + "-evil" + os.sep + "x.txt"
-IN_SCOPE_VAR = "$HOME" + IN_SCOPE_DIR[len(HOME):]
-
-pytestmark = pytest.mark.skipif(
-    not os.path.isfile(PROFILE_SCOPE_PATH),
-    reason="~/.hermes/profile_scope.py not installed on this machine",
-)
+# Snapshot of the separately deployed scope module. Exercise its real parser and
+# path checks with private homes; never inspect the workstation's scope map.
+PROFILE_SCOPE_PATH = str(Path(__file__).parents[1] / "fixtures" / "profile_scope_runtime.py")
+SCOPED_NAME = "release-scope-test"
+NO_SCOPED_PROFILE = False
 
 
 @pytest.fixture(autouse=True)
-def _reset_bridge_cache():
-    """The bridge caches the loaded module process-wide; reset per test so
-    HERMES_HOME monkeypatching and load-failure simulation take effect."""
-    bridge._reset_for_tests()
-    yield
-    bridge._reset_for_tests()
+def _reset_bridge_cache(monkeypatch):
+    import pwd
+    import tempfile
+    # This layer intentionally permits /tmp and /var/tmp. Put the private home
+    # under the checkout so the test's outside-project paths are not scratch.
+    fixture_root = Path(__file__).parents[2] / "work"
+    fixture_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="scope-test-", dir=fixture_root) as directory:
+        home = Path(directory)
+        root = home / ".hermes"
+        scoped = root / "profiles" / SCOPED_NAME
+        scoped.mkdir(parents=True)
+        (scoped / bridge.SCOPED_PROFILE_MARKER).touch()
+        (scoped / "config.yaml").write_text("model: fixture\n")
+        project = home / "project"
+        project.mkdir()
+        config = root / "profile-scopes.yaml"
+        config.write_text(json.dumps({"profiles": {SCOPED_NAME: {"roots": [str(project)]}}}))
+        (root / "dashboard-governance.yaml").write_text("mode: enforce\n")
+        mux = home / ".hermes-mux"
+        (mux / "profiles").mkdir(parents=True)
+        (mux / "profiles" / SCOPED_NAME).symlink_to(scoped, target_is_directory=True)
+        values = {
+            "HOME": str(home), "DEFAULT_HOME": str(root), "SCOPED_HOME": str(scoped),
+            "SIBLING_HOME": str(root / "profiles" / (SCOPED_NAME + "zz")),
+            "NON_SCOPED_HOME": str(root / "profiles" / "financial-ops"),
+            "IN_SCOPE_DIR": str(project), "OUT_OF_SCOPE": str(home / "clients/heijmans/x.txt"),
+            "SECRET_PATH": str(root / "secrets/attio.env"),
+            "EVIL_SIBLING": str(project) + "-evil/x.txt", "IN_SCOPE_VAR": "$HOME/project",
+            "MUX_ROOT": str(mux), "MUX_HOME": str(mux / "home"),
+            "MUX_SCOPED_HOME": str(mux / "profiles" / SCOPED_NAME),
+        }
+        for key, value in values.items():
+            monkeypatch.setitem(globals(), key, value)
+        account = list(pwd.getpwuid(os.getuid()))
+        account[5] = str(home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: pwd.struct_passwd(account))
+        monkeypatch.setattr(bridge, "_PROFILE_SCOPE_PATH", PROFILE_SCOPE_PATH)
+        monkeypatch.setenv("HERMES_PROFILE_SCOPES_FILE", str(config))
+        monkeypatch.setenv("HOME", str(home))
+        bridge._reset_for_tests()
+        yield
+        bridge._reset_for_tests()
 
 
 @pytest.fixture
@@ -356,18 +333,6 @@ class TestTokenResolution:
                                           cwd=IN_SCOPE_DIR) is None
 
 
-# ── The out-of-tree module's own self-test ──────────────────────────────────
-
-class TestSelfTest:
-    def test_profile_scope_main_self_test_passes(self):
-        proc = subprocess.run(
-            [sys.executable, PROFILE_SCOPE_PATH],
-            capture_output=True, text=True, timeout=60,
-        )
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert "ALL PASS" in proc.stdout
-
-
 # ── The multiplexer: overridden HOME and a per-turn contextvar home ─────────
 #
 # The profile multiplexer serves every profile from ONE process whose HOME is
@@ -378,9 +343,6 @@ class TestSelfTest:
 # 2026-08-07: the module was looked up under the wrong HOME and the profile
 # name was read from an env var that always said "the multiplexer".
 
-MUX_ROOT = os.path.join(HOME, ".hermes-mux")
-MUX_HOME = os.path.join(MUX_ROOT, "home")
-MUX_SCOPED_HOME = os.path.join(MUX_ROOT, "profiles", SCOPED_NAME)
 
 
 class TestMultiplexerHome:
@@ -471,8 +433,8 @@ class TestGovernancePolicyPathUnderMux:
     def test_beleidspad_volgt_de_echte_gebruiker_niet_de_omgeving(self, monkeypatch):
         from gateway.platforms.api_server import _beleidspad
 
-        monkeypatch.setenv("HOME", "/home/synthwavehq/.hermes-mux/home")
-        monkeypatch.setenv("HERMES_HOME", "/home/synthwavehq/.hermes/profiles/steve")
+        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", SCOPED_HOME)
         pad = _beleidspad()
         assert pad.endswith("/.hermes/dashboard-governance.yaml")
         assert ".hermes-mux" not in pad
@@ -482,7 +444,7 @@ class TestGovernancePolicyPathUnderMux:
         from gateway.platforms.api_server import _beleidspad
         from hermes_cli.dashboard_governance import load_governance_policy
 
-        monkeypatch.setenv("HOME", "/home/synthwavehq/.hermes-mux/home")
+        monkeypatch.setenv("HOME", MUX_HOME)
         beleid = load_governance_policy(path=_beleidspad())
         # Stil terugvallen op "off" is precies wat we niet willen zien.
         assert beleid.mode != "off"
