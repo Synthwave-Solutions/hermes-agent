@@ -71,8 +71,22 @@ def _consume_display_ticket(ws: WebSocket) -> Optional[dict]:
     return info
 
 
+def register(app) -> bool:
+    """Mount the engine viewer only when its launch profile explicitly allows it."""
+    from tools.bot_desktop import dashboard_viewer
+    if not dashboard_viewer.enabled():
+        return False
+    app.include_router(router)
+    return True
+
+
 @router.websocket("/api/display/ws")
 async def display_ws(ws: WebSocket) -> None:
+    from tools.bot_desktop import dashboard_viewer
+    # Re-check after mounting: disabling the launch profile refuses new connections.
+    if not dashboard_viewer.enabled():
+        await ws.close(code=_CLOSE_NOT_ALLOWED)
+        return
     # Host/Origin/client-IP policy is refused BEFORE accept, like every other dashboard route: a
     # cross-origin page never gets a completed handshake. Everything after that (ticket, desktop
     # state) is refused AFTER accept so the code + reason arrive in a close frame — a close before

@@ -36,6 +36,8 @@ def test_a_bad_ticket_is_refused_with_a_close_frame_the_renderer_can_read(monkey
     from starlette.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
+    from tools.bot_desktop import dashboard_viewer
+    monkeypatch.setattr(dashboard_viewer, "enabled", lambda: True)
     from hermes_cli import web_server
 
     ws_tickets._reset_for_tests()

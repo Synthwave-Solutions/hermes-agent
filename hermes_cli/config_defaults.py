@@ -2534,6 +2534,8 @@ DEFAULT_CONFIG = {
     # Bot Desktop: a headless Xfce screen per profile on the gateway host (Linux), streamed to Hermes
     # Desktop where a human can watch, take over (logins, 2FA, CAPTCHAs) and hand back. `hermes computer-use screen`.
     "bot_desktop": {
+        # SynthPulse owns viewer permissions, privacy and audit. Engine viewer requires explicit opt-in.
+        "dashboard_viewer": False,
         "geometry": "1440x900",
         # Opt-in: start the screen automatically the first time computer_use needs a display on a headless
         # host. Off by default so installing TigerVNC for other reasons never yields a screen nobody asked

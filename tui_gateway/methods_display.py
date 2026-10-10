@@ -28,6 +28,15 @@ _DISPLAY_ERR = 5300
 _lease_listener_installed = threading.Event()
 
 
+def _display_viewer_refusal(rid):
+    """The launch profile owns this gate, never a caller's selected profile."""
+    from tools.bot_desktop import dashboard_viewer
+    if not dashboard_viewer.enabled():
+        return _err(rid, _DISPLAY_ERR, "engine screen viewer is disabled by launch-profile policy",
+                    data={"code": "dashboard_viewer_off"})
+    return None
+
+
 def _display_snapshot() -> dict:
     from hermes_constants import hermes_home_key
     from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
@@ -64,6 +73,8 @@ def _(rid, params: dict) -> dict:
     Suppressed while a human holds the lease — the frame may show what they are typing — and when
     the lease moved DURING the grab: a takeover racing the framebuffer read means the frame may
     already be the human's session, so it is dropped rather than shipped to every client."""
+    if (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     try:
         from tools.bot_desktop import lease as _bd_lease
         before = _bd_lease.get()
@@ -97,6 +108,8 @@ def _(rid, params: dict) -> dict:
     display.lease.release: refused while a human holds unless the caller says ``force``."""
     from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
     force = bool(params.get("force"))
+    if force and (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     # Refusal and release are ONE lease transition: a takeover landing between a separate human_holds()
     # check and the release would be acknowledged to the human and then silently revoked here.
     if _bd_lease.release(unless_human=not force).holder == _bd_lease.HUMAN:
@@ -152,6 +165,8 @@ def _(rid, params: dict) -> dict:
     """Mint a single-use, 30 s ticket for ``/api/display/ws``. The ticket carries the profile home so
     the bridge dials THIS profile's RFB socket, and a server-minted viewer id (returned to the caller,
     who passes it to ``display.lease.acquire`` / ``release``) so the lease can name the holder."""
+    if (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     from hermes_constants import get_hermes_home
     from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
     from tools.bot_desktop import runtime as _bd_runtime
@@ -174,6 +189,8 @@ def _(rid, params: dict) -> dict:
     """The Screen pane's answer to the pending default-image switch: ``approve`` true pins the new
     image (the container is recreated on the next terminal call), false pins the current one. Both
     end the offer. Refused when nothing is pending, so a stale pane cannot rewrite the config."""
+    if (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     from hermes_cli.sandbox_image_switch import decide, pending
     sw = pending()
     if sw is None:
@@ -187,6 +204,8 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Start the package install in the background; the renderer follows ``display.install.log`` /
     ``display.install.done``. Refused while one is already running for this profile."""
+    if (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     from hermes_constants import hermes_home_key
     from tools.bot_desktop import install as _bd_install, runtime as _bd_runtime
     if not _bd_runtime.is_supported_host():
@@ -234,6 +253,8 @@ def _(rid, params: dict) -> dict:
 @method("display.lease.acquire")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
+    if (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     from tools.bot_desktop import lease as _bd_lease
     viewer_id = str(params.get("viewer_id") or "").strip()
     if not viewer_id:
@@ -247,6 +268,8 @@ def _(rid, params: dict) -> dict:
 @method("display.lease.release")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
+    if (refused := _display_viewer_refusal(rid)) is not None:
+        return refused
     from tools.bot_desktop import lease as _bd_lease
     viewer_id = str(params.get("viewer_id") or "").strip() or None
     # lease.release(None) skips the holder check; a client that lost its viewer id must not be able to
