@@ -848,6 +848,9 @@ def _refreshed_job_view(job_id: str) -> Dict[str, Any]:
 
 
 def _action_run(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+    from cron.jobs import _BOT_CEILING_ERROR, bot_ceiling_applies
+    if bot_ceiling_applies():
+        return tool_error(_BOT_CEILING_ERROR, success=False)
     job_id = job["id"]
     # `prompt` on run is transient per-fire context appended to the stored prompt, never
     # persisted; same strict scan as stored prompts.

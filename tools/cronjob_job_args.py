@@ -60,6 +60,14 @@ def _origin_from_env(
     schedule: Union[str, Dict[str, Any], None] = None,
 ) -> Optional[Dict[str, str]]:
     from gateway.session_context import async_delivery_supported, get_session_env
+    from cron.jobs import _governed_caller_identities
+    from gateway.session_context import _UNSET, _VAR_MAP
+    from hermes_cli.dashboard_governance.context import _current_governance_context
+    if _current_governance_context.get() is None and _governed_caller_identities() is not None:
+        def get_session_env(name: str, default: str = "") -> str:
+            var = _VAR_MAP.get(name)
+            value = var.get() if var is not None else _UNSET
+            return default if value is _UNSET else value
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if not (origin_platform and origin_chat_id):

@@ -309,6 +309,7 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     # spawn surface (foreground _make_run_env and the background/PTY
     # _sanitize_subprocess_env path); no-op for admins and ungoverned runs.
     _inject_dwd_identity_env(out)
+    _inject_bot_ceiling_env(out)
     _inject_granted_env_vars(out)
     return _finalize_child_env(out)
 
@@ -321,29 +322,49 @@ def _inject_dwd_identity_env(env: dict[str, str]) -> None:
     own token. The command gate refuses a foreign ``--as``, but an interpreter
     the user is allowed to run can invoke those CLIs out of its sight, so the
     identity travels with the process instead: ``hermes_dwd`` turns this value
-    into the address the CLI acts as, and refuses every other one.
+    into the address the CLI acts as, and refuses every other one. The cron
+    rules read it too (``cron.jobs._governed_caller_identities``): a governed
+    person's ``hermes cron`` acts on their own jobs only.
 
-    Only set for a governed non-admin under enforce. Admins, report_only and
-    ungoverned runs keep today's behaviour, so the owner's own shell and the
-    crons are untouched. A governed caller whose address cannot be resolved
-    gets a value that can never match an account: fail closed, not fall back.
+    Called by both spawn paths (the foreground terminal's ``_make_run_env``
+    and ``_sanitize_subprocess_env``). The value is decided by this process's
+    own inherited value and its bound governance context, never by the env
+    dict being built:
+
+    - a governed non-admin under enforce gets their address;
+    - an inherited value is never dropped: a process started from a governed
+      shell (a nested ``hermes chat`` binds no context) hands it on, and so
+      does one that binds an administrator's context;
+    - a bound context that names another address than the inherited one, a
+      governed caller whose address cannot be resolved, and a context that
+      cannot be read all get a value that matches no account (fail closed).
+
+    Admins, report_only and ungoverned runs with nothing inherited get no
+    identity, so the owner's own shell and the crons are untouched.
     """
+    inherited = str(os.environ.get("HERMES_DWD_IDENTITY") or "").strip()
     env.pop("HERMES_DWD_IDENTITY", None)
     try:
-        from hermes_cli.dashboard_governance.context import current_governance_context
+        from hermes_cli.dashboard_governance.context import current_governance_context, policy_contexts
         from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
-
-        ctx = current_governance_context()
-        if ctx is None:
-            return
-        from hermes_cli.dashboard_governance.context import policy_contexts
-        identities = [dwd_identity_for(bound.access) for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
-        identity = next((value for value in identities if value is not None), None)
-        if identity is None:  # admin: unrestricted, same as before
-            return
-        env["HERMES_DWD_IDENTITY"] = identity or "unresolved-identity"
-    except Exception:
-        logger.debug("could not bind DWD identity for subprocess", exc_info=True)
+    except ImportError:
+        identity = None
+    else:
+        try:
+            envelopes = policy_contexts(current_governance_context())
+            identities = [dwd_identity_for(bound.access) for bound in envelopes if bound.access.mode == "enforce"]
+            identity = next((value for value in identities if value is not None), None)
+        except Exception:
+            logger.debug("could not read the governance context for a subprocess; failing closed", exc_info=True)
+            identity = ""
+    if identity is None:  # admin, not enforced or ungoverned: only what this process has
+        if inherited:
+            env["HERMES_DWD_IDENTITY"] = inherited
+        return
+    identity = str(identity).strip().lower() or "unresolved-identity"
+    if inherited and inherited.lower() != identity:
+        identity = "unresolved-identity"
+    env["HERMES_DWD_IDENTITY"] = identity
 
 
 def _hermes_dotenv_values(names: set[str]) -> dict[str, str]:
@@ -1227,3 +1248,43 @@ class LocalEnvironment(BaseEnvironment):
         for f in (self._snapshot_path, self._cwd_file, *stale):
             with contextlib.suppress(OSError):
                 os.unlink(f)
+
+
+_BOT_CEILING_IDENTITY_ENV = "HERMES_DWD_IDENTITY_BOT_CEILING"
+
+def _inject_bot_ceiling_env(env: dict[str, str]) -> None:
+    """Hand a bound bot access ceiling down to this child.
+
+    Same rules as ``_inject_dwd_identity_env``, for every enforce envelope
+    that carries a ``bot_access_ceiling``: the child gets the ceiled
+    session's address; an inherited value is never dropped (an inherited
+    empty value stays a ceiling); a bound ceiled context that names another
+    address, an address that cannot be resolved and a context that cannot be
+    read all give a value that matches no account. Nothing is set for a
+    session without a ceiling or outside enforce.
+    """
+    inherited_present = _BOT_CEILING_IDENTITY_ENV in os.environ
+    inherited = str(os.environ.get(_BOT_CEILING_IDENTITY_ENV) or "").strip()
+    env.pop(_BOT_CEILING_IDENTITY_ENV, None)
+    try:
+        from hermes_cli.dashboard_governance.context import current_governance_context, policy_contexts
+    except ImportError:
+        addresses = set()
+    else:
+        try:
+            addresses = {
+                str(getattr(bound.access.subject, "email", "") or "").strip().lower()
+                for bound in policy_contexts(current_governance_context())
+                if getattr(bound, "bot_access_ceiling", None) is not None and bound.access.mode == "enforce"
+            }
+        except Exception:
+            logger.debug("could not read the governance context for a subprocess; failing closed", exc_info=True)
+            addresses = {""}
+    if not addresses:
+        if inherited_present:
+            env[_BOT_CEILING_IDENTITY_ENV] = inherited or "unresolved-identity"
+        return
+    address = next(iter(addresses)) if len(addresses) == 1 else ""
+    if not address or (inherited_present and inherited.lower() != address):
+        address = "unresolved-identity"
+    env[_BOT_CEILING_IDENTITY_ENV] = address
