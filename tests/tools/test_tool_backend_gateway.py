@@ -437,6 +437,7 @@ def test_terminal_child_sees_only_the_gateway(gateway, key_file, monkeypatch, tm
     monkeypatch.setenv("OPENAI_API_KEY", PROVIDER_KEY)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", PROVIDER_KEY)
     monkeypatch.setenv("HERMES_DWD_IDENTITY", "alice@acme.example")
+    monkeypatch.setenv("HERMES_DWD_IDENTITY_BOT_CEILING", "alice@acme.example")
     _enforce(gateway)
     env = terminal_tool._create_environment("local", "", str(tmp_path), 30, task_id="r2-terminal")
     try:
@@ -449,8 +450,9 @@ def test_terminal_child_sees_only_the_gateway(gateway, key_file, monkeypatch, tm
         assert lines["ANTHROPIC_BASE_URL"] == gateway.base_url[: -len("/v1")]
         assert lines["ANTHROPIC_AUTH_TOKEN"] == GATEWAY_KEY
         assert PROVIDER_KEY not in result["output"]
-        # Untrusted ambient DWD identity remains stripped by upstream governance.
-        assert not lines.get("HERMES_DWD_IDENTITY")
+        # A governed shell must retain both inherited restrictions through gateway overrides.
+        assert lines.get("HERMES_DWD_IDENTITY") == "alice@acme.example"
+        assert lines.get("HERMES_DWD_IDENTITY_BOT_CEILING") == "alice@acme.example"
         # Absolute paths: the fake CLIs, never a real provider CLI on PATH.
         assert "200" in env.execute(f"{bin_dir}/codex", timeout=30)["output"]
         assert "404" in env.execute(f"{bin_dir}/claude", timeout=30)["output"]
