@@ -12,6 +12,7 @@ from .models import (
     _norm_email,
     intersect_grants,
     grant_matches,
+    permission_matches,
 )
 
 
@@ -87,9 +88,13 @@ def _level_ceiling(grants: GrantSet, level: str) -> GrantSet:
         }):
             return False
         return True
+    # permission_matches: a wildcard in the grants never admits a reserved
+    # catalog permission (org:, billing:, departments:, support:, a2a:,
+    # screen:) into the ceiling; only an entry naming its namespace does
+    # (plan 3.6, defence in depth next to EffectiveAccess.allows).
     return replace(grants, permissions=frozenset(
         p for p in known | set(grants.permissions)
-        if not any(char in p for char in "*?[") and permitted(p) and grant_matches(grants.permissions, p)))
+        if not any(char in p for char in "*?[") and permitted(p) and permission_matches(grants.permissions, p)))
 
 
 def resolve_effective_access(policy: GovernancePolicy, subject: GovernanceSubject) -> EffectiveAccess:

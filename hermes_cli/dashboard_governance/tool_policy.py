@@ -998,6 +998,125 @@ def _check_denied_paths(command_s: str, grants, inbox: str = "") -> AccessDecisi
     return AccessDecision(True, "arguments_allowed")
 
 
+# ── Built-in hard deny: the SynthPulse secret mount (plan 4.3) ──────────────
+# Pair tokens for A2A, the memory hub actor key and other installation secrets
+# are mounted under this root, only into the containers that need them. The
+# agent's own file tools run in such a container (the A2A adapter lives in the
+# engine), so they never read, search, write or patch below it: for every
+# caller, administrators included, in every governance mode and also without a
+# governance context. This is deliberately not a policy `deny.files` entry:
+# that would make host_execution_restricted() true and close the terminal,
+# while terminals on client installations run without this mount anyway
+# (go-live precondition of C8). Not configurable, so no setting can weaken it.
+SECRET_PATH_ROOTS: tuple[str, ...] = ("/run/synthpulse/secrets",)
+SECRET_PATH_DENY_REASON = "secret_path_hard_deny"
+_FILE_TOOL_NAMES = frozenset({"read_file", "search_files", "write_file", "patch"})
+# The V4A headers the patch tool accepts (tools/patch_parser.py), matched as
+# leniently as the parser itself.
+_V4A_FILE_HEADER_RE = re.compile(r"^\s*\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+?)\s*$", re.MULTILINE)
+_V4A_MOVE_HEADER_RE = re.compile(r"^\s*\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _secret_roots() -> list[str]:
+    """Each configured root lexically and, when it is a link, by its target."""
+    roots: list[str] = []
+    for root in SECRET_PATH_ROOTS:
+        for candidate in (os.path.normpath(root), _realpath(root)):
+            if candidate and candidate not in roots:
+                roots.append(candidate)
+    return roots
+
+
+def _realpath(path: str) -> str:
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return ""
+
+
+def _secret_path_candidates(raw: Any, *, likely_only: bool = False) -> list[str]:
+    """Absolute spellings a file tool could resolve ``raw`` to.
+
+    A relative path is joined with the process cwd and with an absolute
+    TERMINAL_CWD (the file tools resolve against the task's terminal cwd), and
+    every candidate is also taken through its symlinks. ``likely_only`` keeps
+    one base for a relative path (TERMINAL_CWD when set, else the process cwd),
+    for checks where an extra candidate would refuse too much.
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return []
+    try:
+        expanded = os.path.expanduser(text)
+    except Exception:
+        expanded = text
+    lexical: list[str] = []
+    if os.path.isabs(expanded):
+        lexical.append(os.path.normpath(expanded))
+    else:
+        bases: list[str] = []
+        terminal_cwd = os.getenv("TERMINAL_CWD", "").strip()
+        if terminal_cwd and os.path.isabs(terminal_cwd):
+            bases.append(terminal_cwd)
+        if not bases or not likely_only:
+            try:
+                bases.append(os.getcwd())
+            except OSError:
+                pass
+        lexical.extend(os.path.normpath(os.path.join(base, expanded)) for base in bases)
+    candidates: list[str] = []
+    for path in lexical:
+        for candidate in (path, _realpath(path)):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _path_at_or_below(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def secret_path_hard_denied(raw: Any) -> bool:
+    """True when ``raw`` names the secret mount or anything below it."""
+    roots = _secret_roots()
+    return any(_path_at_or_below(candidate, root)
+               for candidate in _secret_path_candidates(raw) for root in roots)
+
+
+def _search_reaches_secret_mount(raw: Any) -> bool:
+    """A search rooted above an existing mount would descend into it."""
+    roots = [root for root in _secret_roots() if os.path.lexists(root)]
+    return any(_path_at_or_below(root, candidate)
+               for candidate in _secret_path_candidates(raw, likely_only=True) for root in roots)
+
+
+def _file_tool_paths(tool_name: str, args: Mapping[str, Any]) -> list[Any]:
+    paths: list[Any] = []
+    if tool_name == "search_files" or "path" in args:
+        paths.append(args.get("path") or ".")
+    if tool_name == "patch":
+        patch_text = args.get("patch")
+        if isinstance(patch_text, str) and "***" in patch_text:
+            paths.extend(match.group(1) for match in _V4A_FILE_HEADER_RE.finditer(patch_text))
+            for match in _V4A_MOVE_HEADER_RE.finditer(patch_text):
+                paths.extend((match.group(1), match.group(2)))
+    return paths
+
+
+def secret_path_decision(tool_name: str, args: Any) -> AccessDecision | None:
+    """The built-in refusal for a file tool call that reaches the mount."""
+    if tool_name not in _FILE_TOOL_NAMES:
+        return None
+    if not isinstance(args, Mapping):
+        return None
+    for path in _file_tool_paths(tool_name, args):
+        if secret_path_hard_denied(path):
+            return AccessDecision(False, SECRET_PATH_DENY_REASON, detail=str(path))
+        if tool_name == "search_files" and _search_reaches_secret_mount(path):
+            return AccessDecision(False, SECRET_PATH_DENY_REASON, detail=str(path))
+    return None
+
+
 def _check_identity_env_tamper(command_s: str) -> AccessDecision:
     """Refuse any attempt to touch the identity the child processes carry.
 
@@ -1135,6 +1254,9 @@ def cli_command_requires_manual_approval(access: EffectiveAccess, command: str) 
 
 
 def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, args: dict[str, Any], *, session_id: str = "") -> AccessDecision:
+    hard = secret_path_decision(tool_name, args)
+    if hard is not None:
+        return hard
     if access is None or access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
     grants = access.grants
@@ -1226,6 +1348,10 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
 def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
     from .context import policy_contexts
     try:
+        # Built in and context free: holds for ungoverned turns as well.
+        hard = secret_path_decision(tool_name, args)
+        if hard is not None:
+            return hard
         contexts = policy_contexts(ctx)
         first = AccessDecision(True, "governance_inactive")
         for index, bounded_ctx in enumerate(contexts):

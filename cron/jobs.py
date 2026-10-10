@@ -414,10 +414,10 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
                 owns_claim = self_removal_delivery_allowed(job_id)
         yield owns_claim
 
+# A job's identity is fixed at creation: its owner selects the governance context,
+# its origin selects the delivery target, and its id is an output path component.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "owner_email", "origin", "created_at"})
 
-# Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an
-# update could leak ``../escape``/absolute/nested values into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -2156,7 +2156,9 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
-    # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
+    # Refuse the entire payload before mutation so an identity edit cannot
+    # partly apply unrelated changes.
+
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")

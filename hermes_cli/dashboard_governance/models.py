@@ -19,8 +19,53 @@ def grant_matches(values, value: str, *, path: bool = False) -> bool:
                for pattern in values)
 
 
+# Reserved permission namespaces (plan 3.6, 3.11 and 4.3). Organisation,
+# billing, department and support designations, A2A calls and the bot screen
+# are control-plane rights: a wildcard grant ("*", or a glob that does not name
+# the namespace) never reaches them, so an elevated blacklist account holding
+# the operational wildcard does not silently inherit them. Inside a namespace a
+# glob still works ("a2a:call:*"), except for "screen:", which is granted only
+# by an entry that names the permission exactly. The WebUI keeps the same rule
+# (api/governance/models.py); keep both lists identical.
+RESERVED_NAMESPACES = ("org:", "billing:", "departments:", "support:", "a2a:", "screen:")
+EXACT_ONLY_NAMESPACES = ("screen:",)
+
+
+def reserved_namespace(value: str) -> str:
+    """The reserved namespace ``value`` belongs to, or "" when it is ordinary.
+
+    Case-insensitive and blind to surrounding whitespace, so a differently
+    spelled name cannot slip past the rule.
+    """
+    lowered = str(value or "").strip().lower()
+    for namespace in RESERVED_NAMESPACES:
+        if lowered.startswith(namespace):
+            return namespace
+    return ""
+
+
+def permission_matches(values, value: str) -> bool:
+    """Positive permission match that keeps wildcards out of reserved names.
+
+    Ordinary names match like ``grant_matches``. A reserved name matches only
+    a pattern that itself starts with the same namespace, and an exact-only
+    namespace ("screen:") matches only the identical name. Denies keep using
+    ``grant_matches``: a broad deny still denies a reserved name.
+    """
+    namespace = reserved_namespace(value)
+    if not namespace:
+        return grant_matches(values, value)
+    if namespace in EXACT_ONLY_NAMESPACES:
+        return any(str(pattern) == value for pattern in values)
+    return any(str(pattern).lower().startswith(namespace) and fnmatchcase(value, str(pattern))
+               for pattern in values)
+
+
 def intersect_grants(grants: "GrantSet", ceiling: "GrantSet") -> "GrantSet":
-    def intersect(left, right, path=False):
+    def intersect(left, right, path=False, permissions=False):
+        if permissions:
+            return frozenset(v for v in left if permission_matches(right, v)) | frozenset(
+                v for v in right if permission_matches(left, v))
         return frozenset(v for v in left if grant_matches(right, v, path=path)) | frozenset(
             v for v in right if grant_matches(left, v, path=path))
     values = {}
@@ -37,7 +82,8 @@ def intersect_grants(grants: "GrantSet", ceiling: "GrantSet") -> "GrantSet":
                 if grant_matches(grants.mcp_servers, server) and grant_matches(ceiling.mcp_servers, server)
             }
         else:
-            values[f.name] = intersect(a, b, f.name in {"file_read_roots", "file_write_roots", "cli_workdir_roots"})
+            values[f.name] = intersect(a, b, f.name in {"file_read_roots", "file_write_roots", "cli_workdir_roots"},
+                                       permissions=f.name == "permissions")
     return GrantSet(**values)
 
 
@@ -396,10 +442,18 @@ class EffectiveAccess:
             return False
         if grant_matches(getattr(self.deny, dimension), value, path=path):
             return False
-        if self.role_ceiling is not None and not grant_matches(getattr(self.role_ceiling, dimension), value, path=path):
+        # A reserved permission (org:, billing:, departments:, support:, a2a:,
+        # screen:) is never reached by a wildcard, not in the ceiling and not
+        # in the grant (plan 3.6); a broad deny above still denies it.
+        if dimension == "permissions":
+            def matches(values, candidate, *, path=False):
+                return permission_matches(values, candidate)
+        else:
+            matches = grant_matches
+        if self.role_ceiling is not None and not matches(getattr(self.role_ceiling, dimension), value, path=path):
             return False
         values = getattr(self, dimension) if dimension in {"permissions", "profiles", "routes"} else getattr(self.grants, dimension)
-        return grant_matches(values, value, path=path)
+        return matches(values, value, path=path)
 
     def configuration_denies_file(self, *paths: str) -> bool:
         """A technical-data exception cannot reopen a specific sensitive deny.
