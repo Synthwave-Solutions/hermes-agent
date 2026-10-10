@@ -1872,6 +1872,9 @@ def create_job(
     interpreter: Optional[str] = None,
     owner_email: Optional[str] = None,
     enabled: bool = True,
+    notify: Optional[Dict[str, str]] = None,
+    managed_by: Optional[str] = None,
+    category: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1896,6 +1899,11 @@ def create_job(
         raise ValueError("paused_reason must be a string.")
     if paused_reason is not None and not paused:
         raise ValueError("paused_reason requires paused=True.")
+    from cron.notify_policy import normalize_notify, normalize_managed_by, default_notify_for_new_job
+    normalized_notify = normalize_notify(notify) or default_notify_for_new_job(category=category)
+    normalized_managed_by = normalize_managed_by(managed_by)
+    if category is not None and not isinstance(category, str):
+        raise ValueError("category must be a string")
     parsed_schedule = parse_schedule(schedule)
     # Normalize repeat: treat 0 or negative values as None (infinite). String forms
     # ('forever'/'once'/numeric) coerce via normalize_repeat_value — the shared chokepoint with update paths
@@ -1973,6 +1981,8 @@ def create_job(
         # The person this job runs as. Every fire binds their governance
         # context, so a job can never do more than the person who made it.
         "owner_email": (str(owner_email).strip().lower() if owner_email else _creating_owner_email()),
+        "notify": normalized_notify,
+        "managed_by": normalized_managed_by,
     }
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
     # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature
@@ -1980,6 +1990,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("category", category),
     ):
         if value is not None:
             job[key] = value
@@ -2162,6 +2173,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
+
+    updates = dict(updates)
+    from cron.notify_policy import normalize_notify, normalize_managed_by
+    if "notify" in updates:
+        updates["notify"] = normalize_notify(updates["notify"])
+    if "managed_by" in updates:
+        updates["managed_by"] = normalize_managed_by(updates["managed_by"])
+    if "category" in updates and updates["category"] is not None and not isinstance(updates["category"], str):
+        raise ValueError("category must be a string")
 
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)
