@@ -25,7 +25,7 @@ _HERMES_CORE_TOOLS = [
     "todo_list", "memory",
     "session_search",
     "clarify",
-    "execute_code", "delegate_task",
+    "execute_code", "delegate_task", "opencode_task",
     "cronjob_manage",
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_request_review",
@@ -156,7 +156,11 @@ TOOLSETS = {
     ),
     "clarify": _ts("Ask the user clarifying questions (multiple-choice or open-ended)", ["clarify"]),
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
-    "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
+    "delegation": _ts("Spawn subagents with isolated context for complex subtasks, or hand repository jobs to OpenCode", ["delegate_task", "opencode_task"]),
+    # One-tool toolset so child assembly can subtract opencode_task exactly
+    # (delegate_tool_toolsets._blocked_toolsets_for_role) even when an
+    # orchestrator child regains the whole delegation toolset.
+    "opencode": _ts("Hand bounded repository jobs to OpenCode (governed like terminal)", ["opencode_task"]),
     "kanban": _ts(
         "Kanban multi-agent coordination — only active when the agent is spawned by "
         "the kanban dispatcher (HERMES_KANBAN_TASK env set). The dispatcher runs "

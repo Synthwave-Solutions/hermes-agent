@@ -643,6 +643,8 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
     """
     if access is None or access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
+    if tool_name == OPENCODE_TOOL_NAME:
+        return _decide_opencode_tool_access(access, registry)
     identity = identify_tool(tool_name, registry)
     grants = access.grants
     from .models import grant_matches
@@ -666,6 +668,83 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
         return AccessDecision(True, "toolset_allowed")
     return AccessDecision(False, "tool_not_allowed")
 
+
+
+# ── opencode_task ─────────────────────────────────────────────────────────────
+#
+# opencode_task starts a host process (OpenCode) that edits files with its own
+# tools, so it is governed exactly like terminal: whoever may not run
+# `opencode run` in that workdir through terminal may not reach it through this
+# tool either. The tool is never granted on its own; it rides the terminal
+# grant plus the opencode CLI grant (15-10-2026).
+
+OPENCODE_TOOL_NAME = "opencode_task"
+OPENCODE_CLI_PROBE = "opencode run"
+
+
+def _opencode_cli_decision(access: EffectiveAccess) -> AccessDecision:
+    if not (access.access_mode or access.access_level):
+        return AccessDecision(True, "opencode_cli_allowed")
+    if not access.grants.cli_commands:
+        return AccessDecision(False, "opencode_cli_not_allowed")
+    decision = _check_cli_command(OPENCODE_CLI_PROBE, access.grants, dwd_identity_for(access),
+                                  lenient=access.access_mode == "blacklist")
+    if not decision.allowed:
+        return AccessDecision(False, "opencode_cli_not_allowed", detail=decision.reason)
+    return AccessDecision(True, "opencode_cli_allowed")
+
+
+def _decide_opencode_tool_access(access: EffectiveAccess, registry: Any) -> AccessDecision:
+    from .models import grant_matches
+    if grant_matches(access.deny.tools, OPENCODE_TOOL_NAME):
+        return AccessDecision(False, "explicit_deny", detail=OPENCODE_TOOL_NAME)
+    terminal = decide_tool_access(access, "terminal", registry)
+    if not terminal.allowed:
+        return AccessDecision(False, terminal.reason, detail=OPENCODE_TOOL_NAME)
+    return _opencode_cli_decision(access)
+
+
+def _opencode_argument_decision(access: EffectiveAccess, args: dict[str, Any], session_id: str) -> AccessDecision:
+    """Workdir, task text and optional test command, each checked as terminal would."""
+    workdir = str(args.get("workdir") or "").strip()
+    if not workdir or not os.path.isabs(os.path.expanduser(workdir)):
+        return AccessDecision(False, "opencode_workdir_required", detail=workdir)
+    cli = _opencode_cli_decision(access)
+    if not cli.allowed:
+        return cli
+    probe = decide_tool_argument_access(access, "terminal", {"command": OPENCODE_CLI_PROBE, "workdir": workdir},
+                                        session_id=session_id)
+    if not probe.allowed:
+        return probe
+    # OpenCode writes inside the workdir, so the write rules apply to it too.
+    write = decide_tool_argument_access(access, "write_file",
+                                        {"path": os.path.join(workdir, ".opencode-task-probe")},
+                                        session_id=session_id)
+    if not write.allowed:
+        return AccessDecision(False, write.reason, detail=workdir)
+    from .models import grant_matches
+    for candidate in _PATHLIKE_RE.findall(str(args.get("task") or "")):
+        if len(candidate) < 2:
+            continue
+        canonical = _resolve_candidate_path(candidate)
+        if secret_path_hard_denied(candidate) or secret_path_hard_denied(canonical):
+            return AccessDecision(False, SECRET_PATH_DENY_REASON, detail=candidate)
+        if access.access_mode == "blacklist" and access.configuration_denies_file(candidate, canonical):
+            return AccessDecision(False, "file_denied_glob", detail=candidate)
+        if (grant_matches(access.deny.file_read_roots | access.deny.file_write_roots, canonical, path=True)
+                or _matches_denied_glob(candidate, access.deny.file_denied_globs)
+                or _matches_denied_glob(canonical, access.deny.file_denied_globs)):
+            return AccessDecision(False, "explicit_deny", detail=candidate)
+        if (access.access_mode != "blacklist" and _matches_denied_glob(candidate, access.grants.file_denied_globs)
+                and not _matches_denied_glob(candidate, access.grants.file_allow_globs)):
+            return AccessDecision(False, "file_denied_glob", detail=candidate)
+    test_command = str(args.get("test_command") or "").strip()
+    if test_command:
+        test = decide_tool_argument_access(access, "terminal", {"command": test_command, "workdir": workdir},
+                                           session_id=session_id)
+        if not test.allowed:
+            return AccessDecision(False, test.reason, detail=test.detail or test_command)
+    return AccessDecision(True, "arguments_allowed")
 
 def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, registry: Any) -> AccessDecision:
     from .context import policy_contexts
@@ -713,7 +792,7 @@ def _tool_allowed_for_validated_scope(ctx, tool_name, registry):
     """Per-tool ceilings; private to a freshly checked runtime call or projection."""
     ceiling = getattr(ctx, "bot_access_ceiling", None)
     if ceiling is not None:
-        if tool_name == "terminal" and not ceiling.grants.cli_commands:
+        if tool_name in {"terminal", OPENCODE_TOOL_NAME} and not ceiling.grants.cli_commands:
             return AccessDecision(False, "bot_cli_not_selected")
         bounded = decide_tool_access(ceiling, tool_name, registry)
         if not bounded.allowed:
@@ -1286,6 +1365,8 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         return hard
     if access is None or access.mode != "enforce":
         return AccessDecision(True, "governance_inactive")
+    if tool_name == OPENCODE_TOOL_NAME:
+        return _opencode_argument_decision(access, args, session_id)
     grants = access.grants
     inbox = session_attachment_inbox(session_id)
     if tool_name in {"read_file", "search_files"}:
@@ -1424,7 +1505,7 @@ def _tool_arguments_for_single_context(ctx, tool_name, args):
         if tool_name in {"read_file", "search_files"} and _in_session_inbox(
                 candidate, session_attachment_inbox(getattr(ctx, "session_id", ""))):
             candidate = ""
-    elif tool_name == "terminal":
+    elif tool_name in {"terminal", OPENCODE_TOOL_NAME}:
         candidate = _resolve_candidate_path(args.get("workdir") or getattr(ctx, "workspace_path", "") or ".")
     if not workspace_allowed_for_context(ctx, candidate):
         return AccessDecision(False, "workspace_access_revoked")
@@ -1436,7 +1517,7 @@ def _tool_arguments_for_single_context(ctx, tool_name, args):
                 return AccessDecision(False, "bot_access_revoked")
         except Exception:
             return AccessDecision(False, "bot_access_revoked")
-        if tool_name == "terminal" and not ceiling.grants.cli_commands:
+        if tool_name in {"terminal", OPENCODE_TOOL_NAME} and not ceiling.grants.cli_commands:
             return AccessDecision(False, "bot_cli_not_selected")
         if tool_name == "skill_view":
             name = str(args.get("name") or "")

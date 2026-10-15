@@ -14,6 +14,7 @@ logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the 
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
+        "opencode_task",  # only the parent starts OpenCode jobs (slot budget, review stays with the parent)
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
