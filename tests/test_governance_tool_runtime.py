@@ -1014,6 +1014,57 @@ class TestDeliveryLeadActsForColleagues:
         assert dwd_identity_for(self._access(roles=("operator",))) == self.ME
 
 
+class TestAdminWithExcludedMailbox:
+    """15-10-2026, Michael: Marcel may drive every colleague's Workspace
+    account through DWD, except Michael's own."""
+
+    ME = "marcel@synthwave.solutions"
+    PROTECTED = "michael@synthwave.solutions"
+    OTHER = "yaser@synthwave.solutions"
+
+    def _decide(self, command, *, email=ME, roles=("admin",)):
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        access = EffectiveAccess(
+            subject=GovernanceSubject(email=email),
+            mode="enforce",
+            roles=frozenset(roles),
+            grants=GrantSet(cli_commands=frozenset({"gchat", "gmail", "gws-hermes"})),
+        )
+        return decide_tool_argument_access(access, "terminal", {"command": command})
+
+    def test_reads_and_sends_as_a_colleague(self):
+        assert self._decide(f"gmail --as {self.OTHER} list").allowed
+        assert self._decide(f"gmail --as {self.OTHER} send --to x@y.z").allowed
+        assert self._decide(f"gws-hermes --as {self.OTHER} calendar events list").allowed
+
+    def test_protected_mailbox_is_refused(self):
+        for cmd in (f"gmail --as {self.PROTECTED} list",
+                    f"gchat --as={self.PROTECTED} raw GET /v1/spaces",
+                    f"gmail --as {self.PROTECTED.upper()} list"):
+            refused = self._decide(cmd)
+            assert not refused.allowed and refused.reason == "dwd_identity_excluded", cmd
+
+    def test_subject_is_required(self):
+        refused = self._decide("gmail list")
+        assert not refused.allowed and refused.reason == "dwd_identity_required"
+
+    def test_abbreviation_and_repeat_cannot_smuggle_the_protected_mailbox(self):
+        for cmd in (f"gmail --a {self.PROTECTED} list",
+                    f"gmail --as {self.OTHER} --as {self.PROTECTED} list",
+                    f"gmail --as {self.OTHER} --a={self.PROTECTED} list"):
+            assert not self._decide(cmd).allowed, cmd
+
+    def test_other_admins_stay_unrestricted(self):
+        assert self._decide(f"gmail --as {self.PROTECTED} list",
+                            email="odis@synthwave.solutions").allowed
+
+    def test_non_admin_binding_still_catches_abbreviations(self):
+        refused = self._decide(f"gmail --as hrishikesh@synthwave.solutions --a {self.OTHER} list",
+                               email="hrishikesh@synthwave.solutions", roles=("tech_lead",))
+        assert not refused.allowed and refused.reason == "dwd_identity_mismatch"
+
+
 class TestOwnSessionAttachmentsAreReadable:
     """14-09-2026: the WebUI writes uploads and large composer pastes to
     <hermes home>/webui/attachments/<session>/, under the `**/.hermes/**`

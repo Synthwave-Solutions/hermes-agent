@@ -39,29 +39,51 @@ _DWD_CLIS = frozenset({"gchat", "gmail", "gws-hermes", "gdrive-dwd", "gdrive_dwd
 _DWD_ADMIN_ROLES = frozenset({"owner", "admin", "admin_delivery"})
 # Sentinel: no identity binding for this caller (admin or governance off).
 _DWD_UNRESTRICTED = None
+# Admins who may act as any colleague EXCEPT the listed accounts. In code for
+# the same reason as the admin roles: only a commit can change it. 15-10-2026
+# (Michael: "hij mag in iedereens email dwd behalve de mijne").
+_DWD_ADMIN_EXCLUDED_SUBJECTS = {
+    "marcel@synthwave.solutions": frozenset({"michael@synthwave.solutions"}),
+}
+
+
+class DwdExclusion(frozenset):
+    """An admin caller that may act as anyone except these subjects."""
 
 
 def dwd_identity_for(access: EffectiveAccess | None):
     """The identity a caller's DWD CLI calls must be bound to, or
-    _DWD_UNRESTRICTED for admins. An unknown email binds to '' (fail closed)."""
+    _DWD_UNRESTRICTED for admins. An unknown email binds to '' (fail closed).
+    An admin with excluded subjects gets a DwdExclusion instead."""
     if access is None:
         return _DWD_UNRESTRICTED
     if "bootstrap_admin" in tuple(access.grant_sources or ()):
         return _DWD_UNRESTRICTED
+    email = str(getattr(access.subject, "email", "") or "").strip().lower()
     if frozenset(access.roles or ()) & _DWD_ADMIN_ROLES:
-        return _DWD_UNRESTRICTED
-    email = getattr(access.subject, "email", "") or ""
-    return str(email).strip().lower()
+        excluded = _DWD_ADMIN_EXCLUDED_SUBJECTS.get(email)
+        return DwdExclusion(excluded) if excluded else _DWD_UNRESTRICTED
+    return email
+
+
+def _dwd_subjects(tokens: list[str]) -> list[str]:
+    """Every `--as` subject in one segment, including argparse abbreviations
+    (`--a`) and repeats: argparse takes the LAST one, so all must pass."""
+    found = []
+    for i, tok in enumerate(tokens):
+        flag, eq, value = tok.partition("=")
+        if flag not in ("--a", "--as"):
+            continue
+        if not eq:
+            value = tokens[i + 1] if i + 1 < len(tokens) else ""
+        found.append(value.strip().lower())
+    return found
 
 
 def _dwd_subject(tokens: list[str]) -> str:
     """The `--as` subject in one segment ('' when absent)."""
-    for i, tok in enumerate(tokens):
-        if tok == "--as":
-            return tokens[i + 1].strip().lower() if i + 1 < len(tokens) else ""
-        if tok.startswith("--as="):
-            return tok[len("--as="):].strip().lower()
-    return ""
+    subjects = _dwd_subjects(tokens)
+    return subjects[0] if subjects else ""
 
 
 def _check_dwd_identity(segments: list[list[str]], identity: str) -> AccessDecision:
@@ -70,11 +92,16 @@ def _check_dwd_identity(segments: list[list[str]], identity: str) -> AccessDecis
         base = os.path.basename(argv0) if argv0 else ""
         if base not in _DWD_CLIS:
             continue
-        subject = _dwd_subject(tokens)
-        if not subject:
+        subjects = _dwd_subjects(tokens)
+        if not subjects or not all(subjects):
             return AccessDecision(False, "dwd_identity_required", detail=base)
-        if not identity or subject != identity:
-            return AccessDecision(False, "dwd_identity_mismatch", detail=f"{base} --as {subject}")
+        for subject in subjects:
+            if isinstance(identity, DwdExclusion):
+                if subject in identity:
+                    return AccessDecision(False, "dwd_identity_excluded", detail=f"{base} --as {subject}")
+                continue
+            if not identity or subject != identity:
+                return AccessDecision(False, "dwd_identity_mismatch", detail=f"{base} --as {subject}")
     return AccessDecision(True, "arguments_allowed")
 
 
