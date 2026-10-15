@@ -1369,6 +1369,24 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         workdir = args.get("workdir")
         if workdir and grants.cli_workdir_roots and not _path_within_roots(str(workdir), grants.cli_workdir_roots):
             return AccessDecision(False, "cli_workdir_not_allowed", detail=str(workdir))
+    elif tool_name == "execute_code":
+        # 15-10-2026: execute_code skipped the file denies entirely, so a
+        # path the terminal refuses was one open() away. Same string-level
+        # check as the lenient terminal gate; not process isolation.
+        code_s = str(args.get("code") or "")
+        denied_path = _check_denied_paths(code_s, grants, inbox)
+        if not denied_path.allowed:
+            return denied_path
+        identity = dwd_identity_for(access)
+        if identity is not _DWD_UNRESTRICTED:
+            tamper = _check_identity_env_tamper(code_s)
+            if not tamper.allowed:
+                return tamper
+        if isinstance(identity, DwdExclusion):
+            lowered = code_s.lower()
+            for subject in identity:
+                if subject in lowered:
+                    return AccessDecision(False, "dwd_identity_excluded", detail=f"execute_code {subject}")
     return AccessDecision(True, "arguments_allowed")
 
 

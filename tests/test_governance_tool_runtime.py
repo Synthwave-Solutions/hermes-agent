@@ -1059,6 +1059,30 @@ class TestAdminWithExcludedMailbox:
         assert self._decide(f"gmail --as {self.PROTECTED} list",
                             email="odis@synthwave.solutions").allowed
 
+    def test_execute_code_cannot_name_the_protected_mailbox(self):
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        access = EffectiveAccess(subject=GovernanceSubject(email=self.ME), mode="enforce",
+                                 roles=frozenset({"admin"}), grants=GrantSet())
+        code = f"import subprocess; subprocess.run(['gmail','--as','{self.PROTECTED}','list'])"
+        refused = decide_tool_argument_access(access, "execute_code", {"code": code})
+        assert not refused.allowed and refused.reason == "dwd_identity_excluded"
+        ok = decide_tool_argument_access(access, "execute_code",
+                                         {"code": f"print('{self.OTHER}')"})
+        assert ok.allowed
+
+    def test_execute_code_honours_file_denies(self):
+        from hermes_cli.dashboard_governance.models import GovernanceSubject
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        access = EffectiveAccess(subject=GovernanceSubject(email=self.ME), mode="enforce",
+                                 roles=frozenset({"admin"}), access_mode="blacklist",
+                                 grants=GrantSet(file_denied_globs=frozenset({"/srv/private/**"})))
+        refused = decide_tool_argument_access(
+            access, "execute_code", {"code": "print(open('/srv/private/x.txt').read())"})
+        assert not refused.allowed
+        assert decide_tool_argument_access(
+            access, "execute_code", {"code": "print(open('/srv/public/x.txt').read())"}).allowed
+
     def test_non_admin_binding_still_catches_abbreviations(self):
         refused = self._decide(f"gmail --as hrishikesh@synthwave.solutions --a {self.OTHER} list",
                                email="hrishikesh@synthwave.solutions", roles=("tech_lead",))
