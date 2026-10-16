@@ -7,12 +7,13 @@ the task text.
 
 What this process guarantees (15-10-2026):
 
-* a global limit on concurrent OpenCode jobs (flock slots, default 4);
-* a fresh git worktree per job, so OpenCode never edits a live checkout;
+* a global limit on concurrent OpenCode jobs (flock slots, default 12);
+* OpenCode works directly in the workdir (16-10-2026, no worktree copy); the
+  report lists exactly the files this job changed, with their diff;
 * OpenCode runs inside bubblewrap: the filesystem is read-only except the
-  worktree and OpenCode's own per-job state, and secret locations are masked
-  with empty mounts. That holds for OpenCode's bash tool too, which a
-  permission file alone cannot promise;
+  workdir and OpenCode's own per-job state, and what the caller may not read
+  is masked with empty mounts. That holds for OpenCode's bash tool too, which
+  a permission file alone cannot promise;
 * the OmniRoute key travels in a one-shot file that is deleted before
   OpenCode starts and is masked inside the sandbox;
 * the recursion guard is set, so a nested ``opencode run`` is refused.
@@ -23,6 +24,8 @@ The report (stdout) is what the completion notification delivers to the agent.
 from __future__ import annotations
 
 import fcntl
+import fnmatch
+import hashlib
 import json
 import os
 import shutil
@@ -85,46 +88,53 @@ def _git(repo: Path, *args, timeout=120):
     return _run(["git", "-C", str(repo), *args], timeout=timeout)
 
 
-def prepare_worktree(job: dict) -> tuple[Path, dict]:
-    """Return (path OpenCode works in, git info). Creates a worktree for git repos."""
-    workdir = Path(job["workdir"])
-    info = {"git": False}
-    if not job.get("git_top"):
-        return workdir, info
-    top = Path(job["git_top"])
-    worktree = Path(job["worktree"])
-    branch = job["branch"]
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    exclude = top / ".git" / "info" / "exclude"
+def _hash(path: Path) -> str:
     try:
-        marker = "/.opencode-worktrees/"
-        current = exclude.read_text() if exclude.exists() else ""
-        if marker not in current:
-            exclude.parent.mkdir(parents=True, exist_ok=True)
-            with open(exclude, "a") as fh:
-                fh.write(("\n" if current and not current.endswith("\n") else "") + marker + "\n")
+        digest = hashlib.sha1()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError:
-        pass
-    code, out = _git(top, "worktree", "add", "-b", branch, str(worktree), "HEAD")
-    if code != 0:
-        raise RuntimeError("git worktree add failed: " + out.strip()[-800:])
-    _, base = _git(top, "rev-parse", "HEAD")
-    info = {"git": True, "top": str(top), "worktree": str(worktree), "branch": branch, "base": base.strip()}
-    rel = workdir.relative_to(top) if workdir != top else Path(".")
-    return worktree / rel, info
+        return ""
 
 
-def snapshot(root: Path) -> dict:
+def snapshot(root: Path, git_top: str = "") -> dict:
+    """Content fingerprints of the files a job could change.
+
+    In a git repo only the dirty and untracked files are hashed (the rest is
+    HEAD); elsewhere every file under root, up to SNAPSHOT_FILE_LIMIT."""
     state = {}
-    for count, path in enumerate(p for p in root.rglob("*") if p.is_file()):
-        if count >= SNAPSHOT_FILE_LIMIT:
-            break
-        try:
-            st = path.stat()
-            state[str(path.relative_to(root))] = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            continue
+    if git_top:
+        code, out = _git(Path(root), "status", "--porcelain=v1", "-z", "-uall", "--", ".")
+        if code == 0:
+            entries = out.split("\0")
+            index = 0
+            while index < len(entries):
+                entry = entries[index]
+                index += 1
+                if len(entry) < 4:
+                    continue
+                if entry[0] in "RC":
+                    index += 1  # the rename source follows
+                rel = entry[3:]
+                state[rel] = _hash(Path(git_top) / rel)
+            return state
+    skip = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for name in filenames:
+            count += 1
+            if count > SNAPSHOT_FILE_LIMIT:
+                return state
+            full = Path(dirpath) / name
+            state[str(full.relative_to(root))] = _hash(full)
     return state
+
+
+def changed_files(before: dict, after: dict) -> list[str]:
+    return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
 
 
 def bwrap_argv(job: dict, run_dir: Path, workroot: Path, git_info: dict) -> list[str]:
@@ -157,27 +167,26 @@ def bwrap_argv(job: dict, run_dir: Path, workroot: Path, git_info: dict) -> list
     cache = home / ".cache" / "opencode"
     cache.mkdir(parents=True, exist_ok=True)
     argv += ["--bind", str(state), str(state), "--bind", str(cache), str(cache)]
-    if git_info.get("git"):
+    if git_info.get("git") and git_info.get("writable"):
         top = Path(git_info["top"])
-        worktree = Path(git_info["worktree"])
-        argv += ["--bind", str(worktree), str(worktree)]
-        meta = top / ".git" / "worktrees" / worktree.name
-        if meta.is_dir():
-            argv += ["--bind", str(meta), str(meta)]
-        objects = top / ".git" / "objects"
-        if objects.is_dir():
-            argv += ["--bind", str(objects), str(objects)]
+        argv += ["--bind", str(top), str(top)]
     else:
         argv += ["--bind", str(workroot), str(workroot)]
-    # Secrets inside the work tree itself (an untracked .env next to the code).
-    for found in _secret_files_under(workroot):
+    # Files inside the workdir the caller may not read (a denied .env, say).
+    for found in _denied_files_under(workroot, job.get("deny_patterns", [])):
         argv += ["--ro-bind", "/dev/null", str(found)]
+    # Masks again on top of the writable bind, for denied folders inside it.
+    for raw in job.get("mask_dirs", []):
+        if Path(raw).is_dir() and raw.startswith(str(workroot).rstrip("/") + "/"):
+            argv += ["--tmpfs", raw]
     argv += ["--chdir", str(workroot)]
     return argv
 
 
-def _secret_files_under(root: Path, limit: int = 2000):
-    names = (".env",)
+def _denied_files_under(root: Path, patterns, limit: int = 20000):
+    patterns = [str(p) for p in patterns or () if p]
+    if not patterns:
+        return
     checked = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in {".git", "node_modules", ".venv", "venv", "__pycache__"}]
@@ -185,8 +194,10 @@ def _secret_files_under(root: Path, limit: int = 2000):
             checked += 1
             if checked > limit:
                 return
-            if name.startswith(names) or name.endswith((".pem", ".key")) or name in {"credentials.json", "auth.json"}:
-                yield Path(dirpath) / name
+            full = os.path.join(dirpath, name)
+            if any(fnmatch.fnmatch(full, pat) or fnmatch.fnmatch(name, pat.rsplit("/", 1)[-1])
+                   and pat.startswith("**/") for pat in patterns):
+                yield Path(full)
 
 
 def sandbox_env(job: dict, run_dir: Path, key: str) -> dict:
@@ -231,20 +242,21 @@ def take_key(run_dir: Path) -> str:
     return key
 
 
-def collect_git(git_info: dict, task: str) -> tuple[str, str]:
-    worktree = Path(git_info["worktree"])
-    _git(worktree, "add", "-A")
-    _, stat = _git(worktree, "diff", "--cached", "--stat")
-    _, patch = _git(worktree, "diff", "--cached")
-    if stat.strip():
-        title = "opencode_task: " + " ".join(task.split())[:60]
-        _run(["git", "-C", str(worktree), "-c", "user.name=OpenCode task", "-c", "user.email=opencode@localhost",
-              "commit", "-q", "--no-verify", "-m", title])
+def collect_git(git_info: dict, workroot: Path, files: list[str]) -> str:
+    """Diff of exactly the files this job changed, against HEAD (untracked as new)."""
+    if not files:
+        return ""
+    top = Path(git_info["top"])
+    _, patch = _run(["git", "-C", str(top), "diff", "HEAD", "--", *files], timeout=120)
+    _, untracked = _run(["git", "-C", str(top), "ls-files", "--others", "--exclude-standard", "--", *files], timeout=60)
+    for rel in [u for u in untracked.splitlines() if u.strip()]:
+        _, extra = _run(["git", "-C", str(top), "diff", "--no-index", "--", "/dev/null", rel], timeout=60)
+        patch += extra
     lines = patch.splitlines()
     shown = "\n".join(lines[:REPORT_DIFF_LINES])
     if len(lines) > REPORT_DIFF_LINES:
-        shown += f"\n[... {len(lines) - REPORT_DIFF_LINES} more diff lines in the worktree]"
-    return stat.strip(), shown
+        shown += f"\n[... {len(lines) - REPORT_DIFF_LINES} more diff lines; run git diff in the workdir]"
+    return shown
 
 
 def main(job_dir: str) -> int:
@@ -260,18 +272,16 @@ def main(job_dir: str) -> int:
     if not shutil.which("bwrap"):
         print("\n".join(report + ["status: refused", "reason: bubblewrap (bwrap) is not installed; refusing to run OpenCode unconfined"]))
         return 2
-    slot = acquire_slot(Path(job["slot_dir"]), int(job.get("slots", 4)), int(job.get("slot_wait", 600)))
+    slot = acquire_slot(Path(job["slot_dir"]), int(job.get("slots", 12)), int(job.get("slot_wait", 600)))
     if slot is None:
         print("\n".join(report + ["status: busy",
-                                  f"reason: all {job.get('slots', 4)} OpenCode slots stayed busy; retry later"]))
+                                  f"reason: all {job.get('slots', 12)} OpenCode slots stayed busy; retry later"]))
         return 75
     try:
-        try:
-            workroot, git_info = prepare_worktree(job)
-        except Exception as exc:  # noqa: BLE001 - reported to the agent
-            print("\n".join(report + ["status: failed", f"reason: {exc}"]))
-            return 1
-        before = {} if git_info.get("git") else snapshot(workroot)
+        workroot = Path(job["workdir"])
+        git_info = {"git": bool(job.get("git_top")), "top": job.get("git_top", ""),
+                    "writable": bool(job.get("git_writable"))}
+        before = snapshot(workroot, git_info["top"])
         argv = bwrap_argv(job, run_dir, workroot, git_info) + [
             job["opencode_bin"], "run", "-m", job["model"], "--dir", str(workroot), job["task"]]
         env = sandbox_env(job, run_dir, key)
@@ -285,21 +295,14 @@ def main(job_dir: str) -> int:
             env_test.pop("OMNIROUTE_API_KEY", None)
             tcode, test_out = _run(test_argv, cwd=str(workroot), env=env_test, timeout=int(job.get("test_timeout", 900)))
             report.append(f"test exit: {tcode}")
+        after = snapshot(workroot, git_info["top"])
+        changed = changed_files(before, after)
+        report += ["", "## Changed files (edited in place in " + str(workroot) + ")"] + (changed or ["(none)"])
         if git_info.get("git"):
-            stat, patch = collect_git(git_info, job["task"])
-            report += ["", "## Review", f"worktree: {git_info['worktree']}", f"branch: {git_info['branch']} (base {git_info['base'][:12]})",
-                       "merge after review: git -C <repo> merge " + git_info["branch"],
-                       "discard: git -C <repo> worktree remove --force <worktree> && git -C <repo> branch -D " + git_info["branch"],
-                       "", "## Diff stat", stat or "(no changes)"]
+            patch = collect_git(git_info, workroot, changed)
             if patch:
-                report += ["", "## Patch", patch]
-        else:
-            after = snapshot(workroot)
-            changed = sorted(k for k in after if before.get(k) != after[k])
-            removed = sorted(k for k in before if k not in after)
-            report += ["", "## Changed files (no git repo, edited in place)"] + (changed or ["(none)"])
-            if removed:
-                report += ["", "## Removed files"] + removed
+                report += ["", "## Diff (against HEAD, only files this job changed)", patch]
+            report += ["", "Nothing is committed: review, then commit or `git checkout -- <file>` to undo."]
         if job.get("test_command"):
             report += ["", "## Test output", _tail(test_out)]
         report += ["", "## OpenCode output", _tail(output)]

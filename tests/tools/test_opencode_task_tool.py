@@ -130,31 +130,52 @@ def test_test_command_is_checked_like_terminal(tmp_path, workroot):
     assert not decision.allowed
 
 
-def test_generated_config_and_masks_deny_secrets(tmp_path, workroot):
-    access, _, _ = _blacklist(tmp_path, workroot)
-    dirs, files, patterns = opencode_tool.mask_plan(access)
-    home = str(opencode_tool._HOME)
-    for required in (".hermes", ".ssh", ".claude", ".config/gh", ".config/bunq"):
-        assert os.path.join(home, required) in dirs
-    assert os.path.join(home, ".config/opencode/opencode.jsonc") in files
-    assert os.path.join(home, ".config/opencode/omniroute.key") in files
+def test_owner_sees_keys_and_only_the_secret_mount_is_masked(tmp_path, workroot):
+    dirs, files, patterns = opencode_tool.mask_plan(None)
+    assert dirs == ["/run/synthpulse/secrets"] and files == []
     cfg = opencode_tool.opencode_config(patterns)
     perm = cfg["permission"]
     assert perm["external_directory"] == "deny"
-    for pattern in ("**/.env*", "**/.hermes/**", "**/secrets/**"):
-        assert perm["read"][pattern] == "deny" and perm["edit"][pattern] == "deny"
+    assert "**/.env*" not in perm["read"] and perm["read"]["*"] == "allow"
+    assert perm["bash"]["*opencode*run*"] == "deny"
     assert cfg["mcp"] == {}
     assert cfg["provider"]["omniroute"]["options"]["apiKey"] == "{env:OMNIROUTE_API_KEY}"
 
 
-def test_client_credentials_masked_unless_access_allows(tmp_path, workroot):
+def test_caller_denied_paths_are_masked(tmp_path, workroot):
     creds = os.path.join(str(opencode_tool._HOME), ".config/synthwave/clients")
     access, _, _ = _blacklist(tmp_path, workroot,
                               grants={"files": {"denied_globs": [creds, creds + "/**"]}})
     dirs, _, patterns = opencode_tool.mask_plan(access)
-    assert creds in dirs and "**/.config/synthwave/clients/**" in patterns
-    dirs_none, _, patterns_none = opencode_tool.mask_plan(None)
-    assert creds in dirs_none and "**/.config/synthwave/clients/**" in patterns_none
+    assert creds in dirs and creds + "/**" in patterns
+    cfg = opencode_tool.opencode_config(patterns)
+    assert cfg["permission"]["read"][creds + "/**"] == "deny"
+    assert cfg["permission"]["bash"]["*" + creds.lstrip("/") + "*"] == "deny"
+    (tmp_path / "b").mkdir()
+    allowed, _, _ = _blacklist(tmp_path / "b", workroot)
+    dirs_ok, _, _ = opencode_tool.mask_plan(allowed)
+    assert creds not in dirs_ok
+
+
+def test_runner_reports_only_files_this_job_changed(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*a):
+        subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    git("init", "-q")
+    (repo / "a.py").write_text("a = 1\n")
+    (repo / "b.py").write_text("b = 1\n")
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    (repo / "b.py").write_text("b = 2\n")  # dirty before the job, untouched by it
+    before = runner.snapshot(repo, str(repo))
+    (repo / "a.py").write_text("a = 2\n")
+    (repo / "new.py").write_text("n = 1\n")
+    after = runner.snapshot(repo, str(repo))
+    changed = runner.changed_files(before, after)
+    assert changed == ["a.py", "new.py"]
+    patch = runner.collect_git({"top": str(repo)}, repo, changed)
+    assert "+a = 2" in patch and "+n = 1" in patch and "b = 2" not in patch
 
 
 def test_slot_limit(tmp_path):
@@ -215,7 +236,7 @@ def _wrapper_copy(tmp_path, slots=1):
     keyfile.chmod(0o600)
     text = WRAPPER.read_text()
     text = text.replace("__OPENCODE_REAL_BIN__", str(fake)).replace("__OPENCODE_SLOT_DIR__", str(tmp_path / "slots"))
-    text = text.replace("__OPENCODE_KEY_FILE__", str(keyfile)).replace("OPENCODE_MAX_SLOTS=4", f"OPENCODE_MAX_SLOTS={slots}")
+    text = text.replace("__OPENCODE_KEY_FILE__", str(keyfile)).replace('OPENCODE_MAX_SLOTS="${OPENCODE_MAX_SLOTS:-12}"', f"OPENCODE_MAX_SLOTS={slots}")
     wrapper = tmp_path / "opencode"
     wrapper.write_text(text)
     wrapper.chmod(0o755)

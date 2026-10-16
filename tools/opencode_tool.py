@@ -16,8 +16,13 @@ Governance (15-10-2026, Michael):
   resolved;
 * the profile folderguard checks the workdir;
 * OpenCode itself runs confined (see ``tools/opencode_task_runner.py``):
-  read-only filesystem outside the job's worktree, secret locations and the
-  caller's denied paths masked, per-job OpenCode state, global slot limit.
+  read-only filesystem outside the workdir, the caller's denied paths masked,
+  per-job OpenCode state, global slot limit.
+
+16-10-2026 (Michael): OpenCode works directly in the workdir (no worktree),
+sees keys and credentials the caller may read, and runs up to
+HERMES_OPENCODE_MAX_SLOTS jobs at once (default 12). Only what the caller has
+no access to stays masked.
 """
 
 from __future__ import annotations
@@ -40,7 +45,10 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME = "opencode_task"
 DEFAULT_MODEL = "omniroute/auto/best-coding"
-MAX_SLOTS = 4
+try:
+    MAX_SLOTS = max(1, int(os.environ.get("HERMES_OPENCODE_MAX_SLOTS", "12")))
+except ValueError:
+    MAX_SLOTS = 12
 RUNNER = Path(__file__).resolve().with_name("opencode_task_runner.py")
 
 # Pinned on the passwd home: under the profile multiplexer $HOME points at
@@ -52,35 +60,31 @@ OPENCODE_BIN = os.environ.get("HERMES_OPENCODE_BIN") or str(
 JOBS_DIR = _HOME / ".hermes" / "cache" / "opencode-tasks"
 SLOT_DIR = _HOME / ".hermes" / "run" / "opencode-slots"
 
-# Masked for everyone inside the sandbox, owners included: credentials and
-# other people's state are never part of a coding job.
-ALWAYS_MASK_DIRS = (
+# Candidate locations with credentials or other people's state. Each one is
+# masked only when the caller may not read it through Hermes; an owner sees
+# them all, like in their own terminal.
+CANDIDATE_MASK_DIRS = (
     ".hermes", ".hermes-mux", ".ssh", ".gnupg", ".claude", ".codex", ".aws", ".azure",
     ".azure-devops", ".kube", ".docker", ".config/gcloud", ".config/gh", ".config/bunq",
     ".config/wealth-automation", ".local/share/opencode", ".IdentityService", ".apify",
-    "bunq-agentic", "ObsidianVault/.obsidian",
+    "bunq-agentic", "ObsidianVault", ".config/synthwave/clients",
 )
-ALWAYS_MASK_FILES = (
+CANDIDATE_MASK_FILES = (
     ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".claude.json",
-    ".config/opencode/opencode.jsonc", ".config/opencode/opencode.json", ".config/opencode/omniroute.key",
+    ".config/opencode/opencode.jsonc", ".config/opencode/opencode.json",
 )
-CLIENT_CREDS_DIR = ".config/synthwave/clients"
-
-# OpenCode's own permission layer: a second lock behind the sandbox, and the
-# only one that speaks to OpenCode's read/edit tools by pattern.
-SECRET_PATTERNS = ("**/.env", "**/.env.*", "**/.env*", "**/.hermes/**", "**/secrets/**",
-                   "**/*.pem", "**/*.key", "**/credentials.json", "**/auth.json",
-                   "**/.config/synthwave/clients/**")
+# Hermes refuses this mount to every account, so OpenCode never sees it.
+HARD_MASK_DIRS = ("/run/synthpulse/secrets",)
 
 OPENCODE_TASK_SCHEMA = {
     "name": TOOL_NAME,
     "description": (
         "Hand a bounded repository job (feature, refactor, tests, review, script) to OpenCode, "
-        "a coding agent, and get a review report back. Runs in the background in its own git "
-        "worktree; you are notified with the diff stat, patch, test output and OpenCode's output "
-        "when it finishes. Use it for code work that does not need your session context, tools or "
-        "access; run several in parallel (one per task). Review the diff before merging. "
-        "OpenCode cannot read secrets or files outside the workdir."
+        "a coding agent, and get a review report back. Runs in the background directly in the "
+        "workdir: it edits the files in place. You are notified with the changed files, diff, test "
+        "output and OpenCode's output when it finishes. Use it for code work that does not need your "
+        "session context; run several in parallel (one per task, on separate files or folders). "
+        "OpenCode can read what the caller may read, keys included, and writes only inside the workdir."
     ),
     "parameters": {
         "type": "object",
@@ -89,7 +93,7 @@ OPENCODE_TASK_SCHEMA = {
             "workdir": {"type": "string", "description": "Absolute path of the repository or folder to work in."},
             "model": {"type": "string", "description": f"provider/model for OpenCode (default {DEFAULT_MODEL})."},
             "background": {"type": "boolean", "description": "Run in the background and notify on completion (default true)."},
-            "test_command": {"type": "string", "description": "Optional command run in the worktree after OpenCode, e.g. 'pytest -q tests/x'."},
+            "test_command": {"type": "string", "description": "Optional command run in the workdir after OpenCode, e.g. 'pytest -q tests/x'."},
             "timeout": {"type": "integer", "description": "Seconds before OpenCode is stopped (default 3600, max 7200)."},
         },
         "required": ["task", "workdir"],
@@ -183,36 +187,53 @@ def _literal_path(glob: str) -> Optional[str]:
     return raw.rstrip("/") or None
 
 
-def mask_plan(access) -> tuple[list[str], list[str], list[str]]:
-    """(dirs to mask, files to mask, OpenCode deny patterns) for this caller."""
-    home = str(_HOME)
-    dirs = [os.path.join(home, d) for d in ALWAYS_MASK_DIRS]
-    files = [os.path.join(home, f) for f in ALWAYS_MASK_FILES]
-    patterns = list(SECRET_PATTERNS)
-    creds = os.path.join(home, CLIENT_CREDS_DIR)
-    creds_allowed = False
+def _caller_may_read(access, path: str) -> bool:
     if access is None:
-        creds_allowed = False
-    else:
-        try:
-            from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
-            creds_allowed = decide_tool_argument_access(
-                access, "read_file", {"path": os.path.join(creds, "probe", "creds.json")}).allowed
-        except Exception:  # noqa: BLE001
-            creds_allowed = False
-    if creds_allowed:
-        patterns.remove("**/.config/synthwave/clients/**")
-    else:
-        dirs.append(creds)
+        return True
+    try:
+        from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+        return decide_tool_argument_access(access, "read_file", {"path": path}).allowed
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def mask_plan(access) -> tuple[list[str], list[str], list[str]]:
+    """(dirs to mask, files to mask, OpenCode deny patterns) for this caller.
+
+    Everything the caller may read stays visible; a location is masked only
+    when the policy refuses it to them."""
+    home = str(_HOME)
+    dirs = list(HARD_MASK_DIRS)
+    files: list[str] = []
+    patterns: list[str] = ["/run/synthpulse/secrets/**"]
+    for rel in CANDIDATE_MASK_DIRS:
+        full = os.path.join(home, rel)
+        if not _caller_may_read(access, os.path.join(full, "probe")):
+            dirs.append(full)
+            patterns.append(full + "/**")
+    for rel in CANDIDATE_MASK_FILES:
+        full = os.path.join(home, rel)
+        if not _caller_may_read(access, full):
+            files.append(full)
+            patterns.append(full)
     if access is not None:
         globs = set(getattr(access.grants, "file_denied_globs", ()) or ()) | set(
             getattr(access.deny, "file_denied_globs", ()) or ())
-        for glob in sorted(globs):
+        allow = set(getattr(access.grants, "file_allow_globs", ()) or ())
+        for glob in sorted(globs - allow):
             literal = _literal_path(glob)
             if literal:
+                if _caller_may_read(access, literal):
+                    continue
                 (dirs if Path(literal).is_dir() or glob.endswith(("/**", "/*")) else files).append(literal)
+                patterns.append(literal + ("/**" if Path(literal).is_dir() else ""))
             elif str(glob).startswith("**/") or str(glob).startswith("*"):
                 patterns.append(str(glob))
+        for raw in sorted(set(getattr(access.deny, "file_read_roots", ()) or ())):
+            literal = _literal_path(raw)
+            if literal:
+                dirs.append(literal)
+                patterns.append(literal + "/**")
     return sorted(set(dirs)), sorted(set(files)), list(dict.fromkeys(patterns))
 
 
@@ -233,10 +254,14 @@ def home_layout(access) -> dict:
 
 
 def opencode_config(deny_patterns: list[str]) -> dict:
-    """Inline config (highest precedence): provider, no MCP, no reach outside the workdir."""
+    """Inline config (highest precedence): provider, no MCP, the caller's denies, no edits outside the workdir."""
     rules = {"*": "allow"}
+    bash_rules = {"*": "allow", "*opencode*run*": "deny"}
     for pattern in deny_patterns:
         rules[pattern] = "deny"
+        stem = pattern.replace("/**", "").lstrip("*").strip("/")
+        if stem:
+            bash_rules[f"*{stem}*"] = "deny"
     return {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -253,8 +278,7 @@ def opencode_config(deny_patterns: list[str]) -> dict:
             "external_directory": "deny",
             "read": dict(rules),
             "edit": dict(rules),
-            "bash": {"*": "allow", "*.env*": "deny", "*/.hermes/*": "deny", "*secrets*": "deny",
-                     "*opencode*run*": "deny", "*.config/synthwave/clients*": "deny"},
+            "bash": bash_rules,
             "webfetch": "allow",
         },
     }
@@ -306,18 +330,21 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
         "owner_email": getattr(getattr(access, "subject", None), "email", "") if access is not None else "",
     }
     if top is not None:
-        if access is not None:
+        job["git_top"] = str(top)
+        # The repository root (and so .git) is writable only when the caller may
+        # write there; otherwise OpenCode can write the workdir alone.
+        top_writable = True
+        if access is not None and top != resolved:
             from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
-            probe = decide_tool_argument_access(access, "write_file", {"path": str(top / ".opencode-worktrees" / "probe")})
-            if not probe.allowed:
-                return tool_error(f"Blocked by governance: the repository root {top} is outside your write scope.")
-        job.update({"git_top": str(top), "branch": f"opencode/{job_id}",
-                    "worktree": str(top / ".opencode-worktrees" / job_id)})
+            top_writable = decide_tool_argument_access(
+                access, "write_file", {"path": str(top / ".opencode-task-probe")}).allowed
+        job["git_writable"] = top_writable
     mask_dirs, mask_files, deny_patterns = mask_plan(access)
     # Never mask the place OpenCode has to work in.
-    keep = Path(job.get("worktree") or resolved)
+    keep = resolved
     job["mask_dirs"] = [d for d in mask_dirs if not str(keep).startswith(d.rstrip("/") + "/") and str(keep) != d]
     job["mask_files"] = mask_files
+    job["deny_patterns"] = deny_patterns
     job["opencode_config"] = opencode_config(deny_patterns)
     job.update(home_layout(access))
 
@@ -341,11 +368,10 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
         data = json.loads(result)
     except (TypeError, ValueError):
         data = {"output": result}
-    data.update({"opencode_job": job_id, "model": job["model"],
-                 "worktree": job.get("worktree", ""), "branch": job.get("branch", "")})
+    data.update({"opencode_job": job_id, "model": job["model"], "workdir": str(resolved)})
     if background:
-        data["note"] = ("OpenCode is working in the background; you will be notified with the review report. "
-                        "Review the diff before merging the branch.")
+        data["note"] = ("OpenCode is working in the background directly in the workdir; you will be notified "
+                        "with the changed files and diff. Review them before committing.")
     return json.dumps(data)
 
 
