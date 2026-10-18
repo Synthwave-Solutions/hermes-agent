@@ -297,3 +297,27 @@ def test_sandbox_hides_unlisted_home_and_blocks_outside_writes(tmp_path):
     assert sh(f"cat {hidden}/f.txt").returncode != 0
     assert sh(f"touch {allowed}/new.txt").returncode != 0
     assert sh(f"touch {worktree}/ok.txt").returncode == 0
+
+
+def test_runner_worktree_mode_leaves_live_tree_alone(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout
+    git("init", "-q")
+    (repo / "a.py").write_text("a = 1\n")
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    job = {"git_top": str(repo), "workdir": str(repo), "branch": "opencode/t1",
+           "worktree": str(repo / ".opencode-worktrees" / "t1")}
+    workroot, info = runner.prepare_worktree(job)
+    before = runner.snapshot(workroot, info["top"])
+    (workroot / "a.py").write_text("a = 2\n")
+    changed = runner.changed_files(before, runner.snapshot(workroot, info["top"]))
+    assert changed == ["a.py"]
+    assert "+a = 2" in runner.collect_git(info, workroot, changed)
+    runner.commit_worktree(info, "bump a")
+    assert (repo / "a.py").read_text() == "a = 1\n"
+    assert "a = 2" in git("show", "opencode/t1:a.py")
+    argv = runner.bwrap_argv({"home": str(tmp_path), "deny_patterns": []}, tmp_path / "run", workroot, info)
+    assert str(repo / ".git" / "objects") in argv and str(repo) not in [argv[i + 1] for i, x in enumerate(argv) if x == "--bind" and argv[i + 1] == str(repo)]

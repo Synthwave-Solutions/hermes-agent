@@ -83,7 +83,8 @@ OPENCODE_TASK_SCHEMA = {
         "a coding agent, and get a review report back. Runs in the background directly in the "
         "workdir: it edits the files in place. You are notified with the changed files, diff, test "
         "output and OpenCode's output when it finishes. Use it for code work that does not need your "
-        "session context; run several in parallel (one per task, on separate files or folders). "
+        "session context; run several in parallel (one per task, on separate files or folders, or with "
+        "worktree=true for parallel jobs in one repository). "
         "OpenCode can read what the caller may read, keys included, and writes only inside the workdir."
     ),
     "parameters": {
@@ -93,6 +94,7 @@ OPENCODE_TASK_SCHEMA = {
             "workdir": {"type": "string", "description": "Absolute path of the repository or folder to work in."},
             "model": {"type": "string", "description": f"provider/model for OpenCode (default {DEFAULT_MODEL})."},
             "background": {"type": "boolean", "description": "Run in the background and notify on completion (default true)."},
+            "worktree": {"type": "boolean", "description": "Work in a separate git worktree on branch opencode/<id> instead of the live tree (default false). Use it for parallel jobs in one repository, or when the live tree has work in progress."},
             "test_command": {"type": "string", "description": "Optional command run in the workdir after OpenCode, e.g. 'pytest -q tests/x'."},
             "timeout": {"type": "integer", "description": "Seconds before OpenCode is stopped (default 3600, max 7200)."},
         },
@@ -285,7 +287,7 @@ def opencode_config(deny_patterns: list[str]) -> dict:
 
 
 def opencode_task(task: str, workdir: str, model: Optional[str] = None, background: bool = True,
-                  test_command: Optional[str] = None, timeout: Optional[int] = None,
+                  test_command: Optional[str] = None, timeout: Optional[int] = None, worktree: bool = False,
                   task_id: Optional[str] = None, session_id: Optional[str] = None) -> str:
     task = (task or "").strip()
     if not task:
@@ -339,9 +341,19 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
             top_writable = decide_tool_argument_access(
                 access, "write_file", {"path": str(top / ".opencode-task-probe")}).allowed
         job["git_writable"] = top_writable
+        if worktree:
+            if access is not None:
+                from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
+                probe = decide_tool_argument_access(
+                    access, "write_file", {"path": str(top / ".opencode-worktrees" / "probe")})
+                if not probe.allowed:
+                    return tool_error(f"Blocked by governance: the repository root {top} is outside your write scope.")
+            job.update({"branch": f"opencode/{job_id}", "worktree": str(top / ".opencode-worktrees" / job_id)})
+    elif worktree:
+        return tool_error("worktree=true needs a git repository as workdir.")
     mask_dirs, mask_files, deny_patterns = mask_plan(access)
     # Never mask the place OpenCode has to work in.
-    keep = resolved
+    keep = Path(job.get("worktree") or resolved)
     job["mask_dirs"] = [d for d in mask_dirs if not str(keep).startswith(d.rstrip("/") + "/") and str(keep) != d]
     job["mask_files"] = mask_files
     job["deny_patterns"] = deny_patterns
@@ -368,7 +380,8 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
         data = json.loads(result)
     except (TypeError, ValueError):
         data = {"output": result}
-    data.update({"opencode_job": job_id, "model": job["model"], "workdir": str(resolved)})
+    data.update({"opencode_job": job_id, "model": job["model"], "workdir": str(resolved),
+                 "worktree": job.get("worktree", ""), "branch": job.get("branch", "")})
     if background:
         data["note"] = ("OpenCode is working in the background directly in the workdir; you will be notified "
                         "with the changed files and diff. Review them before committing.")
@@ -383,7 +396,7 @@ def _handle_opencode_task(args, **kw):
     return opencode_task(
         task=args.get("task"), workdir=args.get("workdir"), model=args.get("model"),
         background=args.get("background", True), test_command=args.get("test_command"),
-        timeout=args.get("timeout"), task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+        timeout=args.get("timeout"), worktree=bool(args.get("worktree", False)), task_id=kw.get("task_id"), session_id=kw.get("session_id"),
     )
 
 

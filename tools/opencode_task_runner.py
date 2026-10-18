@@ -8,8 +8,10 @@ the task text.
 What this process guarantees (15-10-2026):
 
 * a global limit on concurrent OpenCode jobs (flock slots, default 12);
-* OpenCode works directly in the workdir (16-10-2026, no worktree copy); the
-  report lists exactly the files this job changed, with their diff;
+* OpenCode works directly in the workdir (16-10-2026); the report lists
+  exactly the files this job changed, with their diff. With worktree=true
+  (18-10-2026) it works in its own git worktree on branch opencode/<id>
+  instead, so parallel jobs in one repository cannot collide;
 * OpenCode runs inside bubblewrap: the filesystem is read-only except the
   workdir and OpenCode's own per-job state, and what the caller may not read
   is masked with empty mounts. That holds for OpenCode's bash tool too, which
@@ -137,6 +139,41 @@ def changed_files(before: dict, after: dict) -> list[str]:
     return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
 
 
+def prepare_worktree(job: dict) -> tuple[Path, dict]:
+    """A fresh worktree on branch opencode/<id>; returns (work path, git info)."""
+    top = Path(job["git_top"])
+    worktree = Path(job["worktree"])
+    branch = job["branch"]
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    exclude = top / ".git" / "info" / "exclude"
+    try:
+        marker = "/.opencode-worktrees/"
+        current = exclude.read_text() if exclude.exists() else ""
+        if marker not in current:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with open(exclude, "a") as fh:
+                fh.write(("\n" if current and not current.endswith("\n") else "") + marker + "\n")
+    except OSError:
+        pass
+    code, out = _git(top, "worktree", "add", "-b", branch, str(worktree), "HEAD")
+    if code != 0:
+        raise RuntimeError("git worktree add failed: " + out.strip()[-800:])
+    _, base = _git(top, "rev-parse", "HEAD")
+    workdir = Path(job["workdir"])
+    rel = workdir.relative_to(top) if workdir != top else Path(".")
+    info = {"git": True, "top": str(worktree), "repo": str(top), "worktree": str(worktree),
+            "branch": branch, "base": base.strip(), "writable": False}
+    return worktree / rel, info
+
+
+def commit_worktree(git_info: dict, task: str) -> None:
+    worktree = Path(git_info["worktree"])
+    _git(worktree, "add", "-A")
+    title = "opencode_task: " + " ".join(task.split())[:60]
+    _run(["git", "-C", str(worktree), "-c", "user.name=OpenCode task", "-c", "user.email=opencode@localhost",
+          "commit", "-q", "--no-verify", "-m", title])
+
+
 def bwrap_argv(job: dict, run_dir: Path, workroot: Path, git_info: dict) -> list[str]:
     home = Path(job["home"])
     argv = ["bwrap", "--die-with-parent", "--unshare-pid", "--new-session",
@@ -167,7 +204,14 @@ def bwrap_argv(job: dict, run_dir: Path, workroot: Path, git_info: dict) -> list
     cache = home / ".cache" / "opencode"
     cache.mkdir(parents=True, exist_ok=True)
     argv += ["--bind", str(state), str(state), "--bind", str(cache), str(cache)]
-    if git_info.get("git") and git_info.get("writable"):
+    if git_info.get("worktree"):
+        repo = Path(git_info["repo"])
+        worktree = Path(git_info["worktree"])
+        argv += ["--bind", str(worktree), str(worktree)]
+        for extra in (repo / ".git" / "worktrees" / worktree.name, repo / ".git" / "objects"):
+            if extra.is_dir():
+                argv += ["--bind", str(extra), str(extra)]
+    elif git_info.get("git") and git_info.get("writable"):
         top = Path(git_info["top"])
         argv += ["--bind", str(top), str(top)]
     else:
@@ -278,9 +322,16 @@ def main(job_dir: str) -> int:
                                   f"reason: all {job.get('slots', 12)} OpenCode slots stayed busy; retry later"]))
         return 75
     try:
-        workroot = Path(job["workdir"])
-        git_info = {"git": bool(job.get("git_top")), "top": job.get("git_top", ""),
-                    "writable": bool(job.get("git_writable"))}
+        if job.get("worktree"):
+            try:
+                workroot, git_info = prepare_worktree(job)
+            except Exception as exc:  # noqa: BLE001 - reported to the agent
+                print("\n".join(report + ["status: failed", f"reason: {exc}"]))
+                return 1
+        else:
+            workroot = Path(job["workdir"])
+            git_info = {"git": bool(job.get("git_top")), "top": job.get("git_top", ""),
+                        "writable": bool(job.get("git_writable"))}
         before = snapshot(workroot, git_info["top"])
         argv = bwrap_argv(job, run_dir, workroot, git_info) + [
             job["opencode_bin"], "run", "-m", job["model"], "--dir", str(workroot), job["task"]]
@@ -297,12 +348,22 @@ def main(job_dir: str) -> int:
             report.append(f"test exit: {tcode}")
         after = snapshot(workroot, git_info["top"])
         changed = changed_files(before, after)
-        report += ["", "## Changed files (edited in place in " + str(workroot) + ")"] + (changed or ["(none)"])
+        where = f"worktree {workroot}" if git_info.get("worktree") else f"edited in place in {workroot}"
+        report += ["", f"## Changed files ({where})"] + (changed or ["(none)"])
         if git_info.get("git"):
             patch = collect_git(git_info, workroot, changed)
             if patch:
                 report += ["", "## Diff (against HEAD, only files this job changed)", patch]
-            report += ["", "Nothing is committed: review, then commit or `git checkout -- <file>` to undo."]
+            if git_info.get("worktree"):
+                if changed:
+                    commit_worktree(git_info, job["task"])
+                repo = git_info["repo"]
+                report += ["", f"branch: {git_info['branch']} (base {git_info['base'][:12]})",
+                           f"merge after review: git -C {repo} merge {git_info['branch']}",
+                           f"discard: git -C {repo} worktree remove --force {git_info['worktree']} && "
+                           f"git -C {repo} branch -D {git_info['branch']}"]
+            else:
+                report += ["", "Nothing is committed: review, then commit or `git checkout -- <file>` to undo."]
         if job.get("test_command"):
             report += ["", "## Test output", _tail(test_out)]
         report += ["", "## OpenCode output", _tail(output)]
