@@ -1377,6 +1377,30 @@ def _apply_display_config(agent, _agent_cfg, platform):
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
 
 
+def _memory_agent_context(agent, platform) -> str:
+    """``agent_context`` for memory providers: anything but "primary" makes providers skip writes.
+
+    - platform "cron" (scheduler) / "subagent" (delegate_task) keep their own context.
+    - Finite non-interactive CLI runs (``hermes -z``, ``hermes chat -q``; session source "oneshot")
+      are script-driven, so they are "background".
+    - API-server requests that declare no ``X-Hermes-Session-Key`` have no long-term memory scope
+      (scripts and webhooks posting a full prompt per call) and are "background" too. A caller that
+      wants memory declares a session key, which keeps the turn "primary".
+    Without this, every automated prompt was stored as a fresh [USER] turn in the shared bank.
+    """
+    if platform in ("cron", "subagent"):
+        return platform
+    if platform == "api_server":
+        return "primary" if getattr(agent, "_gateway_session_key", None) else "background"
+    source = ""
+    with suppress(Exception):
+        from run_agent import _session_source_for_agent  # late: run_agent imports this module
+        source = _session_source_for_agent(platform)
+    if source == "oneshot":
+        return "background"
+    return "primary"
+
+
 def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     """Scoping kwargs for ``MemoryManager.initialize_all`` (status_callback is CLI-only:
     gateway status travels a different path and the indicator no-ops without it)."""
@@ -1384,8 +1408,8 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         "session_id": agent.session_id,
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
-        # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
-        "agent_context": platform if platform in ("cron", "subagent") else "primary",
+        # Non-"primary" contexts make providers skip writes (MemoryProvider.initialize).
+        "agent_context": _memory_agent_context(agent, platform),
     }
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning

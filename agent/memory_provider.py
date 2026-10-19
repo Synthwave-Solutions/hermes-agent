@@ -105,7 +105,8 @@ class MemoryProvider(ABC):
 
         kwargs always include ``hermes_home`` (profile-scoped storage; never hardcode
         ``~/.hermes``) and ``platform``; may include ``agent_context`` ("primary" |
-        "subagent" | "cron" | "flush" — skip writes for non-primary contexts),
+        "subagent" | "cron" | "flush" | "background" — skip writes for non-primary contexts;
+        "background" covers one-shot CLI runs and unscoped API-server calls),
         ``agent_identity``, ``agent_workspace``, ``parent_session_id``, ``user_id``, ``user_id_alt``.
         """
 
