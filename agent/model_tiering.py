@@ -15,6 +15,7 @@ The axes are deliberately decoupled: a huge-context but trivial step can run
 sol-low, a short but genuinely hard question can run terra-xhigh or luna-xhigh.
 
 Kill switch: HERMES_MODEL_TIERING=0 (or config model.tiering: false).
+Explicit reasoning settings and provider recovery decisions always take precedence.
 Fail-open: any error leaves the original kwargs untouched.
 """
 
@@ -111,10 +112,42 @@ def classify_turn(api_messages: list) -> Tuple[str, str, str]:
     return tier, effort, f"{treason} / {ereason}"
 
 
+def configure_model_tiering(agent, config: dict) -> None:
+    """Snapshot the owning profile's switch at construction, without per-call I/O."""
+    model = config.get("model") or {}
+    value = model.get("tiering", True) if isinstance(model, dict) else True
+    agent._model_tiering_enabled = str(value).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _automatic_effort_allowed(agent) -> bool:
+    # The standard request builder already resolves explicit user/profile effort
+    # and provider recovery. Do not undo disabled thinking, a rejected effort,
+    # or a one-shot reasoning-off continuation here.
+    if getattr(agent, "reasoning_config", None) is not None:
+        return False
+    if any(getattr(agent, key, False) for key in (
+        "_reasoning_effort_rejected", "_reasoning_disable_rejected",
+    )):
+        return False
+    wire = getattr(agent, "_wire_reasoning_config", None)
+    if isinstance(wire, dict) and (wire.get("enabled") is False or wire.get("effort") == "none"):
+        return False
+    overrides = getattr(agent, "request_overrides", None)
+    if isinstance(overrides, dict):
+        for layer in (overrides, overrides.get("extra_body")):
+            if isinstance(layer, dict) and any(k in layer for k in (
+                "reasoning", "reasoning_effort", "thinking", "enable_thinking",
+            )):
+                return False
+    return True
+
+
 def apply_model_tiering(agent, kwargs: dict, api_messages: list) -> None:
     """Mutate *kwargs* in place with the per-turn tier and effort."""
     try:
         if os.getenv("HERMES_MODEL_TIERING", "1").strip().lower() in ("0", "false", "off"):
+            return
+        if getattr(agent, "_model_tiering_enabled", True) is False:
             return
         model = str(kwargs.get("model") or "")
         if model not in TIERED_SOURCE_MODELS:
@@ -122,6 +155,9 @@ def apply_model_tiering(agent, kwargs: dict, api_messages: list) -> None:
         tier, effort, reason = classify_turn(api_messages or [])
         target = TIER_TO_MODEL.get(tier, model)
         kwargs["model"] = target
+        if not _automatic_effort_allowed(agent):
+            logger.info("model_tiering: %s -> %s (preserving resolved reasoning)", model, target)
+            return
         extra = kwargs.get("extra_body")
         if not isinstance(extra, dict):
             extra = {}

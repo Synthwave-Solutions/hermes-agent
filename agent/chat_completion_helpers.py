@@ -1682,7 +1682,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         getattr(agent, "base_url", None),
         getattr(agent, "session_id", None),
     )
-    # SYNTHWAVE fork: per-turn model tiering (``agent.model_tiering``). When the session model is
+    # SYNTHWAVE fork: per-turn model tiering (``model.tiering``). When the session model is
     # the synthwave-auto combo, each turn picks a tier (luna/terra/sol) and reasoning effort from
     # the question. Fail-open by design.
     try:
