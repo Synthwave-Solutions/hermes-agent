@@ -118,10 +118,12 @@ def build_api_request(
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
     observe_request_tools(agent, tools_for_api)
-    if tools_for_api == agent.tools:
-        api_kwargs = agent._build_api_kwargs(api_messages)
-    else:
-        api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    from agent.model_tiering import tiering_request_user
+    with tiering_request_user(agent, messages, original_user_message):
+        if tools_for_api == agent.tools:
+            api_kwargs = agent._build_api_kwargs(api_messages)
+        else:
+            api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
     # Messages were scrubbed above; this walk covers the rest of the payload (tool descriptions,
     # extra_body, kwargs strings) — see sanitize_outbound_kwargs for the #50959 rationale.
     sanitize_outbound_kwargs(agent, api_kwargs)
