@@ -21,12 +21,16 @@ Fail-open: any error leaves the original kwargs untouched.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 import os
 import re
 from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_REQUEST_USER = ContextVar("model_tiering_request_user", default=None)
 
 TIERED_SOURCE_MODELS = {"synthwave-auto"}
 
@@ -67,6 +71,28 @@ def _msg_text(msg: Any) -> str:
     return str(content or "")
 
 
+@contextmanager
+def tiering_request_user(agent, messages: list, original_user_message: Any):
+    """Bind trusted clean input only for this request builder, never to prompt/history.
+
+    The persistence anchor follows compaction. A newer user row (e.g. /steer)
+    takes precedence, so an earlier clean ask cannot conceal a changed task.
+    Outside the turn loop, request builders retain their existing wire fallback.
+    """
+    clean = None
+    index = getattr(agent, "_persist_user_message_idx", None)
+    if isinstance(index, int) and not isinstance(index, bool) and isinstance(messages, list):
+        latest = next((i for i in range(len(messages) - 1, -1, -1)
+                       if isinstance(messages[i], dict) and messages[i].get("role") == "user"), None)
+        if latest == index and isinstance(original_user_message, (str, list)):
+            clean = _msg_text({"content": original_user_message})
+    token = _REQUEST_USER.set(clean)
+    try:
+        yield
+    finally:
+        _REQUEST_USER.reset(token)
+
+
 def classify_turn(api_messages: list) -> Tuple[str, str, str]:
     """Return (tier, effort, reason) for the upcoming call."""
     last_user = ""
@@ -88,6 +114,9 @@ def classify_turn(api_messages: list) -> Tuple[str, str, str]:
                 recent_error_count += 1
         if last_user:
             break
+    clean_user = _REQUEST_USER.get()
+    if clean_user is not None:
+        last_user = clean_user
     approx_tokens = approx_chars // 4
     has_code = "```" in last_user or bool(re.search(r"\b(def |class |function|SELECT |import )", last_user))
 
