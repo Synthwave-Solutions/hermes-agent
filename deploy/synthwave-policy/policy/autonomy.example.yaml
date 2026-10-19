@@ -1,0 +1,610 @@
+# Synthwave autonomy policy (read by the synthwave-policy Hermes plugin)
+#
+# Location: ~/.hermes/policy/autonomy.yaml (the root file) is authoritative for every profile.
+# Per profile (bot) settings live under `profiles:` at the bottom of THIS file.
+# A profile may also have $HERMES_HOME/policy/autonomy.yaml, but that file can only TIGHTEN: both
+# files are evaluated, the stricter decision wins, its mode only counts when it says enforce, and
+# its own `profiles:` key is ignored.
+#
+# Every agent tool call gets one decision:
+#   AUTO   the agent may do it on its own
+#   ASK    a human must approve this exact call first (approval gate: once / session / always / deny)
+#   BLOCK  never allowed for an agent
+#
+# mode: observe  logs would-be ASK and BLOCK decisions to $HERMES_HOME/policy/decisions.jsonl
+#                and never interferes. A broken policy file is ignored (fails open).
+# mode: enforce  ASK goes to the human approval gate, BLOCK refuses the call. Without a human
+#                (cron, headless) an ASK is refused too. A broken policy file blocks every call.
+# Once enforce was active, the plugin writes $HERMES_HOME/policy/.enforced. From then on a missing
+# or broken policy file blocks every call. Only a human removes that marker.
+# Commands and code longer than 64 KB are not evaluated: they are ASK ("command too long to evaluate").
+# Scout jobs (cron jobs that run the Scout collector) may only use kanban and web tools: everything
+# else is BLOCK in enforce and logged in observe (built in, not configurable here).
+#
+# How rules match
+#   tool          tool name globs (case-insensitive), e.g. terminal, write_file, mcp_*
+#   mcp           MCP tools as {server: regex, tool: regex}; MCP tools are named
+#                 mcp__<server>__<tool>, e.g. mcp__claude_ai_Gmail__send_message
+#                 (connector tools connectors__<connector>__<tool> match the same way)
+#   command       regex per executed shell command (terminal tool). The command is parsed first:
+#                 text inside echo/printf strings, comments and heredocs given to cat/tee does NOT
+#                 count; bash -c, eval, ssh host cmd, env -S, find -exec, $( ), heredocs and
+#                 here-strings given to a shell, and echo/printf piped into a shell DO count.
+#                 Wrappers (sudo, env, timeout, nohup, xargs, command, VAR=x) and the program path are
+#                 stripped, `W=waapi; $W send` and "$(command -v waapi)" are resolved, so the regex
+#                 sees e.g. "waapi send --to 316... --text hi".
+#   command_text  regex on the raw command string (anywhere, including quotes and heredocs)
+#   code_text     regex on program text that is executed: execute_code, python -c, node -e, perl -e,
+#                 heredocs, here-strings or echo text fed to an interpreter
+#   undecidable   true: the command runs something the text does not show (a variable or substitution
+#                 in command position next to a send word, or a shell/interpreter reading a pipe)
+#   writes_path   globs for files being written (write_file/patch path, shell > >> tee cp mv sed -i ...)
+#                 matched against the full path and the file name
+#   touches_path  like writes_path, plus files deleted, moved away or chmod-ed (rm, mv, unlink, chmod)
+#   rm_recursive_outside  recursive rm with any target outside these globs
+#   args          {argument: regex}, args_text: regex on all arguments as JSON
+#   page_url      regex on the browser page the call acts on (the last browser_navigate of the task)
+#   unless        same matchers; when they match, the rule does not apply
+# Inside one rule all listed matchers must match; within a list any entry may match.
+# When several rules match, the strictest decision wins (BLOCK over ASK over AUTO).
+# Regexes must not contain unbounded gaps (.* or .+): use a bounded gap such as .{0,2000}? so a
+# large adversarial command cannot make the check slow.
+#
+# Test any call with:  policy_check.py terminal '{"command": "waapi send ..."}' --profile marcel
+
+version: 1
+mode: observe
+
+defaults:
+  decision: AUTO
+
+log:
+  max_bytes: 5242880   # rotate decisions.jsonl at 5 MB
+  keep: 1              # keep one rotated file (decisions.jsonl.1)
+
+rules:
+
+  # ===================================================================================
+  # Outbound messages: nothing leaves the building without Michaël's approval.
+  # Drafts and read-only calls stay AUTO.
+  # ===================================================================================
+
+  - id: email-send-mcp
+    decision: ASK
+    description: Sending, replying to or forwarding an e-mail needs Michaël's approval of the full draft
+    tags: [outbound, email]
+    mcp:
+      server: gmail|google_?workspace|gws|outlook|microsoft_?365
+      tool: (gmail_)?(send_message|send_email|send_mail|send|reply|reply_all|reply_to_thread|forward|forward_message|send_draft)
+
+  - id: email-drafts
+    decision: AUTO
+    description: Creating and editing e-mail drafts is fine, sending them is not
+    tags: [outbound, email, draft]
+    mcp:
+      server: gmail|google_?workspace|gws
+      tool: (create|update|get|list|delete)_drafts?
+
+  - id: email-send-cli
+    decision: ASK
+    description: Sending e-mail from the command line needs Michaël's approval of the full draft
+    tags: [outbound, email]
+    tool: terminal
+    command:
+      - ^gws(-hermes)?(\s+-{1,2}[\w-]+(=\S{0,200})?(\s+(?![+-])\S{1,200})?){0,8}?\s+gmail(\s+-{1,2}[\w-]+(=\S{0,200})?(\s+(?![+-])\S{1,200})?){0,8}?\s+(\+(send|reply|reply-all|forward)\b|users\s+(messages|drafts)\s+send\b)
+      - ^(sendmail|msmtp|mutt|mailx|ssmtp|swaks)\b
+      - ^mail\s+(.{0,2000}?\s)?-s\b
+      - ^curl\b.{0,2000}?gmail\.googleapis\.com\S{0,500}/send\b
+
+  - id: gchat-send
+    decision: ASK
+    description: Posting in Google Chat needs Michaël's approval of the full message
+    tags: [outbound, chat]
+    tool: terminal
+    command:
+      - ^gchat(\s+--as(=|\s+)\S+)?\s+(send|reply|card|react|upload|send-file)\b
+      - ^gchat\b.{0,2000}?\sraw\s+(post|put|patch)\b
+      - ^gws(-hermes)?(\s+-{1,2}[\w-]+(=\S{0,200})?(\s+(?![+-])\S{1,200})?){0,8}?\s+chat(\s+-{1,2}[\w-]+(=\S{0,200})?(\s+(?![+-])\S{1,200})?){0,8}?\s+(\+send\b|spaces\s+messages\s+(create|update|patch)\b)
+
+  - id: team-queue-send
+    decision: ASK
+    description: Queueing, editing or dispatching outbound team-queue messages counts as sending and needs approval
+    tags: [outbound, chat, email]
+    tool: terminal
+    command:
+      - ^team-queue(\s+--dir(=|\s+)\S+|\s+--json|\s+--quiet)*\s+(add|run|edit)\b
+
+  - id: whatsapp-send
+    decision: ASK
+    description: Sending a WhatsApp message or media needs Michaël's approval of the full text
+    tags: [outbound, whatsapp]
+    tool: terminal
+    command:
+      - ^waapi(\s+--instance(=|\s+)\S+|\s+--debug)*\s+(send|send-media)\b
+      - ^waapi\b.{0,2000}?\saction\s+(.{0,2000}?\s)?send-(?!seen\b)[\w-]+
+      - ^waapi\b.{0,2000}?\sraw\s+(post|put|patch)\b.{0,2000}?send
+
+  - id: linkedin-send
+    decision: ASK
+    description: LinkedIn messages, comments, reactions and invites need Michaël's approval
+    tags: [outbound, linkedin]
+    tool: terminal
+    command:
+      - ^linkup(\s+--?\S+(\s+[^-\s]\S{0,500})?)*?\s+(send|comment|reply-comment|react)\b
+      - ^linkup(\s+--?\S+(\s+[^-\s]\S{0,500})?)*?\s+action\s+(network|content)\b
+
+  - id: linkedin-send-mcp
+    decision: ASK
+    description: LinkedIn messages, posts, comments and invites need Michaël's approval
+    tags: [outbound, linkedin]
+    mcp:
+      server: linkedin|linkup
+      tool: (?!(get|list|read|search|fetch|find)_).{0,120}(send|post|comment|react|invite|connect|message).{0,120}
+
+  - id: mailchimp-schedule
+    decision: ASK
+    description: Scheduling a Mailchimp campaign sends it to the whole audience and needs Michaël's approval
+    tags: [outbound, newsletter]
+    mcp:
+      server: mailchimp
+      tool: schedule_campaign|send_campaign|send
+
+  - id: mailchimp-schedule-cli
+    decision: ASK
+    description: Scheduling a Mailchimp campaign sends it to the whole audience and needs Michaël's approval
+    tags: [outbound, newsletter]
+    tool: terminal
+    command:
+      - ^mailchimp\s+(schedule|send)\b
+
+  - id: mailchimp-drafts
+    decision: AUTO
+    description: Mailchimp drafts and internal test mails are fine
+    tags: [outbound, newsletter, draft]
+    mcp:
+      server: mailchimp
+      tool: (create|update|delete)_draft_campaign|send_test_email|unschedule_campaign|upload_image
+
+  - id: lemlist-launch
+    decision: ASK
+    description: Starting, resuming or sending a Lemlist campaign needs Michaël's approval
+    tags: [outbound, lemlist]
+    mcp:
+      server: lemlist
+      tool: (?!(get|list|read|search|fetch|find)_).{0,120}(start|launch|resume|send|activate).{0,120}
+
+  - id: lemlist-launch-cli
+    decision: ASK
+    description: Starting, resuming or sending a Lemlist campaign needs Michaël's approval
+    tags: [outbound, lemlist]
+    tool: terminal
+    command:
+      - ^curl\b.{0,2000}?api\.lemlist\.com\S{0,500}/(start|resume|launch|send)\b
+
+  - id: send-message-external
+    decision: ASK
+    description: Messages to external platforms through send_message need Michaël's approval
+    tags: [outbound]
+    tool: send_message
+    args:
+      target: ^\s*(whatsapp|email|mail|sms|signal|linkedin|slack|discord|teams|msteams|mattermost|matrix|googlechat|google_chat|gchat|xmpp|imessage|bluebubbles|twitter|instagram|facebook|messenger|line|wechat|feishu|lark|dingtalk|wecom)\b
+    unless:
+      args:
+        action: ^list$
+
+  - id: composio-outbound
+    decision: ASK
+    description: Sending messages through Composio actions needs Michaël's approval
+    tags: [outbound]
+    tool: mcp_*composio*
+    args_text:
+      - (GMAIL_(SEND|REPLY|FORWARD)|OUTLOOK_(SEND|REPLY|FORWARD)|SLACK_(SEND|POST|CHAT_POST)|WHATSAPP_SEND|LINKEDIN_(CREATE|SEND|POST)|TWITTER_(CREATION|POST|CREATE)|TELEGRAM_SEND|DISCORD_SEND|MICROSOFT_TEAMS_(SEND|POST|CHATS_POST)|GOOGLECHAT_(CREATE|SEND))
+
+  - id: outbound-cli-in-code
+    decision: ASK
+    description: Code that runs a sending CLI or calls a send API needs Michaël's approval
+    tags: [outbound]
+    tool: [terminal, execute_code]
+    # code_text: program text that is executed (execute_code, python -c, node -e, perl -e, a heredoc
+    # or echo piped into an interpreter). Plain shell words such as grep patterns are not code.
+    code_text:
+      - \b(waapi|gchat|team-queue|linkup)(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}(send|send-media|send-file|reply|card|add|run|comment|react|upload)\b
+      - \b(gws|gws-hermes)(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}(gmail|chat)(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}\+?(send|reply|reply-all|forward)\b
+      - \b(gws|gws-hermes)(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}chat(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}spaces(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}messages(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}(create|update|patch)\b
+      - \bmailchimp(\W{1,8}[\w.:@/=+~-]{1,80}){0,6}?\W{1,8}(schedule|send)\b
+      - \b(sendmail|msmtp|ssmtp|swaks|mailx|mutt)\b
+      - \bsmtplib\b
+      - gmail\.googleapis\.com[^\s'"]{0,300}/send\b
+      - chat\.googleapis\.com[^\s'"]{0,300}/messages\b
+      - api\.lemlist\.com[^\s'"]{0,300}/(start|resume|launch|send)\b
+
+  - id: outbound-undecidable
+    decision: ASK
+    description: The command runs something that cannot be read from the text (a variable or substitution in command position next to a send word, or a shell or interpreter fed from a pipe), so a human has to approve it
+    tags: [outbound, undecidable]
+    tool: terminal
+    undecidable: true
+
+  - id: marketplace-outbound
+    decision: ASK
+    description: Marktplaats offers and ads go out under Michaël's name and need approval
+    tags: [outbound, marketplace]
+    mcp:
+      server: pareltje
+      tool: send_offer|publish_ad
+
+  # ===================================================================================
+  # Calendar writes: never without confirmation.
+  # ===================================================================================
+
+  - id: calendar-write-mcp
+    decision: ASK
+    description: Creating, changing, cancelling or answering calendar events needs confirmation
+    tags: [calendar]
+    mcp:
+      server: calendar|gcal|notion
+      tool: (notion_calendar_)?(create|update|delete|cancel|patch|move|insert|quick_add|respond_to)_events?
+
+  - id: calendar-write-cli
+    decision: ASK
+    description: Creating, changing or deleting calendar events needs confirmation
+    tags: [calendar]
+    tool: terminal
+    command:
+      - ^gws(-hermes)?(\s+-{1,2}[\w-]+(=\S{0,200})?(\s+(?![+-])\S{1,200})?){0,8}?\s+calendar(\s+-{1,2}[\w-]+(=\S{0,200})?(\s+(?![+-])\S{1,200})?){0,8}?\s+(\+insert\b|events\s+(insert|update|patch|delete|move|quickadd|import)\b)
+      - ^gcalcli\b.{0,2000}?\s(add|quick|delete|edit|import)\b
+
+  - id: composio-calendar
+    decision: ASK
+    description: Calendar writes through Composio need confirmation
+    tags: [calendar]
+    tool: mcp_*composio*
+    args_text:
+      - (GOOGLECALENDAR_(CREATE|UPDATE|DELETE|PATCH|QUICK_ADD|MOVE)|OUTLOOK_(CREATE|UPDATE|DELETE)_(CALENDAR_)?EVENT)
+
+  # ===================================================================================
+  # Credentials: reading is fine, writing is never done by an agent.
+  # ===================================================================================
+
+  - id: credential-password-cli
+    decision: BLOCK
+    description: Changing passwords or creating login keys is never done by an agent, ask Michaël
+    tags: [credentials]
+    tool: terminal
+    command:
+      - ^(passwd|chpasswd|htpasswd)\b
+      - ^usermod\b.{0,2000}?\s-p\b
+      - ^gcloud\b(.{0,2000}?\s)?iam\s+service-accounts\s+keys\s+create\b
+      - ^az\s+ad\s+(user\s+update\b.{0,2000}?--password|sp\s+credential\s+reset|app\s+credential\s+reset)\b
+      - ^aws\s+iam\s+(create-access-key|create-login-profile|update-login-profile)\b
+      - ^gws(-hermes)?\s+admin\b.{0,2000}?\busers\s+(update|patch)\b.{0,2000}?password
+      - \b(alter|create)\s+(user|role)\b[\s\S]{0,300}?\bpassword\b
+      - \bset\s+password\s+for\b
+
+  - id: credential-password-api
+    decision: BLOCK
+    description: Resetting or overwriting account passwords through an API is never done by an agent, ask Michaël
+    tags: [credentials]
+    tool: [terminal, execute_code]
+    args_text:
+      - auth\.admin\.(updateUserById|update_user_by_id)\b[\s\S]{0,300}?password
+      - /auth/v1/admin/users/[\s\S]{0,300}?password
+      - \b(resetPasswordForEmail|reset_password_for_email)\b
+      - \bauth\.(updateUser|update_user)\b[\s\S]{0,300}?password
+
+  - id: credential-file-write
+    decision: BLOCK
+    description: Writing .env, key or credential files is never done by an agent, ask Michaël
+    tags: [credentials]
+    tool: [write_file, patch, edit, edit_file, create_file, str_replace, multi_edit, append_file]
+    writes_path: &credential_files
+      - .env
+      - .env.*
+      - "*.env"
+      - "*/.ssh/*"
+      - .netrc
+      - .pgpass
+      - "*service-account*.json"
+      - "*service_account*.json"
+      - "*credentials*.json"
+      - "*/.hermes/auth.json"
+      - "*.pem"
+      - id_rsa*
+      - id_ed25519*
+    unless:
+      writes_path: &credential_examples
+        - .env.example
+        - .env.sample
+        - .env.template
+        - .env.dist
+        - "*.env.example"
+
+  - id: credential-file-write-shell
+    decision: ASK
+    description: Writing .env, key or credential files from the shell needs Michaël's approval
+    tags: [credentials]
+    tool: terminal
+    writes_path: *credential_files
+    unless:
+      writes_path: *credential_examples
+
+  # ===================================================================================
+  # Tamper resistance: the policy, its enforce marker and the plugin itself are human-only.
+  # ===================================================================================
+
+  - id: policy-tamper
+    decision: BLOCK
+    description: Changing, moving or deleting the autonomy policy, its enforce marker or the synthwave-policy plugin is never done by an agent
+    tags: [tamper]
+    tool: [terminal, write_file, patch, edit, edit_file, create_file, str_replace, multi_edit, append_file]
+    # touches_path: files written (> >> tee cp mv sed -i ...) plus files deleted, moved away or chmod-ed
+    touches_path:
+      - "*/policy/autonomy.yaml"
+      - autonomy.yaml
+      - "*/policy/.enforced"
+      - .enforced
+      - "*/plugins/synthwave-policy"
+      - "*/plugins/synthwave-policy/*"
+      - "*/.hermes/policy"
+      - "*/.hermes/profiles/*/policy"
+      - "*/.hermes/plugins"
+      - "*/.hermes/profiles/*/plugins"
+
+  - id: policy-tamper-code
+    decision: ASK
+    description: Code that touches the autonomy policy or the synthwave-policy plugin needs a human
+    tags: [tamper]
+    tool: [terminal, execute_code]
+    code_text:
+      - policy/autonomy\.yaml
+      - policy/\.enforced
+      - plugins/synthwave-policy
+
+  - id: hermes-plugins-cli
+    decision: BLOCK
+    description: Disabling, removing or reconfiguring Hermes plugins is never done by an agent
+    tags: [tamper]
+    tool: terminal
+    command:
+      - ^hermes(\s+-{1,2}\S{1,200}(\s+[^-\s]\S{0,200})?){0,6}?\s+plugins?\s+(disable|remove|rm|uninstall|enable|install|adopt|trust|update|pack)\b
+      - ^hermes(\s+-{1,2}\S{1,200}(\s+[^-\s]\S{0,200})?){0,6}?\s+config\s+(set|unset|edit)\s+plugins
+
+  - id: hermes-config-plugins
+    decision: BLOCK
+    description: Editing the plugins section of a Hermes config.yaml is never done by an agent
+    tags: [tamper]
+    tool: [terminal, write_file, patch, edit, edit_file, create_file, str_replace, multi_edit, append_file]
+    writes_path: &hermes_config
+      - "*/.hermes/config.yaml"
+      - "*/.hermes/profiles/*/config.yaml"
+      - "$HERMES_HOME/config.yaml"
+      - "${HERMES_HOME}/config.yaml"
+    args_text:
+      - \bplugins\b
+
+  - id: hermes-config-write
+    decision: ASK
+    description: Changing a Hermes config.yaml needs approval
+    tags: [tamper]
+    tool: [terminal, write_file, patch, edit, edit_file, create_file, str_replace, multi_edit, append_file]
+    touches_path: *hermes_config
+
+  # ===================================================================================
+  # Browsers and the Bot Screen: sending through a web app is still sending.
+  # What the policy can see: the tool arguments and the page a browser_navigate landed on in the
+  # same task. It cannot see the label behind a snapshot ref (@e5) or a screen element number, nor
+  # pages reached by clicking links, nor what a computer_use click hits on the desktop.
+  # Rules tagged bot-screen are skipped while a human holds the bot's screen (the engine already
+  # refuses every agent action then).
+  # ===================================================================================
+
+  - id: browser-send-surface
+    decision: ASK
+    description: Clicking, typing or pressing keys on a mail, chat or messaging web app can send a message and needs approval
+    tags: [outbound, browser, bot-screen]
+    tool: [browser_click, browser_type, browser_press, browser_dialog, browser_cdp, browser_exec, computer_use]
+    page_url: &send_surfaces
+      - ^https?://(mail|inbox)\.google\.com\b
+      - ^https?://web\.whatsapp\.com\b
+      - ^https?://([\w-]+\.)?linkedin\.com/(messaging|feed|in/|company/|post|share)
+      - ^https?://chat\.google\.com\b
+      - ^https?://(outlook\.(live|office|office365)\.com|outlook\.cloud\.microsoft|teams\.microsoft\.com)\b
+    unless:
+      args:
+        action: ^(capture|wait|list_apps|list_windows|focus_app|scroll)$
+
+  - id: browser-send-label
+    decision: ASK
+    description: Clicking a send, post, publish or pay button needs approval
+    tags: [outbound, browser, bot-screen]
+    # Only where the label is in the arguments: a CSS or text selector, a CDP expression or a
+    # browser_exec instruction. A snapshot ref like @e5 carries no label.
+    tool: [browser_click, browser_dialog, browser_cdp, browser_exec]
+    args_text:
+      - (?i)\b(send|verzenden|versturen|verstuur|post|plaatsen|publish|publiceren|betalen|pay|buy|kopen|bestellen|checkout|afrekenen)\b
+
+  - id: browser-password-field
+    decision: BLOCK
+    description: Typing into a password field is for humans only (credentials are never entered by an agent)
+    tags: [credentials, browser, bot-screen]
+    tool: browser_type
+    args:
+      ref: (?i)(password|wachtwoord|passwd|\bpwd\b)
+
+  - id: browser-password-script
+    decision: BLOCK
+    description: Filling a password field from a script or browser instruction is for humans only
+    tags: [credentials, browser, bot-screen]
+    tool: [browser_cdp, browser_exec]
+    args_text:
+      - (?i)(type\s*=\s*\\?["']?password|\bpassword\b|\bwachtwoord\b|\bpasswd\b)
+
+  # ===================================================================================
+  # OmniRoute: never write storage.sqlite from the host (WAL split-brain).
+  # Reads and anything run inside the container (docker exec) are fine.
+  # ===================================================================================
+
+  - id: omniroute-storage-write
+    decision: BLOCK
+    description: Writing OmniRoute storage.sqlite from the host corrupts it, use the OmniRoute API or docker exec
+    tags: [omniroute]
+    tool: [terminal, execute_code]
+    args_text:
+      - storage\.sqlite[\s\S]{0,300}?\b(insert\s+(or\s+\w+\s+)?into|update\s+\S+\s+set|delete\s+from|drop\s+(table|index)|alter\s+table|replace\s+into|create\s+(table|index)|vacuum)\b
+    unless:
+      command:
+        - ^docker\s+(compose\s+)?exec\b
+
+  - id: omniroute-storage-file
+    decision: BLOCK
+    description: Overwriting or deleting OmniRoute storage.sqlite from the host corrupts it
+    tags: [omniroute]
+    tool: [terminal, write_file, patch]
+    writes_path:
+      - storage.sqlite
+      - storage.sqlite-wal
+      - storage.sqlite-shm
+
+  - id: omniroute-storage-rm
+    decision: BLOCK
+    description: Deleting OmniRoute storage.sqlite files from the host corrupts the database
+    tags: [omniroute]
+    tool: terminal
+    command:
+      - ^rm\b.{0,2000}?\bstorage\.sqlite
+
+  # ===================================================================================
+  # Git: force pushes and pushes to main/master need approval. Other branches are AUTO.
+  # ===================================================================================
+
+  - id: git-force-push
+    decision: ASK
+    description: Force pushing rewrites shared history and needs approval
+    tags: [git]
+    tool: terminal
+    command:
+      - ^git(\s+-C\s+\S+|\s+-c\s+\S+)*\s+push\b.{0,2000}?(\s--force(-with-lease)?\b|\s-[a-eg-zA-Z]*f[a-zA-Z]*(\s|$)|\s\+\S+)
+
+  - id: git-push-main
+    decision: ASK
+    description: Pushing to main or master needs approval
+    tags: [git]
+    tool: terminal
+    command:
+      - ^git(\s+-C\s+\S+|\s+-c\s+\S+)*\s+push\b(\s+\S+)*\s+(\S+:)?(refs/heads/)?(main|master)(\s|$)
+
+  # ===================================================================================
+  # Destructive operations: ask first.
+  # ===================================================================================
+
+  - id: rm-recursive-outside-scratch
+    decision: ASK
+    description: Recursive delete outside temp or scratch folders needs approval
+    tags: [destructive]
+    tool: terminal
+    rm_recursive_outside:
+      - /tmp/*
+      - /var/tmp/*
+      - "*/scratchpad/*"
+      - "$TMPDIR/*"
+      - "${TMPDIR}/*"
+      - "*/node_modules"
+      - node_modules
+      - "*/__pycache__"
+      - __pycache__
+      - "*/.pytest_cache"
+      - .pytest_cache
+
+  - id: docker-destructive
+    decision: ASK
+    description: Removing, killing or stopping Docker containers, images or volumes needs approval
+    tags: [destructive, docker]
+    tool: terminal
+    command:
+      - ^docker\s+((container|image|volume|network)\s+)?(rm|rmi|kill|stop)\b
+      - ^docker\s+(system|volume|image|container|network|builder)\s+prune\b
+      - ^docker(-compose|\s+compose)\b.{0,2000}?\s(down|rm|kill|stop)\b
+
+  - id: service-stop-restart
+    decision: ASK
+    description: Stopping or restarting Hermes or OmniRoute services interrupts running chats and needs approval
+    tags: [destructive, services]
+    tool: terminal
+    command:
+      - ^systemctl(\s+-\S+)*\s+(stop|restart|kill|disable|mask|reload-or-restart|try-restart)\b.{0,2000}?(hermes|omniroute)
+      - ^(pkill|killall)\b.{0,2000}?(hermes|omniroute)
+      - ^service\s+\S{0,500}(hermes|omniroute)\S{0,500}\s+(stop|restart)\b
+
+  # ===================================================================================
+  # Lovable: deploying publishes to production. Helix (helix-human-spark) must never go live.
+  # ===================================================================================
+
+  - id: lovable-deploy-helix
+    decision: BLOCK
+    description: Helix (helix-human-spark) may never be deployed to production, preview only
+    tags: [deploy, lovable]
+    mcp:
+      server: lovable
+      tool: deploy_project
+    args_text:
+      - 90a96aee-8bc6-49c9-8c8c-479df5a161db
+
+  - id: lovable-deploy
+    decision: ASK
+    description: Deploying a Lovable project publishes it live and needs approval
+    tags: [deploy, lovable]
+    mcp:
+      server: lovable
+      tool: deploy_project
+
+  # ===================================================================================
+  # Money: no purchases, payments, payouts or refunds by agents.
+  # ===================================================================================
+
+  - id: payments-mcp
+    decision: BLOCK
+    description: Payments, payouts, transfers, refunds and purchases are never done by an agent
+    tags: [money]
+    mcp:
+      server: stripe|bunq|mollie|paypal|adyen|wise|revolut|snelstart
+      tool: (?!(list|get|retrieve|search|read|fetch|find|describe)_).{0,120}(create_?payment|payment_?intent|charge|payout|transfer|refund|checkout|invoice_?(send|pay|finalize)|purchase|subscription_create|create_subscription).{0,120}
+
+  - id: payments-cli
+    decision: BLOCK
+    description: Payments, payouts, transfers and refunds are never done by an agent
+    tags: [money]
+    tool: terminal
+    command:
+      - ^stripe\s+(charges|payment_intents|payouts|transfers|refunds|invoices|subscriptions|checkout\s+sessions)\s+(create|confirm|capture|pay|finalize|send)\b
+      - ^stripe\s+(post|delete)\s+/?v1/(charges|payment_intents|payouts|transfers|refunds|invoices|subscriptions)
+      - ^curl\b(?=.{0,2000}?api\.stripe\.com/v1/(charges|payment_intents|payouts|transfers|refunds|invoices/\S+/pay))(?=.{0,2000}?(\s-d\s|\s--data|\s-X\s*POST|\s--request\s+POST|\s-F\s))
+      - ^curl\b(?=.{0,2000}?api\.bunq\.com/v1/\S{0,500}(payment|draft-payment|payment-batch|request-inquiry|bunqme-tab|schedule-payment))(?=.{0,2000}?(\s-d\s|\s--data|\s-X\s*POST|\s--request\s+POST))
+
+  - id: composio-payments
+    decision: BLOCK
+    description: Payments through Composio actions are never done by an agent
+    tags: [money]
+    tool: mcp_*composio*
+    args_text:
+      - STRIPE_CREATE_(CHARGE|PAYMENT|PAYOUT|TRANSFER|REFUND|INVOICE)
+
+  - id: marketplace-purchase
+    decision: BLOCK
+    description: Authorizing Marktplaats purchases is never done by an agent
+    tags: [money, marketplace]
+    mcp:
+      server: pareltje
+      tool: authorize_purchase_wish|confirm_proposal
+
+# Per profile (bot) settings. Profile rules run before the global rules.
+#   mode: enforce                     switch one bot to enforce while the rest observes
+#   overrides: {rule-id: AUTO}        change the decision of a global rule for this bot
+#   disable: [rule-id]                switch a global rule off for this bot
+#   rules: [...]                      extra rules for this bot only
+profiles: {}
+#  synthwave-cmo:
+#    overrides:
+#      mailchimp-schedule: ASK
+#  synthwave-frontend-dev:
+#    overrides:
+#      git-push-main: AUTO
