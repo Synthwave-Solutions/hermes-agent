@@ -3333,13 +3333,31 @@ _TRAILING_CONTINUE_INTENT_RE = re.compile(
 # Content longer than this is a substantive reply, not a dangling ack.
 _TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
 
+# Dutch immediate-action tails from the HCA shared-session incident. Match only
+# concrete execution verbs, never modal offers ("ik kan") or completed work.
+_DUTCH_ACTION_TAIL_RE = re.compile(
+    r"(?:^|[.!:\n]\s*|,\s*)"
+    r"(?:ik (?:controleer|haal|maak|pak|open|test|voer|doe)\b"
+    r"|ik ga nu\b"
+    r"|(?:nu|eerst|ondertussen|tegelijk|daarna) "
+    r"(?:controleer|haal|maak|pak|open|test|voer|doe) ik\b)"
+    r"[^.!?\n]{1,160}[.:\u2026]?\s*$", re.IGNORECASE,
+)
+_DUTCH_ACTION_DEFERRED_RE = re.compile(
+    r"\b(?:morgen|later|straks|volgende|zodra|nadat|als|mits|niet|"
+    r"toestemming|bevestiging|wacht)\b", re.IGNORECASE,
+)
+
 
 def trailing_continue_intent(text: str) -> bool:
     """Whether ``text`` is a short reply ENDING on an announced next action (stall-guard re-prompt trigger)."""
     t = (text or "").strip()
     if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
         return False
-    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
+    if _TRAILING_CONTINUE_INTENT_RE.search(t[-160:]):
+        return True
+    dutch = _DUTCH_ACTION_TAIL_RE.search(t)
+    return bool(dutch and not _DUTCH_ACTION_DEFERRED_RE.search(dutch.group()))
 
 
 # Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered

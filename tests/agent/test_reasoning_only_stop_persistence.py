@@ -139,8 +139,8 @@ def test_planning_tail_reasoning_only_stop_with_tools_runs_continuation_not_comp
 
 
 def test_planning_tail_stall_is_bounded_by_the_continuation_cap(loop_agent):
-    """A model that never acts is nudged at most twice; the third planning-only stop is promoted
-    so the turn still ends instead of looping."""
+    """A model that never acts is nudged at most twice; the third planning-only stop
+    fails explicitly instead of looping or reporting success."""
     from tests.agent.test_run_agent import _mock_response
 
     loop_agent.valid_tool_names = {"terminal"}
@@ -155,7 +155,8 @@ def test_planning_tail_stall_is_bounded_by_the_continuation_cap(loop_agent):
     ])
 
     assert result["api_calls"] == 3
-    assert result["final_response"] == tail
+    assert result["failure_reason"] == "invalid_response"
+    assert result["final_response"] != tail
 
 
 def test_genuine_reasoning_only_answer_with_tools_still_promotes_on_first_call(loop_agent):

@@ -227,6 +227,7 @@ def finish_text_response(
         agent._emit_interim_assistant_message(interim_msg)
         append_message(messages, {
             "role": "user",
+            "_action_stall_retry": _continuation_kind == "stall",
             "content": (
                 _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
                 else _CODEX_ACK_CONTINUATION_NUDGE
@@ -237,6 +238,31 @@ def finish_text_response(
         # summarization if the continuation exhausts budget.
         final_response = None
         return _verdict("continue")
+
+    if (
+        bool(getattr(agent, "_stall_guards", True))
+        and agent.valid_tool_names
+        and codex_ack_continuations >= 2
+        and (
+            trailing_continue_intent(_stall_text)
+            or bool(_promoted)
+        )
+    ):
+        # Never mark repeated action narration or an invisible reasoning-only
+        # reply as successful after exhausting the bounded recovery attempts.
+        error = "The model did not execute the announced action after two recovery attempts."
+        user_response = (
+            "The agent could not complete the next action: the model kept returning "
+            "text instead of a tool call. This turn stopped without a verified result. "
+            "Earlier actions may already have run; check their results before retrying."
+        )
+        logger.warning("Action-stall recovery exhausted (model=%s)", agent.model)
+        agent._cleanup_task_resources(effective_task_id)
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure(
+            partial_result(messages, api_call_count, user_response, error),
+            "invalid_response", True,
+        ))
 
     codex_ack_continuations = 0
 
