@@ -299,6 +299,12 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
                 result = await list_method(cursor=cursor)
         if cache_meta_out is not None and not items:
             for key, snake, camel in (("ttl_ms", "ttl_ms", "ttlMs"), ("cache_scope", "cache_scope", "cacheScope")):
+                # SDK 2 supplies ttl_ms=0 even for legacy responses that omit
+                # cache hints. Only wire-provided fields may override the
+                # existing no-hint cache behavior; explicit zero still expires.
+                fields_set = getattr(result, "model_fields_set", None)
+                if isinstance(fields_set, (set, frozenset)) and not ({snake, camel} & fields_set):
+                    continue
                 hint = mcp_field(result, snake, camel)
                 if hint is not None:
                     cache_meta_out[key] = hint

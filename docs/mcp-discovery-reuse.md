@@ -10,3 +10,14 @@ The existing `lazy` opt-in, schema TTL, first-use authentication and tool govern
 Validation uses the real temporary on-disk schema store, a real held discovery file lock, synthetic local registry state and the existing two-process cold-discovery test. Before the change, four credential-invalidation cases and the live-registry lock test failed; afterward all 12 new cases and 34 existing cache, TTL, lazy-registration and cross-process cases pass.
 
 Production evidence preceding this change showed 11.23 seconds of MCP discovery after a restart but 50 ms in a new chat without a restart. Therefore this patch does not claim to remove the observed cold handshake cost or improve the already-fast warm measurement. It removes unnecessary lock contention and corrects cache invalidation. Fresh production verification is separate.
+
+## SDK default versus server directive
+
+For Pydantic list results, cache metadata now comes only from fields explicitly
+present in `model_fields_set` (either wire alias or Python field name). MCP SDK 2
+injects `ttl_ms=0` and `cache_scope=private` when decoding an older response without
+cache directives. Persisting those defaults made every legacy manifest immediately
+expire, defeating the existing opt-in lazy startup. A server-supplied zero still
+expires immediately; positive TTL, credential fingerprints, private per-home stores
+and first-use connection/authorization remain unchanged. Existing zero-TTL entries
+must be refreshed from their servers; they are never relabeled as safe to cache.
