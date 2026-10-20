@@ -55,6 +55,43 @@ def _preview_name(name: str) -> str:
     return name[:80] + "..." if len(name) > 80 else name
 
 
+def _wrap_direct_deferred_call(agent: Any, tc: Any, valid_names: Any) -> bool:
+    """SYNTHWAVE fork: a direct call to a deferred tool this session may reach (the model
+    calls it by name after ``tool_describe``) is rewritten to the ``tool_call`` bridge instead
+    of being rejected as unknown; the bridge still applies its scope and schema checks.
+    Returns True when ``tc`` was rewritten. Fail-closed: anything unexpected leaves it as is."""
+    try:
+        from tools.tool_search_catalog import TOOL_CALL_NAME
+        name = tc.function.name
+        if not name or name in valid_names or TOOL_CALL_NAME not in valid_names:
+            return False
+        from agent.tool_executor import _tool_search_scoped_names
+        if name not in _tool_search_scoped_names(agent):
+            return False
+        raw = tc.function.arguments
+        if isinstance(raw, dict):
+            args = raw
+        elif isinstance(raw, str) and raw.strip():
+            args = json.loads(raw)
+        else:
+            args = {}
+        if not isinstance(args, dict):
+            return False
+        tc.function.name = TOOL_CALL_NAME
+        tc.function.arguments = json.dumps({"calls": [{"name": name, "arguments": args}]}, ensure_ascii=False)
+        return True
+    except Exception:
+        logger.debug("direct deferred call not rewritten", exc_info=True)
+        return False
+
+
+def _wrapped_name(tc: Any) -> str:
+    try:
+        return json.loads(tc.function.arguments)["calls"][0]["name"]
+    except Exception:
+        return tc.function.name
+
+
 def _append_tool_error_results(messages, tool_calls, content_for) -> None:
     """One tool-role result per call so every tool_call keeps a matching result."""
     for tc in tool_calls:
@@ -112,6 +149,11 @@ def validate_tool_calls(
     # Repair mismatched tool names before validating (model hallucinations).
     repaired_ids = set()
     for tc in tool_calls:
+        if _wrap_direct_deferred_call(agent, tc, valid_names):
+            agent._vprint(f"{agent.log_prefix}🔧 Routed direct deferred call through tool_call: "
+                          f"'{_preview_name(_wrapped_name(tc))}'", force=True, diagnostic=True)
+            repaired_ids.add(id(tc))
+            continue
         if tc.function.name not in valid_names:
             repaired = agent._repair_tool_call(tc.function.name)
             if repaired:
