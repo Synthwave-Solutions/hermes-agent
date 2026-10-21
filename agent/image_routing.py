@@ -371,7 +371,15 @@ def _lookup_supports_vision(
             logger.debug("image_routing: cached caps lookup failed for %s:%s: %s", provider, model, exc)
             return None
 
+    from agent.model_metadata import is_explicit_remote_router
+
+    remote_router = is_explicit_remote_router(provider, requested_provider)
     for label, probe in _VISION_PROBES:
+        # Match context-length discovery's explicit-router policy: a loopback
+        # router is not an Ollama server. Keep config/catalog capability checks
+        # and the unknown verdict; never infer vision support from this skip.
+        if remote_router and probe is _probe_ollama:
+            continue
         try:
             verdict = probe(provider, model, cfg)
         except Exception as exc:  # pragma: no cover - defensive
