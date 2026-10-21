@@ -1,0 +1,144 @@
+--- a/src/lib/plugins/loader.ts
++++ b/src/lib/plugins/loader.ts
+@@ -218,6 +218,18 @@
+     }
+   > = new Map();
+   let callCounter = 0;
++  let unavailable: Error | null = null;
++
++  // A disconnected/terminated child cannot answer another IPC call. Settle all
++  // waiters now rather than retaining a full hook timeout on every request.
++  const failPending = (error: Error) => {
++    unavailable ??= error;
++    for (const pending of pendingCalls.values()) {
++      clearTimeout(pending.timer);
++      pending.reject(error);
++    }
++    pendingCalls.clear();
++  };
+ 
+   child.on(
+     "message",
+@@ -241,15 +253,16 @@
+ 
+   child.on("error", (err) => {
+     log.error("loader.process_error", { name: manifest.name, error: err.message });
+-  });
+-
+-  child.on("exit", (code) => {
+-    log.info("loader.process_exit", { name: manifest.name, code });
+-    for (const [, pending] of pendingCalls) {
+-      clearTimeout(pending.timer);
+-      pending.reject(new Error(`Plugin process exited with code ${code}`));
+-    }
+-    pendingCalls.clear();
++    failPending(err);
++  });
++
++  child.on("disconnect", () => {
++    failPending(new Error("Plugin IPC channel disconnected"));
++  });
++
++  child.on("exit", (code, signal) => {
++    log.info("loader.process_exit", { name: manifest.name, code, signal });
++    failPending(new Error(`Plugin process exited (${signal ?? code})`));
+     removeHostScript(hostScriptPath);
+   });
+ 
+@@ -260,6 +273,10 @@
+     timeout = DEFAULT_HOOK_TIMEOUT
+   ): Promise<unknown> => {
+     return new Promise((resolve, reject) => {
++      if (unavailable || !child.connected || child.exitCode !== null || child.signalCode !== null) {
++        reject(unavailable ?? new Error("Plugin process is unavailable"));
++        return;
++      }
+       const id = String(++callCounter);
+       const timer = setTimeout(() => {
+         pendingCalls.delete(id);
+@@ -275,7 +292,16 @@
+       }, timeout);
+ 
+       pendingCalls.set(id, { resolve, reject, timer });
+-      child.send({ type: "call", id, hook, payload });
++      try {
++        child.send({ type: "call", id, hook, payload }, (error) => {
++          if (error) failPending(error);
++        });
++      } catch (error: unknown) {
++        // Serialization can fail synchronously while the child remains healthy.
++        clearTimeout(timer);
++        pendingCalls.delete(id);
++        reject(error instanceof Error ? error : new Error(String(error)));
++      }
+     });
+   };
+ 
+@@ -364,6 +390,11 @@
+   });
+ 
+   const cleanup = () => {
++    failPending(new Error("Plugin unloaded"));
++    if (child.exitCode !== null || child.signalCode !== null) {
++      removeHostScript(hostScriptPath);
++      return;
++    }
+     child.kill("SIGTERM");
+     // Escalate to SIGKILL after grace period
+     const killTimer = setTimeout(() => {
+--- /dev/null
++++ b/tests/unit/plugins-loader-lifecycle.test.ts
+@@ -0,0 +1,53 @@
++import test, {type TestContext} from 'node:test';
++import assert from 'node:assert/strict';
++import {mkdtemp,writeFile,rm} from 'node:fs/promises';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {loadPlugin} from '../../src/lib/plugins/loader.ts';
++import type {PluginManifestWithDefaults} from '../../src/lib/plugins/manifest.ts';
++import type {PluginContext} from '../../src/lib/plugins/index.ts';
++const manifest:PluginManifestWithDefaults={name:'lifecycle-test',version:'1.0.0',description:'Lifecycle regression',license:'MIT',main:'plugin.mjs',source:'local',tags:[],requires:{permissions:[]},hooks:{onRequest:true,onResponse:false,onError:false,onInstall:false,onActivate:false,onDeactivate:false,onUninstall:false,onStreamComplete:false},skills:[],enabledByDefault:false,configSchema:{}};
++const ctx:PluginContext={requestId:'probe',body:{},model:'test',provider:'test',metadata:{}};
++async function fixture(t:TestContext,source:string){
++ const dir=await mkdtemp(join(tmpdir(),'plugin-lifecycle-'));
++ const file=join(dir,'plugin.mjs'); await writeFile(file,source);
++ const loaded=await loadPlugin(file,manifest);
++ t.after(async()=>{loaded.cleanup();await rm(dir,{recursive:true,force:true});});
++ return loaded.plugin;
++}
++test('exit rejects future hook calls without waiting the hook timeout',async t=>{
++ const plugin=await fixture(t,'export function onRequest(){process.exit(0)}');
++ await plugin.onRequest!(ctx);
++ const start=performance.now();await plugin.onRequest!(ctx);
++ assert.ok(performance.now()-start<500,'dead process retained hook deadline');
++});
++test('disconnect rejects the pending call while child stays alive',async t=>{
++ const plugin=await fixture(t,'export function onRequest(){process.disconnect();setInterval(()=>{},1000);return new Promise(()=>{})}');
++ const start=performance.now();await plugin.onRequest!(ctx);
++ assert.ok(performance.now()-start<1000,'disconnected child retained hook deadline');
++});
++test('healthy child still serves concurrent hooks',async t=>{
++ const plugin=await fixture(t,'export async function onRequest(ctx){return {body:ctx.body}}');
++ const results=await Promise.all([plugin.onRequest!({...ctx,body:{value:1}}),plugin.onRequest!({...ctx,body:{value:2}})]);
++ assert.deepEqual(results,[{body:{value:1}},{body:{value:2}}]);
++});
++test('serialization failure clears its timer without poisoning a healthy worker',async t=>{
++ const plugin=await fixture(t,'export async function onRequest(ctx){return {body:ctx.body}}');
++ await plugin.onRequest!(ctx);
++ t.mock.timers.enable({apis:['setTimeout']});
++ await plugin.onRequest!({...ctx,body:{notJson:1n}});
++ t.mock.timers.tick(11000);
++ assert.deepEqual(await plugin.onRequest!({...ctx,body:{ok:true}}),{body:{ok:true}});
++ t.mock.timers.reset();
++});
++test('cleanup settles an in-flight hook immediately',async t=>{
++ const dir=await mkdtemp(join(tmpdir(),'plugin-cleanup-'));
++ const entry=join(dir,'plugin.mjs');
++ await writeFile(entry,'export async function onRequest(ctx){if(ctx.body.hang)return new Promise(()=>{});return {body:ctx.body}}');
++ const loaded=await loadPlugin(entry,manifest);
++ t.after(async()=>{loaded.cleanup();await rm(dir,{recursive:true,force:true});});
++ await loaded.plugin.onRequest!(ctx);
++ const pending=loaded.plugin.onRequest!({...ctx,body:{hang:true}});
++ const start=performance.now();loaded.cleanup();await pending;
++ assert.ok(performance.now()-start<500);
++});
