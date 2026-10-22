@@ -411,3 +411,12 @@ hermes cron remove <job_id>         # Delete a job
 - [Cron Feature Guide](../user-guide/features/cron.md)
 - [Gateway Internals](./gateway-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
+
+### Scout tool inheritance
+
+Jobs marked `managed_by: scout` use the owning profile's current `cli` tool
+selection, matching bot conversations, rather than their historical narrow
+per-job allowlist. Resolution happens for each run and fails closed on invalid
+configuration. Enabled MCP servers are included through the existing platform
+resolver. Standard cron-disabled toolsets and owner governance still apply.
+Other jobs retain the existing per-job/cron-platform precedence.

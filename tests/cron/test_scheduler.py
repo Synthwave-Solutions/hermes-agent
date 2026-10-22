@@ -141,6 +141,20 @@ class TestPerJobToolsetMcpMerge:
             {"enabled_toolsets": ["nonexistent_ts"]}, {"platform_toolsets": "oops", "mcp_servers": {}}
         ) == ["nonexistent_ts"]
 
+def test_scout_uses_current_bot_tools_not_legacy_allowlist():
+    job = {"managed_by": "scout", "enabled_toolsets": ["kanban", "no_mcp"]}
+    cfg = {"platform_toolsets": {"cli": ["terminal", "skills", "web"]},
+           "mcp_servers": {"notion": {"enabled": True}, "off": {"enabled": False}}}
+    from hermes_cli.tools_config import _get_platform_tools
+    assert _resolve_cron_enabled_toolsets(job, cfg) == sorted(_get_platform_tools(cfg, "cli"))
+    assert "terminal" in _resolve_cron_enabled_toolsets(job, cfg)
+    assert "notion" in _resolve_cron_enabled_toolsets(job, cfg)
+    cfg["platform_toolsets"]["cli"] = ["web"]
+    assert "terminal" not in _resolve_cron_enabled_toolsets(job, cfg)
+    with pytest.raises(RuntimeError, match="Scout bot toolset resolution failed"):
+        _resolve_cron_enabled_toolsets(job, {"platform_toolsets": "broken"})
+
+
 class TestResolveOrigin:
 
     @pytest.mark.parametrize(
