@@ -502,6 +502,15 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     the full default set (#111380). The raise reaches ``run_job``'s failure path, which records the
     error on the job and opens an incident, so the operator sees it instead of a widened run.
     """
+    if job.get("managed_by") == "scout":
+        # Scout is the bot working proactively, with the same configured surface
+        # as its CLI/WebUI, resolved fresh in this run's profile scope. Ordinary
+        # cron exclusions and owner governance still apply downstream.
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+            return sorted(_get_platform_tools(cfg or {}, "cli"))
+        except Exception as exc:
+            raise RuntimeError("Scout bot toolset resolution failed; run refused") from exc
     per_job = job.get("enabled_toolsets")
     if per_job:
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
