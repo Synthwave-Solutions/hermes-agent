@@ -321,3 +321,15 @@ def test_runner_worktree_mode_leaves_live_tree_alone(tmp_path):
     assert "a = 2" in git("show", "opencode/t1:a.py")
     argv = runner.bwrap_argv({"home": str(tmp_path), "deny_patterns": []}, tmp_path / "run", workroot, info)
     assert str(repo / ".git" / "objects") in argv and str(repo) not in [argv[i + 1] for i, x in enumerate(argv) if x == "--bind" and argv[i + 1] == str(repo)]
+
+
+def test_directory_denies_do_not_mask_unrelated_project_files(tmp_path):
+    paths = ['app/collector.py', 'requirements.txt', '.ssh/id_test',
+             'nested/.ssh/id_test', '.config/bunq/config.json', 'nested/private-sa.json']
+    for rel in paths:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('synthetic fixture')
+    denied = set(runner._denied_files_under(
+        tmp_path, ['**/.ssh/**', '**/.config/bunq/**', '**/*-sa.json']))
+    assert denied == {tmp_path / rel for rel in paths[2:]}

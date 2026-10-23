@@ -239,8 +239,9 @@ def _denied_files_under(root: Path, patterns, limit: int = 20000):
             if checked > limit:
                 return
             full = os.path.join(dirpath, name)
-            if any(fnmatch.fnmatch(full, pat) or fnmatch.fnmatch(name, pat.rsplit("/", 1)[-1])
-                   and pat.startswith("**/") for pat in patterns):
+            # Match complete paths: reducing **/.ssh/** to its final **
+            # masks every ordinary source file in the coding workspace.
+            if any(fnmatch.fnmatch(full, pat) for pat in patterns):
                 yield Path(full)
 
 
