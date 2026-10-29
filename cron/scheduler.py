@@ -3004,9 +3004,10 @@ def _governed_as_job_owner(
     )
     from hermes_cli.dashboard_governance.models import GovernanceSubject
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
-    from cron.jobs import load_cron_governance_policy
+    from cron.jobs import load_cron_governance_policy, resolve_cron_policy_path
 
     try:
+        policy_path, _policy_source = resolve_cron_policy_path()
         policy = load_cron_governance_policy()
         access = resolve_effective_access(policy, GovernanceSubject(email=owner))
     except Exception as exc:
@@ -3033,6 +3034,9 @@ def _governed_as_job_owner(
             subject=access.subject,
             access=access,
             session_id=str(job.get("id") or ""),
+            # Tool review reloads this policy before execution. Without its
+            # source, every managed owner's action fails closed in cron.
+            approval_policy_path=str(policy_path),
         )
     )
     try:

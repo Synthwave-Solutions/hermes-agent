@@ -2197,3 +2197,47 @@ def test_the_migration_leaves_a_job_whose_creator_has_no_policy_entry(capsys):
 
     assert script.main(["--apply"]) == 1
     assert _owners(_home()) == {"tasks2": ""}
+
+
+def test_scheduled_managed_owner_refreshes_policy_and_honors_revocation():
+    from hermes_cli.dashboard_governance.context import current_governance_context
+    from hermes_cli.dashboard_governance.action_approval import authorize_tool_action
+
+    owner = 'scheduled@example.test'
+    path = _home() / 'dashboard-governance.yaml'
+    policy = {
+        'version': 1, 'mode': 'enforce', 'default_effect': 'deny',
+        'users': {owner: {
+            'approval': {'mode': 'automatic', 'prompt': 'Allow permitted reads.'},
+            'grants': {'profiles': ['default'], 'tools': {'builtins': ['read_file']},
+                       'files': {'allow_globs': ['/workspace/**']}}
+        }}
+    }
+    path.write_text(yaml.safe_dump(policy))
+    with s._governed_as_job_owner({'id': 'scheduled-read', 'owner_email': owner}):
+        ctx = current_governance_context()
+        args = {'path': '/workspace/report.txt'}
+        assert authorize_tool_action(ctx, 'read_file', args, {}) is None
+        # An allowed scheduled action must not retain stale grants.
+        policy['users'][owner]['deny'] = {'tools': {'builtins': ['read_file']}}
+        path.write_text(yaml.safe_dump(policy))
+        verdict = authorize_tool_action(current_governance_context(), 'read_file', args, {})
+        assert verdict['approved'] is False
+        assert verdict['reason'] != 'governance_review_unavailable'
+    assert current_governance_context() is None
+
+
+def test_cron_review_uses_platform_policy_across_profile_switches():
+    from hermes_cli.dashboard_governance.context import current_governance_context
+    from hermes_cli.dashboard_governance.action_approval import _fresh
+
+    root = _platform()
+    for name in ('a', 'b', 'a'):
+        with _Profile(root, name, own_policy_mode='off'):
+            with s._governed_as_job_owner({'id': 'same-job', 'owner_email': 'alice@example.test'}):
+                fresh, revision = _fresh(current_governance_context())
+                assert fresh.access.mode == 'enforce'
+                assert fresh.subject.email == 'alice@example.test'
+                assert Path(fresh.approval_policy_path) == root / 'dashboard-governance.yaml'
+                assert revision
+        assert current_governance_context() is None
