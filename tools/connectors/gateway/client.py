@@ -105,8 +105,10 @@ def _default_endpoint_resolver() -> Optional[str]:
 
 def _default_header_provider(url: str) -> dict:
     from tools.managed_gateway_auth import managed_gateway_auth_headers
+    from tools.connectors.identity import personal_connector_token
 
-    return managed_gateway_auth_headers(url)
+    bound, token = personal_connector_token()
+    return managed_gateway_auth_headers(url, token_reader=(lambda: token) if bound else None)
 
 
 class ConnectorClient:
@@ -160,6 +162,9 @@ class ConnectorClient:
             connectors=list(connectors), reinitiate=reinitiate, alias=alias, connection_id=connection_id,
             return_to=return_to, op=op, initiator=self._initiator,
         ).model_dump(by_alias=True, exclude_none=True)
+        from tools.connectors.identity import authorize_personal_connection
+
+        authorize_personal_connection(body["connectors"])
         reply = self._post(wire.CONNECTOR_CONNECTIONS_PATH, body, retries=0)
         return self._checked(wire.ConnectorConnectionsResponse, reply, "connector connections").model_dump()
 

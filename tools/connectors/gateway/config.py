@@ -95,6 +95,10 @@ def connectors_available(
         resolved_loader = config_loader or load_config
         if not resolved_loader().enabled:
             return False
+        from tools.connectors.identity import personal_connector_bound
+        if personal_connector_bound():
+            # The credential read belongs to execution, never schema discovery.
+            return True
         if entitlement_check is None:
             from hermes_cli.anon_auth import is_guest_state
             from tools.managed_tool_gateway import _read_nous_provider_state
@@ -113,6 +117,9 @@ def connectors_available(
 def guest_identity_pending() -> bool:
     """No Nous identity or bearer yet, and a guest one may be created (``nous.guest`` is not false
     and no earlier mint was refused for good). No network: this feeds the ``check_fn``."""
+    from tools.connectors.identity import personal_connector_bound
+    if personal_connector_bound():
+        return False
     from hermes_cli.anon_auth import guest_allowed, last_mint_failure
     from tools.managed_tool_gateway import _read_nous_provider_state, peek_nous_access_token
 
@@ -139,6 +146,10 @@ def ensure_guest_identity() -> Optional[str]:
 
     Returns None when an identity exists or was just created, else the failure copy for the model:
     a refusal, a rate limit or an unreachable portal, with the wait when there is one."""
+    from tools.connectors.identity import personal_connector_token
+    bound, token = personal_connector_token()
+    if bound:
+        return None if token else "Connect your personal account in the app's integrations settings."
     if not guest_identity_pending():
         return None
     from hermes_cli.anon_auth import ensure_portal_identity

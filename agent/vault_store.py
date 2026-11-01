@@ -30,7 +30,6 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 from hermes_dir_acl import make_user_dir
 
-from hermes_constants import get_hermes_home
 from utils import atomic_write_bytes
 
 VAULT_KINDS = ("login", "payment", "address")
@@ -195,11 +194,16 @@ class VaultStore:
     """Encrypted, profile-scoped vault under ``<HERMES_HOME>/vault/``."""
 
     def __init__(self, base_dir: Optional[Path] = None):
+        from agent.vault_scope import vault_home
         self._base = Path(base_dir) if base_dir is not None else (
-            Path(get_hermes_home()) / "vault"
+            vault_home() / "vault"
         )
         self._vault_path = self._base / "vault.json.enc"
         self._key_path = self._base / "vault.key"
+        from agent.vault_scope import _safe, personal_vault_bound
+        if personal_vault_bound():
+            for path in (self._vault_path, self._key_path, self._base / ".vault.lock"):
+                _safe(path)
 
     # -- key / crypto ------------------------------------------------------
 
@@ -301,6 +305,32 @@ class VaultStore:
         atomic_write_bytes(self._vault_path, blob, mode=0o600, fsync_dir=True)
 
     # -- public API ----------------------------------------------------------
+
+    def read_source_settings(self) -> dict[str, Any]:
+        """Private manager configuration; never part of the model's item list."""
+        from agent.vault_scope import _safe
+        path = _safe(self._base / "sources.json.enc")
+        if not path.exists():
+            return {}
+        with self._locked():
+            value = json.loads(self._fernet().decrypt(path.read_bytes()))
+        if not isinstance(value, dict):
+            raise VaultError("invalid password manager settings")
+        return value
+
+    def update_source_settings(self, name: str, settings: dict[str, Any]) -> None:
+        """Atomically merge one manager's encrypted settings under the vault lock."""
+        from agent.vault_scope import _safe
+        if name not in {"onepassword", "bitwarden"}:
+            raise VaultError("unknown password manager")
+        path = _safe(self._base / "sources.json.enc")
+        with self._locked():
+            cipher = self._fernet()
+            value = json.loads(cipher.decrypt(path.read_bytes())) if path.exists() else {}
+            # An identical reconnect must still revoke backend instances built
+            # for the previous account connection.
+            value[name] = {**settings, 'revision': uuid.uuid4().hex}
+            atomic_write_bytes(path, cipher.encrypt(json.dumps(value).encode()), mode=0o600, fsync_dir=True)
 
     def add_item(
         self,

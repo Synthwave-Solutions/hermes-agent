@@ -62,6 +62,10 @@ def _default_endpoint_resolver() -> str:
 
 
 def _default_header_provider(_url: str) -> dict[str, str]:
+    from tools.connectors.identity import personal_connector_token
+    bound, personal_token = personal_connector_token()
+    if bound:
+        return {"Authorization": f"Bearer {personal_token}"} if personal_token else {}
     token = read_nous_access_token()
     return {"Authorization": f"Bearer {token}"} if isinstance(token, str) and token.strip() else {}
 

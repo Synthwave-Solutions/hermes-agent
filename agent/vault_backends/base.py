@@ -89,6 +89,10 @@ def run_with_secret_env(argv: Sequence[str], *, env: dict[str, str], secret_env:
 
 
 def _cfg() -> dict:
+    from agent.vault_scope import personal_config
+    personal = personal_config()
+    if personal is not None:
+        return personal
     from hermes_cli.config import load_config_readonly
     cfg = load_config_readonly().get("vault") or {}
     return cfg if isinstance(cfg, dict) else {}

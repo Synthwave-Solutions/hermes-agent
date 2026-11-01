@@ -35,10 +35,15 @@ class OnePasswordLoginBackend(LoginBackend):
     needs_unlock = True
 
     def __init__(self, cfg: Optional[dict] = None):
-        self.cfg = cfg or {}
-        from agent.secret_scope import get_secret
-        env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
-        self._service_token = get_secret(env_name, "") or ""
+        self.cfg = dict(cfg or {})
+        from agent.vault_scope import personal_source_snapshot, personal_vault_bound
+        self._personal_source = personal_source_snapshot(self.cfg)
+        if personal_vault_bound():
+            self._service_token = str(self.cfg.get("service_account_token") or "")
+        else:
+            from agent.secret_scope import get_secret
+            env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
+            self._service_token = get_secret(env_name, "") or ""
         self._item_vaults: dict[str, str] = {}  # item id -> vault id from the latest ``item list``
 
     # ── auth ────────────────────────────────────────────────────────────────
@@ -50,13 +55,16 @@ class OnePasswordLoginBackend(LoginBackend):
         return op
 
     def _env(self, session_token: Optional[str]) -> dict[str, str]:
+        from agent.vault_scope import manager_environment
         from agent.secret_scope import get_secret
-        env = {k: os.environ[k] for k in _OP_ENV_ALLOWLIST if k in os.environ and not k.startswith("OP_CONNECT_")}
+        env = manager_environment()
         # Connect credentials outrank OP_SERVICE_ACCOUNT_TOKEN inside op, so they must come from the
         # profile's own secret scope like the service token does — never from the launch environment.
-        for k in ("OP_CONNECT_HOST", "OP_CONNECT_TOKEN"):
-            if v := get_secret(k, ""):
-                env[k] = v
+        if env is None:
+            env = {k: os.environ[k] for k in _OP_ENV_ALLOWLIST if k in os.environ and not k.startswith("OP_CONNECT_")}
+            for k in ("OP_CONNECT_HOST", "OP_CONNECT_TOKEN"):
+                if v := get_secret(k, ""):
+                    env[k] = v
         env["NO_COLOR"] = "1"
         account = str(self.cfg.get("account") or "")
         if account:
@@ -70,7 +78,22 @@ class OnePasswordLoginBackend(LoginBackend):
         return env
 
     def is_unlocked(self) -> bool:
+        try:
+            self._check_personal_source()
+        except PermissionError:
+            return False
         return bool(self._service_token) or _unlock.is_unlocked(self.name)
+
+    def _check_personal_source(self) -> None:
+        from agent.vault_scope import require_personal_source
+        try:
+            current = require_personal_source(self.name, self._personal_source)
+        except PermissionError:
+            self._service_token = ''
+            self._item_vaults.clear()
+            raise
+        if current is not None:
+            self._service_token = str(current.get('service_account_token') or '')
 
     def unlock(self, master_password: str) -> None:
         """Mint a session token from the master password (consumed on stdin, never argv)."""
@@ -78,7 +101,10 @@ class OnePasswordLoginBackend(LoginBackend):
         cmd = [str(self._op()), "signin", "--raw"]
         if account := str(self.cfg.get("account") or ""):
             cmd += ["--account", account]
-        proc = run_with_stdin_secret(cmd, env=self._env(None), secret=master_password, timeout=_TIMEOUT, label="op")
+        env = self._env(None)
+        self._check_personal_source()
+        proc = run_with_stdin_secret(cmd, env=env, secret=master_password, timeout=_TIMEOUT, label="op")
+        self._check_personal_source()
         token = (proc.stdout or "").strip()
         if proc.returncode != 0 or not token:
             raise RuntimeError(f"1Password unlock failed: {_scrub(proc.stderr or '')[:200] or 'no session token'}")
@@ -86,11 +112,15 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError("1Password was locked while unlocking; try again")
 
     def _run(self, *args: str) -> str:
+        self._check_personal_source()
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
-        proc = run_cli([str(self._op()), *args], env=self._env(token), timeout=_TIMEOUT, label="op",
+        argv, env = [str(self._op()), *args], self._env(token)
+        self._check_personal_source()
+        proc = run_cli(argv, env=env, timeout=_TIMEOUT, label="op",
                        timeout_message="op timed out", stdin=subprocess.DEVNULL)
+        self._check_personal_source()
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
             # A service account never holds a session, so an auth failure there is not a lock to undo:
