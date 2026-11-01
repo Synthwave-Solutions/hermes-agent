@@ -378,10 +378,17 @@ canonical_method("clarify.lock", params=ClarifyLockParams, result=ClarifyLockRes
 # ── cron / kanban / a2a producers ─────────────────────────────────────────────────────────────
 
 
+class CronRunContext(Params):
+    trigger: Literal["schedule", "manual", "api"]
+    trigger_actor: str
+    run_prompt: str
+
+
 class CronRunParams(Params):
     job_id: str
     request_id: str
     extra_prompt: str | None
+    run_context: CronRunContext | None = None
 
 
 class CronSubmitResult(Result):
