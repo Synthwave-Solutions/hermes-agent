@@ -33,5 +33,9 @@ def check_local_input(authority, ref, row, *, source=None):
         source = source or authority.sessions[ref.session_id].source
         if row['principal_id'] != source.user_id:
             raise RuntimeStoreError('permission_denied')
+    if 'run_context' in payload:
+        from gateway.session_cron import check_context_input
+        check_context_input(authority, ref, row)
+        allowed.add('run_context')
     if not {'text'} <= set(payload) <= allowed:
         raise RuntimeStoreError('permission_denied')

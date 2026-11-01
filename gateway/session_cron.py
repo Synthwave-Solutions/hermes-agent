@@ -85,6 +85,23 @@ def _payload(extra, context=None):
     return payload
 
 
+def check_context_input(authority, ref, row):
+    """Only the cron producer's exact frozen fire may carry context at queue claim."""
+    from gateway.session_policy import policy_for_source
+    source = authority.sessions[ref.session_id].source
+    policy = policy_for_source(authority.runner, source)
+    if policy is None or policy.source != 'cron' or row['principal_id'] != CRON_PRINCIPAL_ID:
+        raise RuntimeStoreError('permission_denied')
+    try:
+        data = json.loads(policy.request_json)
+        expected = _payload(data['extra_prompt'], data['cron_job'].get('_cron_run_context'))
+        matches = row['request_id'] == data['request_id'] and row['payload'] == expected
+    except (ValueError, KeyError, TypeError, AttributeError):
+        matches = False
+    if not matches:
+        raise RuntimeStoreError('permission_denied')
+
+
 def _create(authority, actor, params):
     from cron.jobs import get_job
     from gateway.session_local_recovery import local_identity, restore_local_session

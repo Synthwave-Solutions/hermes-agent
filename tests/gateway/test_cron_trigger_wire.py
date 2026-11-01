@@ -22,6 +22,7 @@ def owner(tmp_path, monkeypatch):
         job = jobs.create_job(prompt='prepare', schedule='every 1h', deliver='local', model='fixture')
         runner = SimpleNamespace(_draining=False, adapters={},
                                  session_store=SessionStore(tmp_path / 'sessions', GatewayConfig()))
+        runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
         authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='test', db=db,
                                      epoch=begin_runtime_epoch(db, instance_id='test'))
         runner.session_authority = authority
@@ -53,6 +54,76 @@ async def test_dispatch_admits_and_recovers_exact_trigger_context(owner, trigger
                 for method in ('cron.submit', 'cron.recover'):
                     answer = await connection.dispatch({'id': 3, 'method': method, 'params': changed})
                     assert answer['error']['data']['reason'] == 'admission_conflict'
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tamper', ['principal', 'request', 'context', 'extra_field', 'non_cron_policy'])
+async def test_context_claim_accepts_only_the_exact_stored_cron_fire(owner, tamper):
+    from copy import deepcopy
+    from dataclasses import replace
+    from gateway.session_contract import SessionRef
+    from gateway.session_operator import check_local_input, is_viewer_input
+    from hermes_state_runtime import RuntimeStoreError
+    connection, job = owner
+    context = normalize_context('manual', 'owner@example.com')
+    params = {'job_id': job['id'], 'request_id': 'fire', 'extra_prompt': None, 'run_context': context}
+    try:
+        response = await connection.dispatch({'id': 1, 'method': 'cron.submit', 'params': params})
+        receipt, authority = response['result'], connection.authority
+        ref = SessionRef(authority.profile_id, receipt['session_id'])
+        row = get_session_admission(authority.db, admission_id=receipt['admission_id'])
+        check_local_input(authority, ref, row)
+        assert not is_viewer_input(row)
+        row = deepcopy(row)
+        adapter = authority.runner._adapter_for_source(authority.sessions[ref.session_id].source)
+        mutations = {
+            'principal': (row, 'principal_id', 'other'),
+            'request': (row, 'request_id', row['request_id'] + '-other'),
+            'context': (row['payload']['run_context'], 'trigger_actor', 'other@example.com'),
+            'extra_field': (row['payload'], 'env', {'HOME': '/other'}),
+            'non_cron_policy': (adapter.policies, ref.session_id,
+                                replace(adapter.policies[ref.session_id], source='cli')),
+        }
+        target, key, value = mutations[tamper]
+        target[key] = value
+        with pytest.raises(RuntimeStoreError, match='permission_denied'):
+            check_local_input(authority, ref, row)
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('trigger', [None, 'manual', 'api'])
+async def test_dispatch_drains_cron_to_terminal_with_the_frozen_context(owner, monkeypatch, trigger):
+    from cron import scheduler
+    from gateway.session_contract import SessionRef
+    connection, job = owner
+    context = normalize_context(trigger or 'schedule', 'owner@example.com', 'prepare now')
+    seen = []
+
+    def run_job(frozen, **kwargs):
+        seen.append(script_environment(frozen))
+        return True, 'Prepared report', 'Prepared report', None
+
+    monkeypatch.setattr(scheduler, 'run_job', run_job)  # the external model boundary only
+    params = {'job_id': job['id'], 'request_id': 'fire', 'extra_prompt': context['run_prompt'] or None}
+    if trigger:
+        params['run_context'] = context
+    try:
+        response = await connection.dispatch({'id': 1, 'method': 'cron.submit', 'params': params})
+        assert 'result' in response, response
+        receipt = response['result']
+        authority = connection.authority
+        await authority._drain(SessionRef(authority.profile_id, receipt['session_id']))
+        state = await connection.dispatch({'id': 2, 'method': 'cron.status', 'params': receipt})
+        assert state['result']['status'] == 'terminal', state
+        assert state['result']['result'] == [True, 'Prepared report', 'Prepared report', None]
+        assert len(seen) == 1
+        assert seen[0]['HERMES_CRON_TRIGGER'] == context['trigger']
+        assert seen[0]['HERMES_CRON_TRIGGER_ACTOR'] == context['trigger_actor']
+        assert seen[0]['HERMES_CRON_RUN_PROMPT'] == context['run_prompt']
     finally:
         await connection.close()
 
