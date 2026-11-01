@@ -55,7 +55,7 @@ def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch, ru
             for operation in ('submit', 'recover'):
                 with pytest.raises(RuntimeStoreError, match='admission_conflict'):
                     await session_cron.operation(authority, operation, changed, actor)
-            for invalid in (None, {'trigger': 'unknown'}, dict(run_context, env={'HOME': '/other'})):
+            for invalid in ([], {'trigger': 'unknown'}, dict(run_context, env={'HOME': '/other'})):
                 with pytest.raises(RuntimeStoreError, match='invalid_params'):
                     await session_cron.operation(authority, 'submit',
                         dict(params, request_id='new', run_context=invalid), actor)

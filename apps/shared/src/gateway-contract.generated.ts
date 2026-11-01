@@ -4818,6 +4818,12 @@ export interface CronRunParams {
   job_id: string
   request_id: string
   extra_prompt: string | null
+  run_context?: CronRunContext | null
+}
+export interface CronRunContext {
+  trigger: 'schedule' | 'manual' | 'api'
+  trigger_actor: string
+  run_prompt: string
 }
 export interface CronSubmitResult {
   session_id: string

@@ -63,8 +63,8 @@ def _actor(authority, actor):
 
 def _request_context(params):
     """Validated per-fire metadata; never a job, principal or permission override."""
-    if 'run_context' not in params:
-        return None  # legacy clients and ordinary scheduled fires retain their wire shape
+    if params.get('run_context') is None:
+        return None  # null and omitted context retain the legacy payload shape
     from cron.run_context import normalize_context
     context = params['run_context']
     if not isinstance(context, dict) or set(context) != {'trigger', 'trigger_actor', 'run_prompt'}:

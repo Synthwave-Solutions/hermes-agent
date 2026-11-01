@@ -16476,6 +16476,35 @@
         "title": "CronRemovedJob",
         "type": "object"
       },
+      "CronRunContext": {
+        "additionalProperties": false,
+        "properties": {
+          "trigger": {
+            "enum": [
+              "schedule",
+              "manual",
+              "api"
+            ],
+            "title": "Trigger",
+            "type": "string"
+          },
+          "trigger_actor": {
+            "title": "Trigger Actor",
+            "type": "string"
+          },
+          "run_prompt": {
+            "title": "Run Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trigger",
+          "trigger_actor",
+          "run_prompt"
+        ],
+        "title": "CronRunContext",
+        "type": "object"
+      },
       "CronRunParams": {
         "additionalProperties": false,
         "properties": {
@@ -16497,6 +16526,17 @@
               }
             ],
             "title": "Extra Prompt"
+          },
+          "run_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CronRunContext"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
