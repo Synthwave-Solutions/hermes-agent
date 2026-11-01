@@ -9,6 +9,10 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 
 from __future__ import annotations
 
+import agent.agent_init_governance as _agent_init_governance
+
+import agent.agent_init_provider_routes as _agent_init_provider_routes
+
 import contextvars
 import functools
 import json
@@ -90,89 +94,12 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "", say=None) -> 
         say(message)
 
 
-def _provider_default_routes(provider: str) -> set[str]:
-    """Return known exact default routes for a canonical provider id."""
-    routes: set[str] = set()
-
-    def add(value):
-        route = normalize_route_base_url(value)
-        if route:
-            routes.add(route)
-
-    with suppress(Exception):
-        from hermes_cli.providers import HERMES_OVERLAYS, get_provider
-        overlay = HERMES_OVERLAYS.get(provider)
-        provider_def = get_provider(provider, allow_network=False)
-        add(getattr(overlay, "base_url_override", ""))
-        add(getattr(provider_def, "base_url", ""))
-
-    with suppress(Exception):
-        from providers import get_provider_profile
-        add(getattr(get_provider_profile(provider), "base_url", ""))
-
-    with suppress(Exception):
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        from hermes_cli.models import normalize_provider as normalize_model_provider
-        from hermes_cli.providers import normalize_provider as normalize_registry_provider
-        for provider_id, config in PROVIDER_REGISTRY.items():
-            if normalize_registry_provider(normalize_model_provider(provider_id)) == provider:
-                add(getattr(config, "inference_base_url", ""))
-
-    if provider == "gemini":
-        routes.update(f"{route.rstrip('/')}/openai" for route in list(routes))
-    return routes
 
 
-def _context_route_mismatch(
-    configured_base_url: Any, active_base_url: Any, configured_provider: Any, active_provider: Any,
-    *, already_normalized: bool = False,
-) -> bool:
-    """Return whether a context pin's configured route differs from runtime."""
-    _norm = (lambda v: str(v or "")) if already_normalized else normalize_route_base_url
-    configured_route, active_route = _norm(configured_base_url), _norm(active_base_url)
-    if configured_route:
-        return configured_route != active_route
-
-    configured_provider = str(configured_provider or "").strip()
-    active_provider = str(active_provider or "").strip()
-    if not configured_provider:
-        return False
-    try:
-        from hermes_cli.models import normalize_provider as normalize_model_provider
-        configured_provider = normalize_model_provider(configured_provider)
-        active_provider = normalize_model_provider(active_provider)
-    except Exception:
-        configured_provider = configured_provider.lower()
-        active_provider = active_provider.lower()
-    with suppress(Exception):
-        from hermes_cli.providers import normalize_provider as normalize_registry_provider
-        configured_provider = normalize_registry_provider(configured_provider)
-        active_provider = normalize_registry_provider(active_provider)
-
-    if active_route:
-        configured_routes = _provider_default_routes(configured_provider)
-        if configured_routes:
-            return active_route not in configured_routes
-        # Named/custom providers have no catalog default routes: an empty configured URL
-        # with a matching provider identity is the same route (gateway display paths
-        # compare the raw empty model.base_url and must not drop model.context_length).
-        return not (active_provider and configured_provider == active_provider)
-    return bool(
-        configured_provider and active_provider and configured_provider != active_provider
-    )
 
 
-def _normalize_custom_provider_name(value: Any) -> str:
-    """Mirror runtime normalization for a requested custom-provider identity."""
-    return str(value or "").strip().lower().replace(" ", "-")
 
 
-def _custom_provider_runtime_ids(value: Any) -> set[str]:
-    """Return raw/menu identities that runtime accepts for a configured name."""
-    normalized = _normalize_custom_provider_name(value)
-    if not normalized:
-        return set()
-    return {normalized, f"custom:{normalized}"}
 
 
 def _build_codex_gpt5_autoraise_notice(
@@ -255,73 +182,12 @@ def _record_codex_gpt55_autoraise_notice(autoraise: dict[str, Any]) -> None:
         marker.write_text(_codex_gpt55_autoraise_notice_state(autoraise), encoding="utf-8")
 
 
-def _normalized_custom_base_url(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip().rstrip("/")
 
 
-def _custom_provider_model_matches(agent_model: str, entry: dict[str, Any]) -> bool:
-    agent_model_norm = str(agent_model or "").strip().lower()
-    # Multi-model entries (`providers.<name>.models` mapping / legacy `models:` list):
-    # matching ANY catalog entry counts, else a provider whose `model` differs from the
-    # session model drops its extra_body (e.g. OpenAI service_tier) → wrong billing tier.
-    models = entry.get("models")
-    catalog = [str(m).strip().lower() for m in models] if isinstance(models, (dict, list, tuple)) else []
-    if catalog and agent_model_norm in catalog:
-        return True
-    provider_model = str(entry.get("model", "") or "").strip().lower()
-    return (not provider_model and not catalog) or provider_model == agent_model_norm
 
 
-def _custom_provider_extra_body_for_agent(
-    *, provider: str, model: str, base_url: str, custom_providers: list[dict[str, Any]]
-) -> Optional[dict[str, Any]]:
-    provider_norm = (provider or "").strip().lower()
-    if provider_norm != "custom" and not provider_norm.startswith("custom:"):
-        return None
-    provider_key_filter = provider_norm.partition(":")[2].strip()
-    target_url = _normalized_custom_base_url(base_url)
-    if not target_url:
-        return None
-
-    fallback: Optional[dict[str, Any]] = None
-    for entry in custom_providers or []:
-        if not isinstance(entry, dict):
-            continue
-        entry_keys = {
-            str(entry.get("provider_key", "") or "").strip().lower(),
-            str(entry.get("name", "") or "").strip().lower(),
-        }
-        if provider_key_filter and provider_key_filter not in entry_keys:
-            continue
-        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
-            continue
-        extra_body = entry.get("extra_body")
-        if not isinstance(extra_body, dict) or not extra_body:
-            continue
-        if str(entry.get("model", "") or "").strip():
-            if _custom_provider_model_matches(model, entry):
-                return dict(extra_body)
-        elif fallback is None:
-            fallback = dict(extra_body)
-    return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: list[dict[str, Any]]) -> None:
-    extra_body = _custom_provider_extra_body_for_agent(
-        provider=agent.provider, model=agent.model, base_url=agent.base_url,
-        custom_providers=custom_providers,
-    )
-    if not extra_body:
-        return
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
-    agent.request_overrides = overrides
 
 
 def _normalize_run_budget_seconds(value) -> Optional[float]:
@@ -367,25 +233,6 @@ def _parse_config_int(raw: Any, default: int) -> int:
         return default
 
 
-def _enforce_dashboard_governance_model_policy(agent) -> None:
-    try:
-        from hermes_cli.dashboard_governance.context import current_governance_context
-        from hermes_cli.dashboard_governance.model_policy import model_allowed_for_context
-
-        ctx = current_governance_context()
-        if ctx is None:
-            return
-        decision = model_allowed_for_context(ctx, provider=agent.provider, model=agent.model)
-    except Exception as exc:
-        try:
-            ctx = current_governance_context()  # type: ignore[name-defined]
-            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
-                raise PermissionError("dashboard governance denied model: governance_model_policy_error") from exc
-        except NameError:
-            pass
-        return
-    if not decision.allowed:
-        raise PermissionError(f"dashboard governance denied model: {decision.reason}")
 
 
 _CONSTRUCTOR_PHASES = frozenset({
@@ -440,8 +287,10 @@ def _trace_constructor(function):
                     logger.info("agent_init_timing %s", json.dumps({
                         "session_id": sid, "outcome": outcome, "phases": trace["phases"],
                     }, separators=(",", ":"), allow_nan=False))
-                except Exception:
-                    pass  # Optional observation must never mask construction/cancellation.
+                except Exception as _boundary_error:
+                    logging.getLogger(__name__).error("_trace_constructor.wrapped: operation failed",
+                        exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
+                    # Optional observation must never mask construction/cancellation.
     return wrapped
 
 
@@ -561,7 +410,7 @@ def _finalize_routing(agent, api_mode, credential_pool):
     from hermes_cli.anon_auth import pin_model_for_route
     agent.model = pin_model_for_route(agent.provider, agent.base_url, agent.model)
     # SYNTHWAVE fork: dashboard governance gates the resolved provider/model before any client exists.
-    _enforce_dashboard_governance_model_policy(agent)
+    _agent_init_governance._enforce_dashboard_governance_model_policy(agent)
 
     # Auto-upgrade to Responses for GPT-5.x-style models and direct OpenAI URLs, unless
     # api_mode was explicit, the runtime is ACP (`acp://` clients route themselves, no
@@ -1762,7 +1611,7 @@ def _custom_provider_configured_base_url(
     ``custom_providers``), normalized for route comparison; "" if unknown.
     Disabled ``providers.*`` entries also mask their ``custom_providers`` twin.
     """
-    _wanted = _normalize_custom_provider_name(_configured_provider)
+    _wanted = _agent_init_provider_routes._normalize_custom_provider_name(_configured_provider)
     _user_providers = _agent_cfg.get("providers")
     _disabled_ids: set[str] = set()
     if isinstance(_user_providers, dict):
@@ -1770,7 +1619,7 @@ def _custom_provider_configured_base_url(
         for _key, _entry in _user_providers.items():
             if not isinstance(_entry, dict):
                 continue
-            _ids = _custom_provider_runtime_ids(_key) | _custom_provider_runtime_ids(_entry.get("name"))
+            _ids = _agent_init_provider_routes._custom_provider_runtime_ids(_key) | _agent_init_provider_routes._custom_provider_runtime_ids(_entry.get("name"))
             if not is_provider_enabled(_entry):
                 _disabled_ids.update(_ids)
                 continue
@@ -1783,10 +1632,10 @@ def _custom_provider_configured_base_url(
     for _entry in _custom_providers:
         if not isinstance(_entry, dict):
             continue
-        _key_ids = _custom_provider_runtime_ids(_entry.get("provider_key"))
+        _key_ids = _agent_init_provider_routes._custom_provider_runtime_ids(_entry.get("provider_key"))
         if _key_ids & _disabled_ids:
             continue
-        if _wanted in _key_ids | _custom_provider_runtime_ids(_entry.get("name")):
+        if _wanted in _key_ids | _agent_init_provider_routes._custom_provider_runtime_ids(_entry.get("name")):
             _url = normalize_route_base_url(_entry.get("base_url"))
             if _url:
                 return _url
@@ -1804,7 +1653,7 @@ def _configured_default_base_url(_agent_cfg, _model_cfg, _custom_providers) -> s
     custom provider's URL when ``model.provider`` is not a first-class/auth provider)."""
     _configured_base_url = normalize_route_base_url(_model_cfg.get("base_url"))
     _configured_provider = str(_model_cfg.get("provider") or "").strip()
-    _norm = _normalize_custom_provider_name(_configured_provider)
+    _norm = _agent_init_provider_routes._normalize_custom_provider_name(_configured_provider)
     _custom_provider_candidate = bool(_norm)
     if _norm in _RUNTIME_FIRST_PROVIDER_IDS:
         _custom_provider_candidate = False
@@ -1858,7 +1707,7 @@ def _scope_context_length_to_default_runtime(
             _active_runtime_model = normalize_model_for_provider(agent.model, agent.provider)
     _configured_base_url = _configured_default_base_url(_agent_cfg, _model_cfg, _custom_providers)
     _active_base_url = _active_route_url(agent, base_url)
-    _route_mismatch = _context_route_mismatch(
+    _route_mismatch = _agent_init_provider_routes._context_route_mismatch(
         _configured_base_url, _active_base_url, str(_model_cfg.get("provider") or "").strip(),
         agent.provider, already_normalized=True,
     )
@@ -1999,7 +1848,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 
     # Reused by _check_compression_model_feasibility (aux compression model detection).
     agent._custom_providers = _custom_providers
-    _merge_custom_provider_extra_body(agent, _custom_providers)
+    _agent_init_provider_routes._merge_custom_provider_extra_body(agent, _custom_providers)
 
     if _config_context_length is None and _custom_providers:
         with suppress(Exception):

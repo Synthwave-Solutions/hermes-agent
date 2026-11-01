@@ -372,6 +372,8 @@ def _lookup_supports_vision(
         try:
             return _probe_models_dev(provider, model, cfg, allow_network=False)
         except Exception as exc:  # pragma: no cover - defensive
+            logging.getLogger(__name__).error("_lookup_supports_vision: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             logger.debug("image_routing: cached caps lookup failed for %s:%s: %s", provider, model, exc)
             return None
 
@@ -561,7 +563,7 @@ def _attach_limit(env_name: str, default: int) -> int:
     try:
         val = int(os.getenv(env_name, "").strip() or default)
         return val if val > 0 else default
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -613,7 +615,7 @@ def _downscale_for_attachment(raw: bytes, mime: str, *, source: str = "") -> tup
                 source or "<bytes>", w, h, mime, len(raw) // 1024, out_mime, len(out) // 1024,
             )
             return out, out_mime
-    except Exception as exc:
+    except (ImportError, OSError, ValueError) as exc:
         logger.info("image_routing: attachment downscale skipped for %s: %s", source or "<bytes>", exc)
         return raw, mime
 

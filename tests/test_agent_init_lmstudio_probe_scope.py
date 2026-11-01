@@ -1,4 +1,6 @@
 """Real initializer/context resolution with synthetic metadata HTTP only."""
+
+import agent.model_metadata_protocol as _model_metadata_protocol
 import json
 import time
 import threading
@@ -173,10 +175,10 @@ def test_targeted_negative_cache_is_bounded_and_expires(monkeypatch, gateway):
     monkeypatch.setattr(metadata.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(metadata, "_LMSTUDIO_PROBE_MISS_MAX_SIZE", 2)
     for key in ("one", "two", "three"):
-        metadata._lmstudio_probe_miss_seen(key, record=True)
+        _model_metadata_protocol._lmstudio_probe_miss_seen(key, record=True)
     assert set(metadata._lmstudio_probe_misses) == {"two", "three"}
     clock[0] += metadata._ENDPOINT_PROBE_FAILURE_TTL_SECONDS + 1
-    assert not metadata._lmstudio_probe_miss_seen("three")
+    assert not _model_metadata_protocol._lmstudio_probe_miss_seen("three")
     assert not metadata._lmstudio_probe_misses
 
 

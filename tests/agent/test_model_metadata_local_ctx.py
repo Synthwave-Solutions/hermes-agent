@@ -4,6 +4,8 @@ get_model_context_length.
 All tests use synthetic inputs — no filesystem or live server required.
 """
 
+import agent.model_metadata_payloads as _model_metadata_payloads
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -213,9 +215,9 @@ class TestQueryLocalContextLengthVllm:
         # Every context key the module recognises is honoured by the flat
         # reader the probe branches use, and no completion key ever is.
         for key in mm._CONTEXT_LENGTH_KEYS:
-            assert mm._extract_flat_context_length({key: 123456}) == 123456, key
+            assert _model_metadata_payloads._extract_flat_context_length({key: 123456}) == 123456, key
         for key in mm._MAX_COMPLETION_KEYS:
-            assert mm._extract_flat_context_length({key: 123456}) is None, key
+            assert _model_metadata_payloads._extract_flat_context_length({key: 123456}) is None, key
 
 
 class TestQueryLocalContextLengthModelsList:
@@ -345,20 +347,20 @@ class TestContextLengthFromModelPayload:
 
 
     def test_prefers_max_model_len_over_max_tokens(self):
-        from agent.model_metadata import _context_length_from_model_payload
+        from agent.model_metadata_payloads import _context_length_from_model_payload
 
         payload = {"id": "local-model", "max_model_len": 131072, "max_tokens": 4096}
         assert _context_length_from_model_payload(payload) == 131072
 
     def test_falls_back_to_max_tokens_when_no_input_window_field(self):
-        from agent.model_metadata import _context_length_from_model_payload
+        from agent.model_metadata_payloads import _context_length_from_model_payload
 
         # Some OpenAI-compat servers only expose max_tokens for the window.
         payload = {"id": "odd-server", "max_tokens": 65536}
         assert _context_length_from_model_payload(payload) == 65536
 
     def test_returns_none_for_empty_payload(self):
-        from agent.model_metadata import _context_length_from_model_payload
+        from agent.model_metadata_payloads import _context_length_from_model_payload
 
         assert _context_length_from_model_payload({}) is None
         assert _context_length_from_model_payload(None) is None  # type: ignore[arg-type]

@@ -800,7 +800,7 @@ class AIAgent(
                                      explicit: bool = False) -> None:
         """Spawn the background memory/skill review thread.
 
-        ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
+        The shared spawn helper captures the active profile and governance scope.
         ``focus`` is /refine steering text; ``task_cfg`` is the pre-loaded config block (None on direct calls).
         ``explicit`` (/refine) forks under the ``refine_review`` write origin, keeping the full
         memory operation set. A deferred review preempted by a live turn is requeued (bounded)
@@ -810,6 +810,7 @@ class AIAgent(
             finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
             trace_background_review,
         )
+        from agent.memory_provider import spawn_context_thread
         from tools.thread_context import propagate_context_to_thread
 
         review_run = prepare_background_review_run(self)
@@ -831,7 +832,8 @@ class AIAgent(
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile.
-            t = threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review")
+            t = spawn_context_thread(
+                target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review")
             trace_background_review(self, "scheduled", review_run=review_run,
                                     review_memory=bool(review_memory), review_skills=bool(review_skills))
             t.start()

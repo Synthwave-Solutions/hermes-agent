@@ -362,7 +362,7 @@ def _inject_dwd_identity_env(env: dict[str, str]) -> None:
     Admins, report_only and ungoverned runs with nothing inherited get no
     identity, so the owner's own shell and the crons are untouched.
     """
-    inherited = str(os.environ.get("HERMES_DWD_IDENTITY") or "").strip()
+    inherited = str(os.environ.get("HERMES_DWD_IDENTITY") or "").strip()  # health: allow HX002 -- inherited caller identity ABI must survive nested shells; config.yaml must not override the caller identity
     env.pop("HERMES_DWD_IDENTITY", None)
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context, policy_contexts
@@ -397,11 +397,8 @@ def _hermes_dotenv_values(names: set[str]) -> dict[str, str]:
     found: dict[str, str] = {}
     if not names:
         return found
-    try:
-        from hermes_constants import get_hermes_home
-        path = Path(get_hermes_home()) / ".env"
-    except Exception:
-        path = Path(os.path.expanduser("~/.hermes/.env"))
+    from hermes_constants import get_hermes_home
+    path = get_hermes_home() / ".env"
     try:
         raw = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:

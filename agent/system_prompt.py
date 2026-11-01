@@ -318,8 +318,9 @@ def _skills_prompt(agent: Any) -> str:
     try:
         from agent.skill_index_focus import compact_categories as _usage_compact
         _compact_cats = frozenset(_compact_cats) | _usage_compact(_skills_dir)
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_skills_prompt: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
                                          compact_categories=_compact_cats or None, skills_dir_override=_skills_dir)
 

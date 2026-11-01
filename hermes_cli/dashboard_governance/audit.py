@@ -78,7 +78,7 @@ def read_audit_events(*, limit: int = 100) -> list[dict[str, Any]]:
     for line in reversed(lines[-max(1, int(limit)) :]):
         try:
             row = json.loads(line)
-        except Exception:
+        except json.JSONDecodeError:
             continue
         if isinstance(row, dict):
             rows.append(row)

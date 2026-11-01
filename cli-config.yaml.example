@@ -73,6 +73,8 @@ model:
   # Default model to use (can be overridden with --model flag)
   # Both "default" and "model" work as the key name here.
   default: "anthropic/claude-opus-4.6"
+  # SynthPulse: null preserves HERMES_MODEL_TIERING; explicit true/false wins.
+  tiering: null
   
   # Inference provider selection:
   #   "auto"         - Auto-detect from credentials (default)
@@ -2394,3 +2396,17 @@ updates:
 #   # This runs ONCE per process at startup, so it cannot replace a credential
 #   # that expires mid-session. For a single provider whose token needs
 #   # re-minting during a session, use `providers.<name>.key_cmd` instead.
+
+# =============================================================================
+# SynthPulse profile settings (optional)
+# =============================================================================
+# Explicit profile values override the legacy managed launcher's environment.
+# Null keeps legacy behavior. See SYNTHPULSE.md for the complete mapping.
+opencode:
+  binary: null  # HERMES_OPENCODE_BIN; otherwise the installed OpenCode CLI.
+  max_slots: null  # HERMES_OPENCODE_MAX_SLOTS; otherwise 12 installation-wide slots.
+webui:
+  state_dir: null  # HERMES_WEBUI_STATE_DIR; otherwise this profile's webui/ directory.
+  attachment_dir: null  # HERMES_WEBUI_ATTACHMENT_DIR; otherwise webui/attachments/.
+api_server:
+  disable_caller_governance: null  # HERMES_DISABLE_CALLER_GOVERNANCE; otherwise false.

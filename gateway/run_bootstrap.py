@@ -731,23 +731,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all; ``idle_exit`` arms the
     unmanaged idle exit (``gateway.run_idle_exit``) for a client-started daemon."""
-    from gateway.run import (
-        GatewayRunner,
-        _best_effort,
-        _enable_multiplex_log_routing,
-        _ensure_windows_gateway_venv_imports,
-        _gateway_loop_exception_handler,
-        _host_attach_or_none,
-        _log_standalone_profiles_at_boot,
-        _multiplex_profile_homes,
-        _refresh_host_gateway_record,
-        _run_planned_stop_watcher,
-        _start_gateway_make_restart_signal_handler,
-        asyncio,
-        load_gateway_config_for_runner,
-        os,
-        threading,
-    )
+    from gateway.run import GatewayRunner, _best_effort, _enable_multiplex_log_routing, _ensure_windows_gateway_venv_imports, _gateway_loop_exception_handler, _host_attach_or_none, _log_standalone_profiles_at_boot, _multiplex_profile_homes, _refresh_host_gateway_record, _run_planned_stop_watcher, _start_gateway_make_restart_signal_handler, asyncio, os, threading
+    from gateway.run_profile_config import load_gateway_config_for_runner
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
     _start_gateway_resolve_terminal_cwd()

@@ -1222,10 +1222,14 @@ def _check_profile_scope_guard(command: str, cwd: str | None = None):
         # profile from HERMES_HOME (segment-equality parse + marker-file
         # fallback in the bridge); otherwise fail-open so non-scoped
         # profiles are never impacted by a guard error.
+        logging.getLogger(__name__).error("_check_profile_scope_guard: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(e).__name__), e.__traceback__))
         try:
             from tools import profile_scope_bridge
             scoped = profile_scope_bridge.is_scoped_home()
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_check_profile_scope_guard: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             scoped = False
         if scoped:
             logger.error("Profile-scope guard error (fail-closed): %s", e)
@@ -1360,10 +1364,14 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
                 "user_consent": False,
             }
     except Exception as _scope_err:
+        logging.getLogger(__name__).error("check_execute_code_guard: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_scope_err).__name__), _scope_err.__traceback__))
         try:
             from tools import profile_scope_bridge
             _scope_home = profile_scope_bridge.is_scoped_home()
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("check_execute_code_guard: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             _scope_home = False
         if _scope_home:
             logger.error("Profile-scope guard error in execute_code "

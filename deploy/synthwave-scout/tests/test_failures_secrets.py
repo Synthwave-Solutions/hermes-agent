@@ -8,7 +8,9 @@ import time
 
 import pytest
 
-from test_scout import WAKE_FALSE, env, last_line, run, write_jobs, write_output, write_profile
+from test_scout import WAKE_FALSE, last_line, run, write_jobs, write_output, write_profile
+
+pytest_plugins = ["test_scout"]
 
 import scout_collect
 import scout_ledger

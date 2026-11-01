@@ -36,7 +36,8 @@ def _codex_agent(tmp_path: Path, monkeypatch, effort: str, *, enabled: bool = Tr
 
 @pytest.mark.parametrize("effort", ["high", "xhigh"])
 def test_high_effort_small_prompt_gets_the_silence_floor_on_all_three_fuses(tmp_path, monkeypatch, effort):
-    from agent.chat_completion_helpers import HIGH_EFFORT_SILENCE_FLOOR_SECONDS, _resolve_nonstream_watchdogs
+    from agent.chat_completion_helpers import HIGH_EFFORT_SILENCE_FLOOR_SECONDS
+    from agent.chat_completion_watchdogs import _resolve_nonstream_watchdogs
 
     wd = _resolve_nonstream_watchdogs(_codex_agent(tmp_path, monkeypatch, effort), _SMALL_PROMPT)
 
@@ -49,7 +50,8 @@ def test_high_effort_small_prompt_gets_the_silence_floor_on_all_three_fuses(tmp_
 def test_default_effort_tiers_and_explicit_operator_values_are_untouched(tmp_path, monkeypatch):
     """Control: medium effort (and disabled reasoning) keep the small-prompt tiers; an explicit
     env value for any fuse is never raised by the floor."""
-    from agent.chat_completion_helpers import HIGH_EFFORT_SILENCE_FLOOR_SECONDS, _resolve_nonstream_watchdogs
+    from agent.chat_completion_helpers import HIGH_EFFORT_SILENCE_FLOOR_SECONDS
+    from agent.chat_completion_watchdogs import _resolve_nonstream_watchdogs
 
     medium = _resolve_nonstream_watchdogs(_codex_agent(tmp_path, monkeypatch, "medium"), _SMALL_PROMPT)
     medium_fuses = (medium.idle_timeout, medium.ttfb_timeout, medium.stale_timeout)
@@ -71,7 +73,7 @@ def test_effort_floor_never_outlives_the_run_budget_cap(tmp_path, monkeypatch):
     high-effort floor must be applied before that cap, not override it."""
     import time
 
-    from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
+    from agent.chat_completion_watchdogs import _resolve_nonstream_watchdogs
 
     agent = _codex_agent(tmp_path, monkeypatch, "high")
     agent.run_budget_seconds = 100

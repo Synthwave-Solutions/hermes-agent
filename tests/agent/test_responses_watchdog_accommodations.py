@@ -11,6 +11,8 @@ Ensures:
 
 from __future__ import annotations
 
+import agent.chat_completion_watchdogs as _chat_completion_watchdogs
+
 import sys
 import time
 import types
@@ -149,5 +151,5 @@ def test_hard_ceiling_clamps_hosted_but_not_local_responses_endpoints(monkeypatc
     for agent in (hosted, local):
         agent._compute_non_stream_stale_timeout = lambda api_kwargs: 3000.0
 
-    assert h._resolve_nonstream_watchdogs(hosted, kwargs).stale_timeout == 1500.0
-    assert h._resolve_nonstream_watchdogs(local, kwargs).stale_timeout == 3000.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(hosted, kwargs).stale_timeout == 1500.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(local, kwargs).stale_timeout == 3000.0

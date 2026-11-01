@@ -190,7 +190,7 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
         gateway_session_key=gateway_session_key, model_alias=body.get('model'))
     if error is not None:
         return None, error
-    from gateway.platforms.api_server import _request_relay_metadata
+    from gateway.platforms.api_server_runtime_options import _request_relay_metadata
     run_kwargs = dict(user_message=user_message, conversation_history=history,
         ephemeral_system_prompt=instructions, session_id=session_id,
         gateway_session_key=gateway_session_key, bind_declared_conversation=declared_selected,

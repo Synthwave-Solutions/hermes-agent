@@ -62,7 +62,9 @@ def _trace_finalization_timing(agent, event, started=None):
                 row["duration_ms"] = round(duration, 3)
         _timing_logger.info("Turn finalization timing: %s", json.dumps(row, sort_keys=True))
         return now
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_trace_finalization_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return None  # Logging/clock failures must never change finalization.
 
 

@@ -4,6 +4,14 @@ Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
+import agent.model_metadata_disk as _model_metadata_disk
+
+import agent.model_metadata_protocol as _model_metadata_protocol
+
+import agent.model_metadata_endpoint as _model_metadata_endpoint
+
+import agent.model_metadata_payloads as _model_metadata_payloads
+
 import contextlib
 import contextvars
 import hashlib
@@ -122,32 +130,12 @@ _lmstudio_probe_misses: dict[str, float] = {}
 _lmstudio_probe_miss_lock = threading.Lock()
 
 
-def _targeted_probe_miss_seen(misses: dict[str, float], lock: threading.Lock, max_size: int, key: str, record: bool) -> bool:
-    now = time.monotonic()
-    with lock:
-        for stale_key, seen in list(misses.items()):
-            if now - seen >= _ENDPOINT_PROBE_FAILURE_TTL_SECONDS:
-                del misses[stale_key]
-        if record:
-            misses[key] = now
-            while len(misses) > max_size:
-                misses.pop(next(iter(misses)))
-        return key in misses
 
 
-def _ollama_probe_miss_seen(key: str, *, record: bool = False) -> bool:
-    return _targeted_probe_miss_seen(_ollama_probe_misses, _ollama_probe_miss_lock, _OLLAMA_PROBE_MISS_MAX_SIZE, key, record)
 
 
-def _lmstudio_probe_miss_seen(key: str, *, record: bool = False) -> bool:
-    return _targeted_probe_miss_seen(_lmstudio_probe_misses, _lmstudio_probe_miss_lock, _LMSTUDIO_PROBE_MISS_MAX_SIZE, key, record)
 
 
-def _credential_identity(api_key: object) -> str:
-    """Non-reversible credential identity for cache scoping. Callable (minted) keys are not
-    fingerprinted: doing so would mint on every cache read."""
-    from agent.credential_persistence import fingerprint_secret_value
-    return (fingerprint_secret_value(api_key) or "") if isinstance(api_key, str) else ""
 # Routable-but-dead endpoints (corp LAN off-VPN) blackhole TCP: once ANY probe paid
 # a full connect timeout, later probes short-circuit for a while.
 _ENDPOINT_BLACKHOLE_TTL_SECONDS = 30.0
@@ -218,38 +206,10 @@ def _cache_file(name: str) -> Path:
     return get_hermes_home() / "cache" / name
 
 
-def _load_json_dict(path: Path) -> dict[str, Any]:
-    """JSON object at ``path``, or {} when missing/invalid."""
-    try:
-        with path.open("r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
 
 
-def _ttl_memo_get(path: Path, key: str, ttl: float, *, ts_key: str, value_key: str) -> Optional[Any]:
-    """Fresh (< ``ttl`` seconds) ``value_key`` of the ``key`` entry in a TTL memo file, else None."""
-    entry = _load_json_dict(path).get(key)
-    if not isinstance(entry, dict):
-        return None
-    try:
-        if (time.time() - float(entry[ts_key])) >= ttl:
-            return None
-        return entry[value_key]
-    except Exception:
-        return None
 
 
-def _ttl_memo_put(path: Path, key: str, value: Any, ttl: float, *, ts_key: str, value_key: str, what: str, ts_first: bool = False) -> None:
-    """Write ``key`` into a TTL memo file, dropping expired siblings. Best-effort."""
-    try:
-        now = time.time()
-        data = {k: v for k, v in _load_json_dict(path).items() if isinstance(v, dict) and (now - float(v.get(ts_key, 0))) < ttl}
-        data[key] = {ts_key: now, value_key: value} if ts_first else {value_key: value, ts_key: now}
-        atomic_json_write(path, data, indent=0, separators=(",", ":"))
-    except Exception as e:
-        logger.debug("Failed to save %s: %s", what, e)
 
 
 def _local_probe_disk_cache_path() -> Path:
@@ -258,12 +218,12 @@ def _local_probe_disk_cache_path() -> Path:
 
 def _local_probe_disk_get(kind: str, key: str) -> Optional[Any]:
     """Return a fresh cached value for ``kind:key``, else None."""
-    return _ttl_memo_get(_local_probe_disk_cache_path(), f"{kind}:{key}", _LOCAL_PROBE_DISK_TTL_SECONDS, ts_key="ts", value_key="value")
+    return _model_metadata_disk._ttl_memo_get(_local_probe_disk_cache_path(), f"{kind}:{key}", _LOCAL_PROBE_DISK_TTL_SECONDS, ts_key="ts", value_key="value")
 
 
 def _local_probe_disk_put(kind: str, key: str, value: Any) -> None:
     """Persist a successful probe result. Best-effort; prunes stale entries."""
-    _ttl_memo_put(_local_probe_disk_cache_path(), f"{kind}:{key}", value, _LOCAL_PROBE_DISK_TTL_SECONDS, ts_key="ts", value_key="value", what="local probe disk cache")
+    _model_metadata_disk._ttl_memo_put(_local_probe_disk_cache_path(), f"{kind}:{key}", value, _LOCAL_PROBE_DISK_TTL_SECONDS, ts_key="ts", value_key="value", what="local probe disk cache")
 
 
 def _get_model_metadata_cache_path() -> Path:
@@ -307,13 +267,13 @@ def _endpoint_disk_cache_get(normalized: str) -> Optional[dict[str, dict[str, An
     """Fresh cross-process memo of a remote ``/models`` probe (same TTL as in-memory): one-shot
     runs (``hermes -q``, cron) start cold and Nous bypasses the persistent context cache, so
     without this every launch paid the live probe. Local endpoints are never memoized."""
-    models = _ttl_memo_get(_get_endpoint_metadata_cache_path(), normalized, _ENDPOINT_MODEL_CACHE_TTL, ts_key="at", value_key="models")
+    models = _model_metadata_disk._ttl_memo_get(_get_endpoint_metadata_cache_path(), normalized, _ENDPOINT_MODEL_CACHE_TTL, ts_key="at", value_key="models")
     return models if isinstance(models, dict) else None
 
 
 def _endpoint_disk_cache_put(normalized: str, cache: dict[str, dict[str, Any]]) -> None:
     """Memoize a successful remote ``/models`` probe; expired siblings are dropped."""
-    _ttl_memo_put(
+    _model_metadata_disk._ttl_memo_put(
         _get_endpoint_metadata_cache_path(), normalized, cache, _ENDPOINT_MODEL_CACHE_TTL,
         ts_key="at", value_key="models", what="endpoint model metadata disk cache", ts_first=True)
 
@@ -843,11 +803,11 @@ def detect_local_server_type(
     # Newer positive generic/disk verdicts above take precedence over a prior targeted miss. Never share a
     # failed authenticated probe across profiles or key rotation, and never retain the credential itself.
     miss_key = None
-    miss_seen = _ollama_probe_miss_seen if ollama_only else _lmstudio_probe_miss_seen
+    miss_seen = _model_metadata_protocol._ollama_probe_miss_seen if ollama_only else _model_metadata_protocol._lmstudio_probe_miss_seen
     if ollama_only or lmstudio_only:
         from hermes_constants import get_hermes_home
         kind = "ollama" if ollama_only else "lm-studio"
-        miss_key = hashlib.sha256(json.dumps([kind, str(get_hermes_home()), server_url, _credential_identity(api_key)]).encode("utf-8")).hexdigest()
+        miss_key = hashlib.sha256(json.dumps([kind, str(get_hermes_home()), server_url, _model_metadata_protocol._credential_identity(api_key)]).encode("utf-8")).hexdigest()
         if miss_seen(miss_key):
             return None
     # Most specific first: (name, paths tried until one answers 200, body check). LM Studio answers /api/tags
@@ -876,7 +836,7 @@ def detect_local_server_type(
                         if r.status_code == 200:
                             break
                     return (name if r.status_code == 200 and check(r) else None), None
-                except Exception as exc:
+                except (httpx.HTTPError, OSError, ValueError, TypeError) as exc:
                     return None, exc
             first_name, first_error = probe(waterfall[0])
             outcomes: Any = [(first_name, first_error)]
@@ -888,7 +848,7 @@ def detect_local_server_type(
             if speculate and first_name is None and rest and isinstance(first_error, httpx.ReadTimeout):
                 # A slow non-native gateway can time out every optional protocol endpoint: overlap the
                 # remaining reads (same per-request timeout, endpoints and result precedence).
-                outcomes = itertools.chain(outcomes, _speculative_protocol_outcomes(rest, probe, headers, verify))
+                outcomes = itertools.chain(outcomes, _model_metadata_protocol._speculative_protocol_outcomes(rest, probe, headers, verify))
             else:
                 # Responsive native endpoints and targeted probes keep the serial early exit.
                 outcomes = itertools.chain(outcomes, map(probe, rest))
@@ -916,112 +876,19 @@ def detect_local_server_type(
 _SPECULATION_INCOMPLETE = object()
 
 
-def _speculative_protocol_outcomes(legs, serial_probe, headers: dict[str, str], verify) -> Iterator[tuple[Optional[str], Any]]:
-    """Run the remaining protocol probes of ``detect_local_server_type`` concurrently and return
-    their outcomes in priority order, stopping after the first match or connect timeout.
-
-    One owned event loop runs on a joined worker thread (works even when called from inside a
-    running loop); lower-priority probes still in flight are cancelled and drained before the
-    async client closes. Each probe has a total budget of ``_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS``
-    (HTTPX's read timeout alone permits an indefinitely trickling response). A probe that expired
-    is not treated as a negative verdict: detection resumes serially from that probe instead."""
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-
-    import httpx
-
-    async def speculate():
-        async with httpx.AsyncClient(timeout=2.0, headers=headers, verify=verify) as async_client:
-            async def run(leg):
-                name, urls, check = leg
-                deadline = asyncio.timeout(_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS)
-                try:
-                    async with deadline:
-                        for url in urls:
-                            r = await async_client.get(url)
-                            if r.status_code == 200:
-                                break
-                        return (name if r.status_code == 200 and check(r) else None), None
-                except TimeoutError as exc:
-                    return None, _SPECULATION_INCOMPLETE if deadline.expired() else exc
-                except Exception as exc:
-                    return None, exc
-
-            tasks = [asyncio.create_task(run(leg)) for leg in legs]
-            outcomes = []
-            try:
-                for task in tasks:
-                    outcome = await task
-                    outcomes.append(outcome)
-                    name, error = outcome
-                    if name is not None or error is _SPECULATION_INCOMPLETE or (error is not None and _is_connect_timeout(error)):
-                        break
-                return outcomes
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-local-probe") as pool:
-        outcomes = pool.submit(lambda: asyncio.run(speculate())).result()
-    if outcomes and outcomes[-1][1] is _SPECULATION_INCOMPLETE:
-        # Do not classify a large/slow native response as a negative verdict just because
-        # speculation expired: resume serially (lazily, keeping the early exit) from that probe.
-        return itertools.chain(outcomes[:-1], map(serial_probe, legs[len(outcomes) - 1:]))
-    return iter(outcomes)
 
 
 # Cache the negative verdict in memory only (never on disk — a failure is often transient: server starting,
 # key being fixed) so the very next turn does not re-run the whole waterfall against an endpoint that just
 # answered nothing (#89863).
-def _iter_nested_dicts(value: Any):
-    if isinstance(value, dict):
-        yield value
-        for nested in value.values():
-            yield from _iter_nested_dicts(nested)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _iter_nested_dicts(item)
 
 
-def _coerce_reasonable_int(value: Any, minimum: int = 1024, maximum: int = 10_000_000) -> Optional[int]:
-    if isinstance(value, bool):
-        return None
-    try:
-        result = int(value.strip().replace(",", "") if isinstance(value, str) else value)
-    except (TypeError, ValueError):
-        return None
-    return result if minimum <= result <= maximum else None
 
 
-def _extract_first_int(payload: dict[str, Any], keys: tuple[str, ...]) -> Optional[int]:
-    keyset = {key.lower() for key in keys}
-    for mapping in _iter_nested_dicts(payload):
-        for key, value in mapping.items():
-            if str(key).lower() in keyset:
-                coerced = _coerce_reasonable_int(value)
-                if coerced is not None:
-                    return coerced
-    return None
 
 
-def _extract_flat_context_length(payload: dict[str, Any]) -> Optional[int]:
-    """Top-level-only context WINDOW read (no nested walk, so an unrelated nested section can't leak
-    a same-named key). ``max_tokens`` is NOT a window key: on OpenAI-compatible passthroughs it is the max OUTPUT."""
-    return next((c for c in map(_coerce_reasonable_int, (payload.get(k) for k in _CONTEXT_LENGTH_KEYS)) if c is not None), None)
 
 
-def _context_length_from_model_payload(payload: dict[str, Any]) -> Optional[int]:
-    """Context window from a ``/v1/models`` object: window keys first, ``max_tokens`` last (Anthropic
-    payloads carry ``max_input_tokens`` = 1M window AND ``max_tokens`` = 128k OUTPUT cap)."""
-    if not isinstance(payload, dict):
-        return None
-    ctx = _extract_flat_context_length(payload)
-    if ctx is not None:
-        return ctx
-    raw = payload.get("max_tokens")
-    return int(raw) if isinstance(raw, (int, float)) and int(raw) > 0 else None
 
 
 # Generic ``/models`` pricing: an explicit ``unit`` beside the rates wins; without one, a token rate
@@ -1034,60 +901,10 @@ _PER_MILLION_QUOTE_MIN = 0.001
 _TOKEN_RATE_FIELDS = ("prompt", "completion", "cache_read", "cache_write")
 
 
-def _normalize_token_rates(pricing: dict[str, Any], unit: Any) -> dict[str, Any]:
-    """Rescale the generic path's token rates to per-token strings (the contract usage_pricing
-    multiplies by 1e6), the way the Novita/DeepInfra branches already do for their known units."""
-    rates: dict[str, float] = {}
-    for key in _TOKEN_RATE_FIELDS:
-        try:
-            rates[key] = float(pricing[key])
-        except (KeyError, TypeError, ValueError):
-            continue
-    divisor = _PRICING_UNIT_DIVISORS.get(str(unit or "").strip().lower())
-    if divisor is None:
-        divisor = 1_000_000 if any(v >= _PER_MILLION_QUOTE_MIN for v in rates.values()) else 1
-    if divisor != 1:
-        pricing.update({key: str(value / divisor) for key, value in rates.items()})
-    return pricing
 
 
-def _extract_pricing(payload: dict[str, Any]) -> dict[str, Any]:
-    def _per_token(source: dict[str, Any], fields: dict[str, str], scale) -> dict[str, Any]:
-        # Provider $/MTok (or Novita's 1/10_000-$ per M) -> per-token strings, the same path usage_pricing uses for OpenRouter.
-        return {target: str(scale(float(source[key]))) for target, key in fields.items() if source.get(key) is not None}
-    novita_fields = {"prompt": "input_token_price_per_m", "completion": "output_token_price_per_m"}
-    if any(payload.get(k) is not None for k in novita_fields.values()):
-        return _per_token(payload, novita_fields, lambda v: v / 10_000 / 1_000_000)
-    # DeepInfra ships pricing under ``metadata.pricing`` in $/MTok.
-    metadata = payload.get("metadata")
-    deepinfra_pricing = metadata.get("pricing") if isinstance(metadata, dict) else None
-    deepinfra_fields = {"prompt": "input_tokens", "completion": "output_tokens", "cache_read": "cache_read_tokens"}
-    if isinstance(deepinfra_pricing, dict) and any(k in deepinfra_pricing for k in deepinfra_fields.values()):
-        return _per_token(deepinfra_pricing, deepinfra_fields, lambda v: v / 1_000_000)
-    alias_map = {
-        "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
-        "completion": ("completion", "output", "output_cost_per_token", "completion_token_cost"),
-        "request": ("request", "request_cost"),
-        "cache_read": ("cache_read", "cached_prompt", "input_cache_read", "cache_read_cost_per_token"),
-        "cache_write": ("cache_write", "cache_creation", "input_cache_write", "cache_write_cost_per_token"),
-    }
-    for mapping in _iter_nested_dicts(payload):
-        normalized = {str(key).lower(): value for key, value in mapping.items()}
-        pricing: dict[str, Any] = {}
-        for target, aliases in alias_map.items():
-            for alias in aliases:
-                if alias in normalized and normalized[alias] not in {None, ""}:
-                    pricing[target] = normalized[alias]
-                    break
-        if pricing:
-            return _normalize_token_rates(pricing, normalized.get("unit"))
-    return {}
 
 
-def _add_model_aliases(cache: dict[str, dict[str, Any]], model_id: str, entry: dict[str, Any]) -> None:
-    cache[model_id] = entry
-    if "/" in model_id:
-        cache.setdefault(model_id.split("/", 1)[1], entry)
 
 
 def fetch_model_metadata(force_refresh: bool = False, *, cached_only: bool = False) -> dict[str, dict[str, Any]]:
@@ -1123,7 +940,7 @@ def fetch_model_metadata(force_refresh: bool = False, *, cached_only: bool = Fal
             }
             canonical = model.get("canonical_slug", "")
             for alias in ((model_id, canonical) if canonical and canonical != model_id else (model_id,)):
-                _add_model_aliases(cache, alias, entry)
+                _model_metadata_payloads._add_model_aliases(cache, alias, entry)
         _model_metadata_cache = cache
         _model_metadata_cache_time = time.time()
         _save_model_metadata_disk_cache(cache)
@@ -1143,98 +960,18 @@ def fetch_model_metadata(force_refresh: bool = False, *, cached_only: bool = Fal
         return {}
 
 
-def _endpoint_model_entry(model: dict[str, Any], model_id: str, context_length: Optional[int]) -> dict[str, Any]:
-    """Cache entry for one ``/models`` item; optional keys are set only when known."""
-    optional = (("context_length", context_length), ("max_completion_tokens", _extract_first_int(model, _MAX_COMPLETION_KEYS)), ("pricing", _extract_pricing(model) or None))
-    return {"name": model.get("name", model_id), **{k: v for k, v in optional if v is not None}}
 
 
-def _lmstudio_loaded_context(model: dict[str, Any]) -> Optional[int]:
-    """Context of the first loaded LM Studio instance (the runtime value), else None."""
-    for inst in model.get("loaded_instances", []) or []:
-        cfg = inst.get("config", {}) if isinstance(inst, dict) else None
-        ctx = cfg.get("context_length") if isinstance(cfg, dict) else None
-        if isinstance(ctx, int) and ctx > 0:
-            return ctx
-    return None
 
 
-def _lmstudio_native_models(normalized: str, headers: dict[str, str]) -> dict[str, dict[str, Any]]:
-    """LM Studio ``/api/v1/models`` → cache; context comes from the first loaded instance."""
-    response = model_metadata_http.get(_lmstudio_server_root(normalized).rstrip("/") + "/api/v1/models", headers=headers, timeout=(5, 10), verify=model_metadata_http.resolve_verify(normalized))
-    response.raise_for_status()
-    cache: dict[str, dict[str, Any]] = {}
-    for model in response.json().get("models", []):
-        model_id = (model.get("key") or model.get("id")) if isinstance(model, dict) else None
-        if not model_id:
-            continue
-        entry = _endpoint_model_entry(model, model_id, _lmstudio_loaded_context(model))
-        _add_model_aliases(cache, model_id, entry)
-        alt_id = model.get("id")
-        if isinstance(alt_id, str) and alt_id and alt_id != model_id:
-            _add_model_aliases(cache, alt_id, entry)
-    return cache
 
 
-def _apply_llamacpp_props(cache: dict[str, dict[str, Any]], request_candidate: str, headers: dict[str, str], verify) -> None:
-    """Overwrite ``context_length`` with llama.cpp's allocated ``n_ctx`` from /props (``/v1/props``, then
-    ``/props`` for older builds). In router mode the bare endpoint 400s, so each LOADED child is read
-    via ``/props?model=``; unloaded children are skipped — probing could autoload them."""
-    base = request_candidate.rstrip("/").replace("/v1", "")
-    def _props(params=None):
-        resp = model_metadata_http.get(base + "/v1/props", params=params, headers=headers, timeout=5, verify=verify)
-        if resp.is_error:
-            resp = model_metadata_http.get(base + "/props", params=params, headers=headers, timeout=5, verify=verify)
-        return resp
-    def _n_ctx(props: dict[str, Any]) -> Any:
-        return (props.get("default_generation_settings") or {}).get("n_ctx")
-    props_resp = _props()
-    if not props_resp.is_error:
-        props = props_resp.json()
-        n_ctx, model_alias = _n_ctx(props), props.get("model_alias", "")
-        if n_ctx and model_alias and model_alias in cache:
-            cache[model_alias]["context_length"] = n_ctx
-        return
-    native = model_metadata_http.get(base + "/models", headers=headers, timeout=5, verify=verify)
-    if native.is_error:
-        return
-    for child in (native.json() or {}).get("data", [])[:16]:
-        child_id = child.get("id") if isinstance(child, dict) else None
-        if not child_id or child_id not in cache or (child.get("status") or {}).get("value") not in ("loaded", "ready"):
-            continue
-        pr = _props({"model": child_id, "autoload": "false"})  # it may have unloaded since /models
-        child_ctx = _n_ctx(pr.json()) if not pr.is_error else None
-        if child_ctx:
-            cache[child_id]["context_length"] = child_ctx
 
 
-def _endpoint_metadata_cache_key(base_url: str, api_key: object = "") -> str:
-    """Digest scoping an endpoint snapshot to the active (context-local) profile, the normalized
-    endpoint and the credential fingerprint. Raw credentials are never retained in keys."""
-    from hermes_constants import get_hermes_home
-    # Callers on the pricing path can hand in a non-str endpoint; key on its text form.
-    endpoint = _normalize_base_url(base_url if isinstance(base_url, str) else str(base_url or ""))
-    return hashlib.sha256(json.dumps([str(get_hermes_home()), endpoint, _credential_identity(api_key)]).encode("utf-8")).hexdigest()
 
 
-def _remember_endpoint_models(memo_key: str, cache: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Store a snapshot (caller holds ``_endpoint_model_metadata_lock``); oldest beyond the bound are evicted."""
-    _endpoint_model_metadata_cache[memo_key] = cache
-    _endpoint_model_metadata_cache_time[memo_key] = time.time()
-    while len(_endpoint_model_metadata_cache) > _ENDPOINT_MODEL_CACHE_MAX_SIZE:
-        oldest = min(_endpoint_model_metadata_cache, key=lambda item: _endpoint_model_metadata_cache_time.get(item, 0))
-        del _endpoint_model_metadata_cache[oldest]
-        _endpoint_model_metadata_cache_time.pop(oldest, None)
-    return cache
 
 
-def _parse_models_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    cache: dict[str, dict[str, Any]] = {}
-    for model in payload.get("data", []):
-        model_id = model.get("id") if isinstance(model, dict) else None
-        if model_id:
-            _add_model_aliases(cache, model_id, _endpoint_model_entry(model, model_id, _extract_first_int(model, _CONTEXT_LENGTH_KEYS)))
-    return cache
 
 
 def fetch_endpoint_model_metadata(
@@ -1255,7 +992,7 @@ def fetch_endpoint_model_metadata(
     if not normalized or base_url_host_matches(normalized, "openrouter.ai"):
         return {}
     local = is_local_endpoint(normalized)
-    memo_key = _endpoint_metadata_cache_key(normalized, api_key)
+    memo_key = _model_metadata_endpoint._endpoint_metadata_cache_key(normalized, api_key)
     if not native_protocol_probes:
         memo_key += "|remote-router"
     stale = None
@@ -1270,7 +1007,7 @@ def fetch_endpoint_model_metadata(
         memo = _endpoint_disk_cache_get(normalized) if stale is None and not local else None
         if memo is not None:
             with _endpoint_model_metadata_lock:
-                return _remember_endpoint_models(memo_key, memo)
+                return _model_metadata_endpoint._remember_endpoint_models(memo_key, memo)
     if cached_only:
         return {}
     with _endpoint_model_metadata_lock:
@@ -1288,7 +1025,7 @@ def fetch_endpoint_model_metadata(
             # Copy the context so the refresh resolves the same profile (TLS settings, probe caches).
             context = contextvars.copy_context()
             threading.Thread(
-                target=context.run, args=(_run_endpoint_metadata_fetch, memo_key, normalized, api_key, options, flight),
+                target=context.run, args=(_model_metadata_endpoint._run_endpoint_metadata_fetch, memo_key, normalized, api_key, options, flight),
                 kwargs={"background": True}, name="endpoint-metadata-refresh", daemon=True,
             ).start()
         return stale
@@ -1298,85 +1035,11 @@ def fetch_endpoint_model_metadata(
         if flight.done.wait(_ENDPOINT_MODEL_FETCH_WAIT_SECONDS):
             return flight.result if flight.result is not None else {}
         return {}
-    return _run_endpoint_metadata_fetch(memo_key, normalized, api_key, options, flight)
+    return _model_metadata_endpoint._run_endpoint_metadata_fetch(memo_key, normalized, api_key, options, flight)
 
 
-def _run_endpoint_metadata_fetch(memo_key, normalized, api_key, options, flight, background=False):
-    """Leader fetch: probe, store the snapshot and release followers."""
-    try:
-        result = _fetch_endpoint_model_metadata_uncached(normalized, api_key, **options)
-        with _endpoint_model_metadata_lock:
-            previous = _endpoint_model_metadata_cache.get(memo_key)
-            if background and not result and previous:
-                # A failed refresh must not replace a good snapshot with an empty one: keep it
-                # and retry in five minutes.
-                _endpoint_model_metadata_cache_time[memo_key] = time.time() - _ENDPOINT_MODEL_CACHE_TTL + 300
-                flight.result = previous
-                return previous
-            flight.result = result
-            _remember_endpoint_models(memo_key, result)
-        return result
-    except Exception:
-        # A background refresh has no caller to raise to; keep the old snapshot.
-        if background:
-            logger.debug("Background endpoint metadata refresh failed for %s", normalized, exc_info=True)
-            return {}
-        raise
-    finally:
-        # Also release followers after cancellation/BaseException. They get an unknown snapshot,
-        # and a later call may retry; no failure is invented.
-        with _endpoint_model_metadata_lock:
-            _endpoint_model_metadata_inflight.pop(memo_key, None)
-            flight.done.set()
 
 
-def _fetch_endpoint_model_metadata_uncached(
-    normalized: str, api_key: str, *, native_protocol_probes: bool = True,
-) -> dict[str, dict[str, Any]]:
-    """The probe ladder; invoked once per in-flight metadata scope (callers store the result)."""
-    local = is_local_endpoint(normalized)
-    alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
-    candidates = [normalized] + ([alternate] if alternate != normalized else [])
-    headers = _auth_headers(api_key)
-    verify = model_metadata_http.resolve_verify(normalized)
-    last_error: Optional[Exception] = None
-    if native_protocol_probes and local:
-        try:
-            # Only LM Studio's loaded-instance context must precede the standard listing; the
-            # full context fallback still detects the other local protocols when needed.
-            if detect_local_server_type(normalized, api_key=api_key, lmstudio_only=True) == "lm-studio":
-                return _lmstudio_native_models(normalized, headers)
-        except Exception as exc:
-            last_error = exc
-            _note_if_connect_timeout(exc, normalized)
-    for candidate in candidates:
-        # A connect timeout condemns the host, not the path.
-        if _endpoint_blackholed(normalized):
-            break
-        # Cache keys stay unrewritten; only the outbound target is IPv4-resolved.
-        request_candidate = _localhost_to_ipv4(candidate)
-        url = request_candidate.rstrip("/") + "/models"
-        try:
-            with model_metadata_http.stream(url, headers=headers, timeout=(5, 10), verify=verify) as response:
-                if response.status_code in (401, 403):
-                    logger.debug("Model metadata probe received HTTP %s from %s; stopping candidate probing", response.status_code, url)
-                    break
-                response.raise_for_status()
-                response.read()
-                payload = response.json()
-            cache = _parse_models_payload(payload)
-            if native_protocol_probes and any(m.get("owned_by") == "llamacpp" for m in payload.get("data", []) if isinstance(m, dict)):
-                with contextlib.suppress(Exception):
-                    _apply_llamacpp_props(cache, request_candidate, headers, verify)
-            if cache and not local:
-                _endpoint_disk_cache_put(normalized, cache)
-            return cache
-        except Exception as exc:
-            last_error = exc
-            _note_if_connect_timeout(exc, normalized)
-    if last_error:
-        logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
-    return {}
 
 
 def _resolve_endpoint_context_length(model: str, base_url: str, api_key: str = "", *, native_protocol_probes: bool = True) -> Optional[int]:
@@ -1861,7 +1524,7 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "", *,
     if not native_protocol_probes:
         if api_key is not None and not isinstance(api_key, str):
             return probe()
-        cache_key += ("remote-router", _endpoint_metadata_cache_key(base_url, api_key))
+        cache_key += ("remote-router", _model_metadata_endpoint._endpoint_metadata_cache_key(base_url, api_key))
     return _memo_local_probe(cache_key, probe)
 
 
@@ -1894,7 +1557,7 @@ def _openai_models_list_context(client, server_url: str, model: str) -> Optional
         return None
     # Runtime n_ctx (llama.cpp nests it under meta) beats n_ctx_train, which can exceed what the server allocates.
     sources = [s for s in (matched, matched.get("meta") or {}) if isinstance(s, dict)]
-    for reader in (lambda src: _positive_int(src.get("n_ctx")), _context_length_from_model_payload):
+    for reader in (lambda src: _positive_int(src.get("n_ctx")), _model_metadata_payloads._context_length_from_model_payload):
         for source in sources:
             ctx = reader(source)
             if ctx is not None:
@@ -1933,7 +1596,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         if server_type is None:
             return None
         resp = client.get(f"{server_url}/v1/models/{model}")
-        return _context_length_from_model_payload(resp.json()) if resp.status_code == 200 else None
+        return _model_metadata_payloads._context_length_from_model_payload(resp.json()) if resp.status_code == 200 else None
     typed = {
         "ollama": _ollama_ctx,
         "lm-studio": lambda client: _lmstudio_context(client, lmstudio_url, model),

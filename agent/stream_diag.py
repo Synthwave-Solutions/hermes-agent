@@ -56,8 +56,9 @@ def stream_diag_start_timing(agent: Any, diag: dict) -> None:
             "_timing_request": identity(getattr(agent, "_current_api_request_id", None)),
             "_timing_call_count": getattr(agent, "_api_call_count", None),
         })
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("stream_diag_start_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
 def stream_diag_mark_timing(diag: dict, mark: str) -> None:
@@ -70,8 +71,9 @@ def stream_diag_mark_timing(diag: dict, mark: str) -> None:
         diag["_timing_offsets"].setdefault(
             mark, max(0.0, (_timing_clock() - diag["_timing_started"]) * 1000)
         )
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("stream_diag_mark_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
 def log_stream_attempt_timing(diag: dict, *, attempt: int, outcome: str) -> None:
@@ -107,8 +109,9 @@ def log_stream_attempt_timing(diag: dict, *, attempt: int, outcome: str) -> None
         }
         diag["_timing_logged"] = True
         logger.info("stream_attempt_timing %s", json.dumps(row, separators=(",", ":")))
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("log_stream_attempt_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
 def stream_diag_capture_response(agent: Any, diag: dict[str, Any], http_response: Any) -> None:

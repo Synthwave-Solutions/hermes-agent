@@ -35,7 +35,7 @@ def _chat_completion_capturing_headers(agent, client, api_kwargs: dict):
     if not callable(parse):
         return raw
     if capture_route:
-        from agent.chat_completion_helpers import _extract_omniroute_route
+        from agent.chat_completion_gateway import _extract_omniroute_route
         route = _extract_omniroute_route(raw)
         if route:
             agent._omniroute_route_info = route

@@ -1158,7 +1158,7 @@ class TestGetTextAuxiliaryClient:
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
              patch("agent.auxiliary_client._resolve_codex_credential_and_base",
                    return_value=(None, "https://chatgpt.com/backend-api/codex")), \
-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+             patch("agent.auxiliary_client_gateway._resolve_api_key_provider", return_value=(None, None)):
             client, model = get_text_auxiliary_client()
         assert client is None
         assert model is None
@@ -1558,7 +1558,7 @@ class TestTryPaymentFallback:
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_nous", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)), \
+             patch("agent.auxiliary_client_gateway._resolve_api_key_provider", return_value=(None, None)), \
              patch("agent.auxiliary_client._read_main_provider", return_value="auto"):
             client, model, label = _try_payment_fallback("openrouter")
         assert client is None
@@ -2125,7 +2125,7 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
         lambda pid: False,
     )
 
-    from agent.auxiliary_client import _resolve_api_key_provider
+    from agent.auxiliary_client_gateway import _resolve_api_key_provider
     _resolve_api_key_provider()
 
     assert "anthropic" not in called, \
@@ -2160,7 +2160,7 @@ def test_resolve_api_key_provider_skips_unconfigured_copilot(monkeypatch):
         lambda pid: False,
     )
 
-    from agent.auxiliary_client import _resolve_api_key_provider
+    from agent.auxiliary_client_gateway import _resolve_api_key_provider
     client, model = _resolve_api_key_provider()
 
     assert client is None
@@ -4441,7 +4441,7 @@ class TestAuxUnhealthyCache:
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
              patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
              patch("agent.auxiliary_client._try_custom_endpoint") as custom_try, \
-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+             patch("agent.auxiliary_client_gateway._resolve_api_key_provider", return_value=(None, None)):
             client, _model, label = _try_payment_fallback("openrouter", task="compression")
         assert client is nous_client
         assert label == "nous"

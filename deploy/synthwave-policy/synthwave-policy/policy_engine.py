@@ -37,6 +37,8 @@ ties go to the first rule (profile rules first, then global rules in file order)
 
 from __future__ import annotations
 
+import logging
+
 import fnmatch
 import hashlib
 import json
@@ -152,6 +154,86 @@ def _lookup_name(inner: str) -> Optional[str]:
 _HEREDOC_START = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z0-9_.\-]+)\2")
 
 
+def _consume_double_quote(text, i, cur, extra, _depth):
+    quote = '"'
+    ch, n = text[i], len(text)
+    if ch == "\\" and i + 1 < n:
+        cur.append(text[i:i + 2])
+        i += 2
+        return i, quote
+    if ch == '"':
+        quote = ""
+        cur.append(ch)
+        i += 1
+        return i, quote
+    if text.startswith("$(", i) and not text.startswith("$((", i):
+        inner, j = _read_balanced(text, i + 2)
+        extra.extend(split_shell(inner, _depth + 1))
+        cur.append(text[i:j])
+        i = j
+        return i, quote
+    if ch == "`":
+        j = text.find("`", i + 1)
+        j = n if j < 0 else j
+        extra.extend(split_shell(text[i + 1:j], _depth + 1))
+        cur.append(text[i:j + 1])
+        i = j + 1
+        return i, quote
+    cur.append(ch)
+    i += 1
+    return i, quote
+
+
+def _consume_heredocs(text, start, pending):
+    n = len(text)
+    seg_heredocs: list[str] = []
+    pos = start
+    for delim, strip_tabs in pending:
+        body_lines: list[str] = []
+        while pos <= n:
+            j = text.find("\n", pos)
+            line = text[pos:] if j < 0 else text[pos:j]
+            pos = n + 1 if j < 0 else j + 1
+            check = line.lstrip("\t") if strip_tabs else line
+            if check.strip() == delim:
+                break
+            body_lines.append(line)
+        seg_heredocs.append("\n".join(body_lines))
+    return pos, seg_heredocs
+
+
+def _flush_shell_segment(out, cur, cur_heredocs, piped=False):
+    seg = "".join(cur).strip()
+    if seg or cur_heredocs:
+        out.append((seg, list(cur_heredocs), piped))
+    cur.clear()
+    cur_heredocs.clear()
+
+
+def _consume_unquoted_substitution(text, i, cur, extra, _depth):
+    ch, n = text[i], len(text)
+    if text.startswith("$(", i):
+        inner, j = _read_balanced(text, i + 2)
+        extra.extend(split_shell(inner, _depth + 1))
+        cur.append(_lookup_name(inner) or "__SUBST__")
+        i = j
+        return i
+    if text.startswith("<(", i) or text.startswith(">(", i):
+        inner, j = _read_balanced(text, i + 2)
+        extra.extend(split_shell(inner, _depth + 1))
+        cur.append("__SUBST__")
+        i = j
+        return i
+    if ch == "`":
+        j = text.find("`", i + 1)
+        j = n if j < 0 else j
+        extra.extend(split_shell(text[i + 1:j], _depth + 1))
+        cur.append(_lookup_name(text[i + 1:j]) or "__SUBST__")
+        i = j + 1
+        return i
+    return None
+
+
 def split_shell(text: str, _depth: int = 0) -> list[tuple[str, list[str], bool]]:
     """Split a shell string into (segment_text, heredoc_bodies, piped) tuples.
 
@@ -173,13 +255,6 @@ def split_shell(text: str, _depth: int = 0) -> list[tuple[str, list[str], bool]]
     i = 0
     n = len(text)
 
-    def flush(piped: bool = False) -> None:
-        seg = "".join(cur).strip()
-        if seg or cur_heredocs:
-            out.append((seg, list(cur_heredocs), piped))
-        cur.clear()
-        cur_heredocs.clear()
-
     while i < n:
         ch = text[i]
         if quote == "'":
@@ -189,30 +264,7 @@ def split_shell(text: str, _depth: int = 0) -> list[tuple[str, list[str], bool]]
             i += 1
             continue
         if quote == '"':
-            if ch == "\\" and i + 1 < n:
-                cur.append(text[i:i + 2])
-                i += 2
-                continue
-            if ch == '"':
-                quote = ""
-                cur.append(ch)
-                i += 1
-                continue
-            if text.startswith("$(", i) and not text.startswith("$((", i):
-                inner, j = _read_balanced(text, i + 2)
-                extra.extend(split_shell(inner, _depth + 1))
-                cur.append(text[i:j])
-                i = j
-                continue
-            if ch == "`":
-                j = text.find("`", i + 1)
-                j = n if j < 0 else j
-                extra.extend(split_shell(text[i + 1:j], _depth + 1))
-                cur.append(text[i:j + 1])
-                i = j + 1
-                continue
-            cur.append(ch)
-            i += 1
+            i, quote = _consume_double_quote(text, i, cur, extra, _depth)
             continue
         # unquoted
         if ch == "\\" and i + 1 < n:
@@ -232,28 +284,13 @@ def split_shell(text: str, _depth: int = 0) -> list[tuple[str, list[str], bool]]
             i = n if j < 0 else j
             continue
         if text.startswith("$((", i):
-            inner, j = _read_balanced(text, i + 3)
+            _inner, j = _read_balanced(text, i + 3)
             cur.append(text[i:j])
             i = j
             continue
-        if text.startswith("$(", i):
-            inner, j = _read_balanced(text, i + 2)
-            extra.extend(split_shell(inner, _depth + 1))
-            cur.append(_lookup_name(inner) or "__SUBST__")
-            i = j
-            continue
-        if text.startswith("<(", i) or text.startswith(">(", i):
-            inner, j = _read_balanced(text, i + 2)
-            extra.extend(split_shell(inner, _depth + 1))
-            cur.append("__SUBST__")
-            i = j
-            continue
-        if ch == "`":
-            j = text.find("`", i + 1)
-            j = n if j < 0 else j
-            extra.extend(split_shell(text[i + 1:j], _depth + 1))
-            cur.append(_lookup_name(text[i + 1:j]) or "__SUBST__")
-            i = j + 1
+        next_position = _consume_unquoted_substitution(text, i, cur, extra, _depth)
+        if next_position is not None:
+            i = next_position
             continue
         if text.startswith("<<<", i):
             cur.append("<<<")
@@ -269,43 +306,61 @@ def split_shell(text: str, _depth: int = 0) -> list[tuple[str, list[str], bool]]
         if ch == "\n":
             if pending:
                 # Consume heredoc bodies that start on the next line.
-                seg_heredocs: list[str] = []
-                pos = i + 1
-                for delim, strip_tabs in pending:
-                    body_lines: list[str] = []
-                    while pos <= n:
-                        j = text.find("\n", pos)
-                        line = text[pos:] if j < 0 else text[pos:j]
-                        pos = n + 1 if j < 0 else j + 1
-                        check = line.lstrip("\t") if strip_tabs else line
-                        if check.strip() == delim:
-                            break
-                        body_lines.append(line)
-                    seg_heredocs.append("\n".join(body_lines))
+                pos, seg_heredocs = _consume_heredocs(text, i + 1, pending)
                 pending.clear()
                 cur_heredocs.extend(seg_heredocs)
-                flush()
+                _flush_shell_segment(out, cur, cur_heredocs, )
                 i = pos
                 continue
-            flush()
+            _flush_shell_segment(out, cur, cur_heredocs, )
             i += 1
             continue
         if ch == "|":
             if text.startswith("||", i):
-                flush()
+                _flush_shell_segment(out, cur, cur_heredocs, )
                 i += 2
                 continue
-            flush(piped=True)
+            _flush_shell_segment(out, cur, cur_heredocs, piped=True)
             i += 2 if text.startswith("|&", i) else 1
             continue
         if ch in ";&()":
-            flush()
+            _flush_shell_segment(out, cur, cur_heredocs, )
             i += 1
             continue
         cur.append(ch)
         i += 1
-    flush()
+    _flush_shell_segment(out, cur, cur_heredocs, )
     return out + extra
+
+
+def _strip_env_wrapper(argv, i):
+    i += 1
+    while i < len(argv) and (argv[i].startswith("-") or _ENV_ASSIGN.match(argv[i])):
+        a = argv[i]
+        split_val = None
+        if a in ("-S", "--split-string") and i + 1 < len(argv):
+            split_val = argv[i + 1]
+            argv = argv[:i] + _tokenize(split_val) + argv[i + 2:]
+            break
+        if a.startswith("--split-string="):
+            split_val = a.split("=", 1)[1]
+        elif a.startswith("-S") and len(a) > 2:
+            split_val = a[2:]
+        if split_val is not None:
+            argv = argv[:i] + _tokenize(split_val) + argv[i + 1:]
+            break
+        if a in ("-u", "-C"):
+            i += 1
+        i += 1
+    return argv, i
+
+
+def _skip_wrapper_options(argv, i, value_options=(), *, stop_at_dash=False):
+    while i < len(argv) and argv[i].startswith("-") and not (stop_at_dash and argv[i] == "-"):
+        if argv[i] in value_options:
+            i += 1
+        i += 1
+    return i
 
 
 def _strip_wrappers(argv: list[str]) -> list[str]:
@@ -335,53 +390,24 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             continue
         if base in _WRAPPERS_NO_ARG:
             i += 1
-            while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
-                if base == "exec" and argv[i] == "-a":
-                    i += 1
-                i += 1
+            i = _skip_wrapper_options(argv, i, ("-a",) if base == "exec" else (), stop_at_dash=True)
             continue
         if base in ("sudo", "doas"):
             i += 1
-            while i < len(argv) and argv[i].startswith("-"):
-                if argv[i] in ("-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t"):
-                    i += 1
-                i += 1
+            i = _skip_wrapper_options(argv, i, ("-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t"))
             continue
         if base == "env":
-            i += 1
-            while i < len(argv) and (argv[i].startswith("-") or _ENV_ASSIGN.match(argv[i])):
-                a = argv[i]
-                split_val = None
-                if a in ("-S", "--split-string") and i + 1 < len(argv):
-                    split_val = argv[i + 1]
-                    argv = argv[:i] + _tokenize(split_val) + argv[i + 2:]
-                    break
-                if a.startswith("--split-string="):
-                    split_val = a.split("=", 1)[1]
-                elif a.startswith("-S") and len(a) > 2:
-                    split_val = a[2:]
-                if split_val is not None:
-                    argv = argv[:i] + _tokenize(split_val) + argv[i + 1:]
-                    break
-                if a in ("-u", "-C"):
-                    i += 1
-                i += 1
+            argv, i = _strip_env_wrapper(argv, i)
             continue
         if base in ("timeout", "nice", "ionice", "chrt", "taskset"):
             i += 1
-            while i < len(argv) and argv[i].startswith("-"):
-                if argv[i] in ("-n", "-s", "-k", "-c", "-p"):
-                    i += 1
-                i += 1
+            i = _skip_wrapper_options(argv, i, ("-n", "-s", "-k", "-c", "-p"))
             if base in ("timeout", "chrt", "taskset") and i < len(argv):
                 i += 1  # duration / priority / mask
             continue
         if base in ("xargs", "watch", "flock", "parallel"):
             i += 1
-            while i < len(argv) and argv[i].startswith("-"):
-                if argv[i] in ("-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "-w", "-j"):
-                    i += 1
-                i += 1
+            i = _skip_wrapper_options(argv, i, ("-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "-w", "-j"))
             if base == "flock" and i < len(argv):
                 i += 1  # lock file
             continue
@@ -593,6 +619,52 @@ def _find_exec_commands(argv: list[str]) -> list[str]:
 _VAR_REF = re.compile(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$")
 
 
+def _resolve_command_head(argv, variables):
+    dynamic = False
+    if argv:
+        m = _VAR_REF.match(argv[0])
+        if m:
+            val = variables.get(m.group(1) or m.group(2))
+            if val:
+                argv = _strip_wrappers(_tokenize(val) + argv[1:])
+            else:
+                dynamic = True
+        elif argv[0].startswith(("$(", "`")):
+            inner = argv[0][2:-1] if argv[0].startswith("$(") else argv[0][1:-1]
+            name = _lookup_name(inner)
+            if name:
+                argv = [name] + argv[1:]
+            else:
+                dynamic = True
+        elif argv[0] == "__SUBST__" or "$" in argv[0]:
+            dynamic = True
+    if not dynamic:
+        argv = [a for a in argv if a != "__SUBST__"]
+    return argv, dynamic
+
+
+def _parse_shell_segment(seg, producer, _depth, variables):
+    argv, heredocs, herestrings = seg.argv, seg.heredocs, seg.herestrings
+    segments = []
+    stdin_mode = "-s" in argv[1:]
+    if "-c" in argv[1:]:
+        idx = argv.index("-c")
+        if idx + 1 < len(argv):
+            segments.extend(parse_command(argv[idx + 1], _depth + 1, variables))
+    else:
+        file_args = [a for a in argv[1:] if not a.startswith("-")]
+        if stdin_mode or not file_args or file_args == ["-"]:
+            bodies = heredocs + herestrings
+            text = _producer_text(producer)
+            if text is not None:
+                bodies.append(text)
+            elif producer is not None and not bodies:
+                seg.undecidable = True
+            for body in bodies:
+                segments.extend(parse_command(body, _depth + 1, variables))
+    return segments
+
+
 def parse_command(command: str, _depth: int = 0, _vars: Optional[dict[str, str]] = None) -> list[Segment]:
     """Parse a shell command string into executed simple commands (recursing into ``bash -c``,
     ``eval``, ``ssh host cmd``, ``env -S``, ``find -exec``, heredocs, here-strings and echo/printf
@@ -614,26 +686,7 @@ def parse_command(command: str, _depth: int = 0, _vars: Optional[dict[str, str]]
                 k, _, v = t.partition("=")
                 variables[k] = v
         argv = _strip_wrappers(tokens)
-        dynamic = False
-        if argv:
-            m = _VAR_REF.match(argv[0])
-            if m:
-                val = variables.get(m.group(1) or m.group(2))
-                if val:
-                    argv = _strip_wrappers(_tokenize(val) + argv[1:])
-                else:
-                    dynamic = True
-            elif argv[0].startswith(("$(", "`")):
-                inner = argv[0][2:-1] if argv[0].startswith("$(") else argv[0][1:-1]
-                name = _lookup_name(inner)
-                if name:
-                    argv = [name] + argv[1:]
-                else:
-                    dynamic = True
-            elif argv[0] == "__SUBST__" or "$" in argv[0]:
-                dynamic = True
-        if not dynamic:
-            argv = [a for a in argv if a != "__SUBST__"]
+        argv, dynamic = _resolve_command_head(argv, variables)
         targets = targets + _command_write_targets(argv)
         seg = Segment(raw=raw, argv=argv, write_targets=targets, heredocs=heredocs,
                       touch_targets=targets + _command_touch_targets(argv), herestrings=herestrings,
@@ -647,22 +700,7 @@ def parse_command(command: str, _depth: int = 0, _vars: Optional[dict[str, str]]
             continue
         cmd = argv[0]
         if cmd in _SHELLS:
-            stdin_mode = "-s" in argv[1:]
-            if "-c" in argv[1:]:
-                idx = argv.index("-c")
-                if idx + 1 < len(argv):
-                    segments.extend(parse_command(argv[idx + 1], _depth + 1, variables))
-            else:
-                file_args = [a for a in argv[1:] if not a.startswith("-")]
-                if stdin_mode or not file_args or file_args == ["-"]:
-                    bodies = heredocs + herestrings
-                    text = _producer_text(producer)
-                    if text is not None:
-                        bodies.append(text)
-                    elif producer is not None and not bodies:
-                        seg.undecidable = True
-                    for body in bodies:
-                        segments.extend(parse_command(body, _depth + 1, variables))
+            segments.extend(_parse_shell_segment(seg, producer, _depth, variables))
         elif _INTERPRETER.match(cmd):
             code, reads_stdin = _interpreter_payloads(argv)
             if reads_stdin:
@@ -864,6 +902,43 @@ def _parse_decision(value: Any, where: str) -> str:
     return d
 
 
+def _compile_profile(name, praw, seen):
+    where = f"profiles.{name}"
+    praw = praw or {}
+    if not isinstance(praw, dict):
+        raise PolicyError(f"{where}: expected a mapping")
+    unknown = set(praw) - PROFILE_KEYS
+    if unknown:
+        raise PolicyError(f"{where}: unknown key(s) {sorted(unknown)}")
+    pp = ProfilePolicy()
+    if "mode" in praw:
+        pm = str(praw["mode"]).lower()
+        if pm not in MODES:
+            raise PolicyError(f"{where}.mode must be one of {MODES}")
+        pp.mode = pm
+    pdef = praw.get("defaults") or {}
+    if not isinstance(pdef, dict):
+        raise PolicyError(f"{where}.defaults must be a mapping")
+    if "decision" in pdef:
+        pp.default_decision = _parse_decision(pdef["decision"], f"{where}.defaults.decision")
+    ov = praw.get("overrides") or {}
+    if not isinstance(ov, dict):
+        raise PolicyError(f"{where}.overrides must be a mapping of rule id to decision")
+    prules = [_compile_rule(r, f"{where}.rules[{i}]", f"profile:{name}")
+              for i, r in enumerate(praw.get("rules") or [])]
+    known = seen | {r.id for r in prules}
+    for rid, dec in ov.items():
+        if rid not in known:
+            raise PolicyError(f"{where}.overrides: unknown rule id {rid!r}")
+        pp.overrides[str(rid)] = _parse_decision(dec, f"{where}.overrides.{rid}")
+    for rid in _as_list(praw.get("disable")):
+        if rid not in known:
+            raise PolicyError(f"{where}.disable: unknown rule id {rid!r}")
+        pp.disable.append(str(rid))
+    pp.rules = prules
+    return pp
+
+
 def compile_policy(data: Any, source: str = "") -> Policy:
     if data is None:
         data = {}
@@ -901,40 +976,7 @@ def compile_policy(data: Any, source: str = "") -> Policy:
     if not isinstance(profiles_raw, dict):
         raise PolicyError("profiles must be a mapping of profile name to settings")
     for name, praw in profiles_raw.items():
-        where = f"profiles.{name}"
-        praw = praw or {}
-        if not isinstance(praw, dict):
-            raise PolicyError(f"{where}: expected a mapping")
-        unknown = set(praw) - PROFILE_KEYS
-        if unknown:
-            raise PolicyError(f"{where}: unknown key(s) {sorted(unknown)}")
-        pp = ProfilePolicy()
-        if "mode" in praw:
-            pm = str(praw["mode"]).lower()
-            if pm not in MODES:
-                raise PolicyError(f"{where}.mode must be one of {MODES}")
-            pp.mode = pm
-        pdef = praw.get("defaults") or {}
-        if not isinstance(pdef, dict):
-            raise PolicyError(f"{where}.defaults must be a mapping")
-        if "decision" in pdef:
-            pp.default_decision = _parse_decision(pdef["decision"], f"{where}.defaults.decision")
-        ov = praw.get("overrides") or {}
-        if not isinstance(ov, dict):
-            raise PolicyError(f"{where}.overrides must be a mapping of rule id to decision")
-        prules = [_compile_rule(r, f"{where}.rules[{i}]", f"profile:{name}")
-                  for i, r in enumerate(praw.get("rules") or [])]
-        known = seen | {r.id for r in prules}
-        for rid, dec in ov.items():
-            if rid not in known:
-                raise PolicyError(f"{where}.overrides: unknown rule id {rid!r}")
-            pp.overrides[str(rid)] = _parse_decision(dec, f"{where}.overrides.{rid}")
-        for rid in _as_list(praw.get("disable")):
-            if rid not in known:
-                raise PolicyError(f"{where}.disable: unknown rule id {rid!r}")
-            pp.disable.append(str(rid))
-        pp.rules = prules
-        profiles[str(name)] = pp
+        profiles[str(name)] = _compile_profile(name, praw, seen)
     return Policy(mode=mode, default_decision=default_decision, rules=rules, profiles=profiles,
                   max_bytes=max(1024, max_bytes), keep=max(0, keep), source=source)
 
@@ -1018,7 +1060,7 @@ class CallContext:
         if self._args_text is None:
             try:
                 dumped = json.dumps(self.args, ensure_ascii=False, sort_keys=True, default=str)
-            except Exception:
+            except (TypeError, ValueError):
                 dumped = str(self.args)
             # JSON escapes newlines, so also append the raw string values for multi-line text.
             text = dumped + "\n" + "\n".join(_iter_strings(self.args))
@@ -1156,6 +1198,14 @@ def _mcp_match(m: Matchers, ctx: CallContext) -> bool:
     return False
 
 
+def _removal_targets_match(segments, allowed):
+    for segment in segments:
+        targets = _rm_recursive_targets(segment)
+        if targets is not None and (not targets or any(not _glob_match(t, allowed, basename=False) for t in targets)):
+            return True
+    return False
+
+
 def _matchers_hit(m: Matchers, ctx: CallContext) -> bool:
     """All present matcher keys must match."""
     if m.tool and not any(fnmatch.fnmatchcase(ctx.tool_lower, t) for t in m.tool):
@@ -1170,17 +1220,8 @@ def _matchers_hit(m: Matchers, ctx: CallContext) -> bool:
     if m.command_text:
         if not any(p.search(ctx.command) for p in m.command_text):
             return False
-    if m.rm_allow is not None:
-        hit = False
-        for s in ctx.segments:
-            targets = _rm_recursive_targets(s)
-            if targets is None:
-                continue
-            if not targets or any(not _glob_match(t, m.rm_allow, basename=False) for t in targets):
-                hit = True
-                break
-        if not hit:
-            return False
+    if m.rm_allow is not None and not _removal_targets_match(ctx.segments, m.rm_allow):
+        return False
     if m.writes_path:
         if not any(_glob_match(t, m.writes_path) for t in ctx.write_targets()):
             return False
@@ -1312,7 +1353,7 @@ def root_home() -> Path:
     try:
         from hermes_constants import get_default_hermes_root  # type: ignore
         return Path(get_default_hermes_root())
-    except Exception:
+    except ImportError:
         return Path.home() / ".hermes"
 
 
@@ -1320,7 +1361,7 @@ def current_home() -> Path:
     try:
         from hermes_constants import get_hermes_home  # type: ignore
         return Path(get_hermes_home())
-    except Exception:
+    except ImportError:
         val = os.environ.get("HERMES_HOME", "").strip()
         return Path(os.path.expanduser(val)) if val else Path.home() / ".hermes"
 
@@ -1331,16 +1372,16 @@ def profile_for_home(home: Path) -> str:
         name = get_active_profile_name()
         if name:
             return str(name)
-    except Exception:
-        pass
+    except (ImportError, OSError, ValueError):
+        logging.getLogger(__name__).debug("profile_for_home: optional fallback used")
     try:
         resolved = home.expanduser().resolve()
         if resolved == root_home().expanduser().resolve():
             return "default"
         if resolved.parent.name == "profiles":
             return resolved.name
-    except Exception:
-        pass
+    except (OSError, RuntimeError):
+        logging.getLogger(__name__).debug("profile_for_home: optional fallback used")
     return "default"
 
 
@@ -1354,7 +1395,7 @@ def root_policy_path() -> Path:
 def _same_dir(a: Path, b: Path) -> bool:
     try:
         return a.expanduser().resolve() == b.expanduser().resolve()
-    except Exception:
+    except (OSError, RuntimeError):
         return str(a) == str(b)
 
 
@@ -1406,7 +1447,7 @@ def marker_sources(home: Path) -> dict[str, Path]:
                 continue
             data = json.loads(p.read_text(encoding="utf-8") or "{}")
             sources = data.get("sources") if isinstance(data, dict) else None
-        except Exception:
+        except (OSError, ValueError):
             sources = None
         if not isinstance(sources, list) or not sources:
             sources = ["root"]
@@ -1427,7 +1468,7 @@ def write_enforced_marker(home: Path, profile: str, sources: Iterable[str] = ("r
         try:
             data = json.loads(path.read_text(encoding="utf-8") or "{}")
             current = sorted(set(data.get("sources") or [])) if isinstance(data, dict) else []
-        except Exception:
+        except (OSError, ValueError):
             return  # never rewrite a marker we cannot read
         if set(wanted) <= set(current):
             return
@@ -1532,6 +1573,8 @@ def load_effective(home: Path, profile: str, cache: PolicyCache) -> Effective:
                              max_bytes=pol.max_bytes, keep=pol.keep, source=pol.source)
             policies.append((path, pol))
         except Exception as exc:
+            logging.getLogger(__name__).error("load_effective: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             errors.append((path, exc))
             last = cache.last_good.get(str(path))
             if raw_mode_hint(path) == "enforce" or (last is not None and (
@@ -1634,7 +1677,7 @@ def approval_rule_key(rule_id: str, tool_name: str, args: Any) -> str:
     every future send of that kind, so the key includes a hash of the tool and arguments."""
     try:
         blob = json.dumps({"t": tool_name, "a": args}, sort_keys=True, default=str, ensure_ascii=False)
-    except Exception:
+    except (TypeError, ValueError):
         blob = f"{tool_name}:{args!r}"
     return f"synthwave-policy:{rule_id}:{hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]}"
 

@@ -8,6 +8,8 @@ in neither chain (undocumented, shifting allow-list): main provider or explicit
 ``auxiliary.<task>.provider`` only. HTTP 402 in call_llm() falls through the chain.
 """
 
+import agent.auxiliary_client_gateway as _auxiliary_client_gateway
+
 from agent import model_gateway as _model_gateway
 
 import contextlib
@@ -2153,82 +2155,6 @@ def _read_codex_singleton_token() -> Optional[str]:
         return None
 
 
-def _resolve_api_key_provider() -> tuple[Optional[OpenAI], Optional[str]]:
-    """Try each API-key provider in PROVIDER_REGISTRY order; (client, model) or (None, None)."""
-    if _model_gateway.enforced():
-        return _refuse_direct_lane("api-key")
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
-    except ImportError:
-        logger.debug("Could not import PROVIDER_REGISTRY for API-key fallback")
-        return None, None
-    for provider_id, pconfig in PROVIDER_REGISTRY.items():
-        if pconfig.auth_type != "api_key":
-            continue
-        if _is_provider_unhealthy(provider_id):
-            logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
-            continue
-        if provider_id == "anthropic":
-            # Explicit-config gate: Claude Code credentials must not silently become aux fallback.
-            with contextlib.suppress(ImportError):
-                from hermes_cli.auth import is_provider_explicitly_configured
-                if not is_provider_explicitly_configured("anthropic"):
-                    continue
-            return _try_anthropic()
-        if provider_id == "copilot":
-            # Explicit-config gate: ambient gh-CLI credentials must not silently become aux fallback (#114740).
-            with contextlib.suppress(ImportError):
-                from hermes_cli.auth import is_provider_explicitly_configured
-                if not is_provider_explicitly_configured("copilot"):
-                    continue
-        model = _get_aux_model_for_provider(provider_id) or None
-        if model is None:
-            continue  # skip provider if we don't know a valid aux model
-        pool_present, entry = _select_pool_entry(provider_id)
-        if pool_present:
-            api_key = _pool_runtime_api_key(entry)
-            if not api_key:
-                continue
-            raw_base_url = _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
-            via = " via pool"
-        else:
-            creds = resolve_api_key_provider_credentials(provider_id)
-            api_key = str(creds.get("api_key", "")).strip()
-            if not api_key:
-                continue
-            raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-            via = ""
-        # The session's own endpoint wins for its provider: the key was issued for that gateway, and
-        # sending it to the registry default 401s, then quarantines the provider the main model is on.
-        runtime = _normalize_main_runtime(None)
-        if runtime.get("provider") == provider_id and runtime.get("base_url"):
-            raw_base_url = runtime["base_url"].rstrip("/")
-            if isinstance(runtime.get("api_key"), str) and runtime["api_key"]:
-                api_key = runtime["api_key"]
-            via = " (session endpoint)"
-        logger.debug("Auxiliary text client: %s (%s)%s", pconfig.name, model, via)
-        # Native Gemini, else OpenAI-wire + Anthropic rewrap.
-        base_url = _to_openai_base_url(raw_base_url)
-        if provider_id == "gemini":
-            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-            if is_native_gemini_base_url(base_url):
-                return GeminiNativeClient(api_key=api_key, base_url=base_url), model
-        if base_url_host_matches(base_url, "api.kimi.com"):
-            headers = {"User-Agent": "claude-code/0.1.0"}
-        elif base_url_host_matches(base_url, "githubcopilot.com"):
-            from hermes_cli.models import copilot_default_headers
-            headers = copilot_default_headers()
-        elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
-            headers = build_nvidia_nim_headers(base_url)
-        else:
-            headers = _profile_default_headers(provider_id)
-        extra = {"default_headers": headers} if headers else {}
-        merged = _apply_user_default_headers(extra.get("default_headers"))
-        if merged:
-            extra["default_headers"] = merged
-        client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
-        return _maybe_wrap_anthropic(client, model, api_key, raw_base_url), model
-    return None, None
 
 
 def _endpoint_default_headers(
@@ -2308,7 +2234,7 @@ def _warn_paid_lane_once(model: str) -> None:
 def _try_openrouter(explicit_api_key: Optional[str | Callable[[], str]] = None, model: str | None = None,
                     explicit_base_url: Optional[str] = None) -> tuple[Optional[OpenAI], Optional[str]]:
     if _model_gateway.enforced():
-        return _refuse_direct_lane("openrouter")
+        return _auxiliary_client_gateway._refuse_direct_lane("openrouter")
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
     if free_only and not _is_free_model(or_model):
@@ -2368,7 +2294,7 @@ def _describe_openrouter_unavailable(model: str | None = None) -> str:
 
 def _try_nous(vision: bool = False) -> tuple[Optional[OpenAI], Optional[str]]:
     if _model_gateway.enforced():
-        return _refuse_direct_lane("nous")
+        return _auxiliary_client_gateway._refuse_direct_lane("nous")
     nous = _read_nous_auth()
     runtime = _resolve_nous_runtime_api(force_refresh=False)
     if runtime is None and not nous:
@@ -2908,7 +2834,7 @@ def _validate_base_url(base_url: str) -> None:
 
 def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
     if _model_gateway.enforced():
-        return _refuse_direct_lane("local/custom")
+        return _auxiliary_client_gateway._refuse_direct_lane("local/custom")
     runtime = _resolve_custom_runtime()
     custom_base, custom_key, custom_mode = (*runtime, None) if len(runtime) == 2 else runtime
     if not custom_base or not custom_key:
@@ -2952,7 +2878,7 @@ def _build_xai_oauth_aux_client(model: str) -> tuple[Optional[Any], Optional[str
     Caller must pass an explicit model — a pinned Grok default would rot as xAI's allowlist drifts.
     """
     if _model_gateway.enforced():
-        return _refuse_direct_lane("xai-oauth")
+        return _auxiliary_client_gateway._refuse_direct_lane("xai-oauth")
     if not model:
         logger.warning(
             "Auxiliary client: xai-oauth requested without a model; "
@@ -2983,7 +2909,7 @@ def _build_codex_client(model: str) -> tuple[Optional[Any], Optional[str]]:
     No auto-selected default: the Codex model allow-list is undocumented and drifts.
     """
     if _model_gateway.enforced():
-        return _refuse_direct_lane("openai-codex")
+        return _auxiliary_client_gateway._refuse_direct_lane("openai-codex")
     if not model:
         logger.warning(
             "Auxiliary client: openai-codex requested without a model; "
@@ -3008,7 +2934,7 @@ def _try_azure_foundry(
     """Azure Foundry aux client via the main agent's ``_resolve_azure_foundry_runtime`` (api_key vs Entra
     callable bearer, per-model api_mode, base_url overrides). Returns ``(client, model)`` or ``(None, None)``."""
     if _model_gateway.enforced():
-        return _refuse_direct_lane("azure-foundry")
+        return _auxiliary_client_gateway._refuse_direct_lane("azure-foundry")
     try:
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         from hermes_cli.auth import AuthError
@@ -3063,7 +2989,7 @@ def _try_azure_foundry(
 def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
                    explicit_base_url: Optional[str] = None) -> tuple[Optional[Any], Optional[str]]:
     if _model_gateway.enforced():
-        return _refuse_direct_lane("anthropic")
+        return _auxiliary_client_gateway._refuse_direct_lane("anthropic")
     try:
         from agent.anthropic_adapter import build_anthropic_client
         from agent.anthropic_credentials import resolve_anthropic_token
@@ -3153,80 +3079,8 @@ def _normalize_main_runtime(main_runtime: Optional[dict[str, Any]]) -> dict[str,
     return normalized
 
 
-def _refuse_direct_lane(label: str) -> tuple[None, None]:
-    """A direct provider lane under ``model_gateway.enforce``: never built."""
-    logger.debug("Auxiliary: %s lane refused under model_gateway.enforce", label)
-    return None, None
 
-def _try_model_gateway() -> tuple[Optional[Any], Optional[str]]:
-    """The gateway lane of the step 3 chain (only lane under enforcement)."""
-    return _resolve_gateway_client("auto", None)
 
-def _resolve_gateway_client(
-    provider: Optional[str],
-    model: Optional[str],
-    *,
-    async_mode: bool = False,
-    explicit_base_url: Optional[str] = None,
-    explicit_api_key: Optional[str] = None,
-    main_runtime: Optional[dict[str, Any]] = None,
-    is_vision: bool = False,
-) -> tuple[Optional[Any], Optional[str]]:
-    """Build the gateway client that replaces every provider under enforcement.
-
-    The model is the caller's (a task or fallback entry) or the main model;
-    the key is the caller's own gateway key, never a provider key. A gateway
-    marked unhealthy raises ``ModelGatewayUnavailable`` instead of choosing
-    another lane.
-    """
-    if _is_provider_unhealthy(_model_gateway.GATEWAY_LABEL):
-        raise _model_gateway.ModelGatewayUnavailable(
-            "the model gateway is marked unhealthy after a failed call; "
-            "direct provider lanes are disabled by model_gateway.enforce"
-        )
-    runtime = _normalize_main_runtime(main_runtime)
-    if (provider or "").strip().lower() == "moa" and model:
-        # A MoA preset name is not a wire model; its acting model is the aggregator.
-        _agg_provider, _agg_model = _resolve_moa_aggregator(model)
-        model = _agg_model or model
-    base_url = _model_gateway.gateway_base_url()
-    fallback_key = ""
-    if explicit_base_url and _model_gateway.is_gateway_url(explicit_base_url):
-        fallback_key = explicit_api_key or ""
-    runtime_key = runtime.get("api_key")
-    if (
-        not fallback_key
-        and isinstance(runtime_key, str)
-        and _model_gateway.is_gateway_url(str(runtime.get("base_url") or ""))
-    ):
-        fallback_key = runtime_key
-    if not fallback_key and _model_gateway.is_gateway_url(_read_main_base_url()):
-        main_key = _read_main_api_key()
-        fallback_key = main_key if isinstance(main_key, str) else ""
-    try:
-        base_url, api_key = _model_gateway.require_gateway(fallback_key=fallback_key)
-    except _model_gateway.ModelGatewayUnavailable:
-        if _aux_probe_active():
-            return None, None
-        raise
-    final_model = (
-        model
-        or str(runtime.get("model") or "")
-        or _read_main_model_for_aux()
-        or _read_main_model()
-    )
-    if not final_model:
-        logger.warning(
-            "Auxiliary: no model for the gateway lane (provider=%s); set "
-            "auxiliary.<task>.model or model.default", provider or "auto",
-        )
-        return None, None
-    client = _create_openai_client(api_key=api_key, base_url=base_url)
-    client._hermes_aux_effective_provider = _model_gateway.GATEWAY_LABEL
-    if async_mode:
-        client, final_model = _to_async_client(client, final_model, is_vision=is_vision)
-        client._hermes_aux_effective_provider = _model_gateway.GATEWAY_LABEL
-    return client, final_model
 
 def _get_provider_chain() -> list[tuple]:
     """Ordered provider detection chain, built at call time so ``_try_*`` patches are picked up.
@@ -3234,10 +3088,10 @@ def _get_provider_chain() -> list[tuple]:
     ``openai-codex`` is deliberately absent (shifting allow-list breaks guessed-model fallback).
     """
     if _model_gateway.enforced():
-        return [(_model_gateway.GATEWAY_LABEL, _try_model_gateway)]
+        return [(_model_gateway.GATEWAY_LABEL, _auxiliary_client_gateway._try_model_gateway)]
     return [
         ("openrouter", _try_openrouter), ("nous", _try_nous),
-        ("local/custom", _try_custom_endpoint), ("api-key", _resolve_api_key_provider),
+        ("local/custom", _try_custom_endpoint), ("api-key", _auxiliary_client_gateway._resolve_api_key_provider),
     ]
 
 
@@ -5223,7 +5077,7 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         return _route_client(req, client, final_model)
     # Try custom first, then API-key providers (Codex excluded here:
     # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+    for try_fn in (_try_custom_endpoint, _auxiliary_client_gateway._resolve_api_key_provider):
         client, default = try_fn()
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
@@ -5524,7 +5378,7 @@ def resolve_provider_client(
     client for ``responses.stream()`` callers. ``api_mode`` forces "codex_responses"/"chat_completions"/
     "anthropic_messages" instead of auto-detect. Returns (client, resolved_model) or (None, None)."""
     if _model_gateway.enforced():
-        return _resolve_gateway_client(
+        return _auxiliary_client_gateway._resolve_gateway_client(
             provider, model, async_mode=async_mode, explicit_base_url=explicit_base_url,
             explicit_api_key=explicit_api_key, main_runtime=main_runtime, is_vision=is_vision,
         )
@@ -6499,7 +6353,7 @@ def _with_custom_endpoint_extra_body(
     if not base_url:
         return extra_body
     try:
-        from agent.agent_init import _custom_provider_extra_body_for_agent
+        from agent.agent_init_provider_routes import _custom_provider_extra_body_for_agent
         from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
         inherited = _custom_provider_extra_body_for_agent(
             provider=provider or "", model=model or "", base_url=str(base_url),

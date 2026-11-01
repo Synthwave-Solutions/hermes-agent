@@ -8,15 +8,8 @@ import { Segmented } from "@nous-research/ui/ui/components/segmented";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
-import {
-  api,
-  type GovernanceAuditEvent,
-  type GovernanceEffectiveAccessResponse,
-  type GovernanceGroupEntry,
-  type GovernanceSimulateResponse,
-  type GovernanceSubjectInput,
-  type GovernanceUserEntry,
-} from "@/lib/api";
+import { api } from "@/lib/api";
+import type { GovernanceAuditEvent, GovernanceEffectiveAccessResponse, GovernanceGroupEntry, GovernanceSimulateResponse, GovernanceSubjectInput, GovernanceUserEntry } from "@/lib/api-governance";
 import { useGovernance } from "@/contexts/useGovernance";
 
 type GovernanceTab =

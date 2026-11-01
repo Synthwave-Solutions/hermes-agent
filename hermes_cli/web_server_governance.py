@@ -94,9 +94,11 @@ def audit_governance_policy_change(
             mode=access.mode,
             extra={"action": action, "target": target, "before": before, "after": after},
         )
-    except Exception:
+    except Exception as _boundary_error:
         # Policy writes must not fail because the audit sink is temporarily unwritable; the
         # mutation itself has already been persisted.
+        logging.getLogger(__name__).error("audit_governance_policy_change: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return
 
 
@@ -137,7 +139,9 @@ def save_governance_raw_policy(raw: dict[str, Any], *, label: str) -> Path:
         return save_governance_policy(raw)
     except GovernancePolicyError as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid_policy", "message": str(exc)})
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("save_governance_raw_policy: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         _log.exception("%s failed", label)
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -249,7 +253,9 @@ def dashboard_governance_context_env_for_ws(
             request_id=channel or "",
         )
         return serialize_context_for_env(ctx)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("dashboard_governance_context_env_for_ws: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         _log.debug("failed to build dashboard governance context for WS child", exc_info=True)
         return None
 
@@ -262,5 +268,7 @@ def apply_governance_context_env(env: Optional[dict], governance_context_env: Op
         from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV
 
         env[GOVERNANCE_CONTEXT_ENV] = governance_context_env
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("apply_governance_context_env: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         _log.debug("Failed to inject dashboard governance context into chat env", exc_info=True)

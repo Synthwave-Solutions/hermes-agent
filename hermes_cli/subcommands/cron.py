@@ -251,7 +251,7 @@ def _cli_actor() -> str:
         import getpass
 
         user = getpass.getuser()
-    except Exception:
+    except (OSError, KeyError):
         user = ""
     return f"os:{user or 'unknown'}"
 

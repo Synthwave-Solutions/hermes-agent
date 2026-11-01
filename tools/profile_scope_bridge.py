@@ -39,7 +39,7 @@ def _real_home() -> str:
     try:
         import pwd
         return pwd.getpwuid(os.getuid()).pw_dir if hasattr(os, "getuid") else os.path.expanduser("~")
-    except Exception:
+    except (ImportError, OSError, KeyError):
         return os.path.expanduser("~")
 
 
@@ -67,7 +67,12 @@ def load_profile_scope():
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             _PROFILE_SCOPE_MOD = mod
+        except FileNotFoundError:
+            logger.debug("profile_scope module absent at %s", path)
+            _PROFILE_SCOPE_MOD = None
         except Exception as e:
+            logging.getLogger(__name__).error("load_profile_scope: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(e).__name__), e.__traceback__))
             if os.path.isfile(path):
                 logger.warning("profile_scope load failed: %s", e)
             else:
@@ -125,7 +130,7 @@ def is_scoped_home() -> bool:
         try:
             from hermes_constants import get_hermes_home_override
             home = get_hermes_home_override() or ""
-        except Exception:
+        except ImportError:
             home = ""
         name, profiles_root = _profile_name_from_home(
             home or os.environ.get("HERMES_HOME", ""))
@@ -136,6 +141,8 @@ def is_scoped_home() -> bool:
             return name in mod.scoped_profiles()
         marker = os.path.join(profiles_root, name, SCOPED_PROFILE_MARKER)
         return (os.path.exists(marker)
-                or os.environ.get("HERMES_PROFILE_SCOPED") == "1")
-    except Exception:
+                or os.environ.get("HERMES_PROFILE_SCOPED") == "1")  # health: allow HX002 -- legacy launcher scope attestation used only when the profile module is unavailable; config must not widen the profile boundary
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("is_scoped_home: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False

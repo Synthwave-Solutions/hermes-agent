@@ -1557,11 +1557,15 @@ def _run_no_agent_job(
         ok, output = _run_job_script_with_claim_heartbeat(
             job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
     except Exception as exc:
+        logging.getLogger(__name__).error("_run_no_agent_job: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.error("Job '%s': script execution failed (%s)", job_id, type(exc).__name__)
         try:
             from agent.redact import redact_sensitive_text
             output = redact_sensitive_text(f"Script execution failed: {exc}", force=True)
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_run_no_agent_job: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             output = "Script execution failed [details redacted]"
         ok = False
 
@@ -3244,6 +3248,8 @@ def _run_one_job_impl(
             # Arbitrary waiter errors must not claim dispatch failure or resend
             # a worker's notice. A recovered unknown execution is different:
             # its worker never committed a terminal outcome.
+            logging.getLogger(__name__).error("_run_one_job_impl: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(handoff_error).__name__), handoff_error.__traceback__))
             post_handoff = isinstance(handoff_error, _ExternalWorkerPostHandoffError)
             stage = "failed after handoff" if post_handoff else "dispatch failed"
             error = f"Restart-safe cron worker {stage}: {handoff_error}"
@@ -3690,6 +3696,17 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _redacted_cron_error(e):
+    """Even a broken redactor must never expose job secrets in a failure notice."""
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(str(e) or type(e).__name__, force=True)
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_run_one_job_body: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
+        return "Cron execution failed [details redacted]"
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
@@ -3853,11 +3870,7 @@ def _run_one_job_body(
         # "scheduled" until the run-claim TTL expires and the dispatch-limit guard removes it with no output
         # and no error. Owner fencing still applies: a stale worker must not record over a replacement claim
         # owner.
-        try:
-            from agent.redact import redact_sensitive_text
-            _err_text = redact_sensitive_text(str(e) or type(e).__name__, force=True)
-        except Exception:
-            _err_text = "Cron execution failed [details redacted]"
+        _err_text = _redacted_cron_error(e)
         logger.error("Error processing job %s (%s): %s", job["id"], type(e).__name__, _err_text)
         delivery_outcome = "suppressed"
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
@@ -4654,6 +4667,8 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
             try:
                 clear_run_claim(job["id"])
             except Exception as exc:
+                logging.getLogger(__name__).error("_process_due_job: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
                 logger.warning("Job %s: could not clear refused run claim: %s", job["id"], exc)
         return True
     except OSError as exc:

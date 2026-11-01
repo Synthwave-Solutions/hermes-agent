@@ -7,10 +7,7 @@ July 2026 incident: a custom provider with a multi-model catalog
 was silently dropped — every request billed at standard tier (~2.3x).
 """
 
-from agent.agent_init import (
-    _custom_provider_extra_body_for_agent,
-    _custom_provider_model_matches,
-)
+from agent.agent_init_provider_routes import _custom_provider_extra_body_for_agent, _custom_provider_model_matches
 
 BASE = "https://api.openai.com/v1"
 

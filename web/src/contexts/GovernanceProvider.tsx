@@ -5,7 +5,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, type GovernanceEffectiveAccessResponse } from "@/lib/api";
+import { api } from "@/lib/api";
+import type { GovernanceEffectiveAccessResponse } from "@/lib/api-governance";
 import { GovernanceContext, fallbackAccess } from "@/contexts/governance-context";
 
 function setAllows(values: Set<string>, value: string): boolean {

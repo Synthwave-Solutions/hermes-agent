@@ -49,6 +49,8 @@ several people); 2 usage error.
 
 from __future__ import annotations
 
+import logging
+
 import argparse
 import getpass
 import json
@@ -235,6 +237,83 @@ def _creator_standing(policies: list[Any], creator: str) -> str:
     return "unknown"
 
 
+def _inspect_ownerless_jobs(jobs, people, principal, known_policies, agent_only, errors):
+    """Classify ownerless jobs without broadening a governed creator's access."""
+    items = []
+    if len(people) == 1:
+        new_owner, action, detail, assign_as = people[0], "would_assign", "", "profile_person"
+    elif people:
+        new_owner, action, assign_as = "", "left", ""
+        detail = (
+            "this profile belongs to several people ("
+            + ", ".join(people)
+            + "): an administrator must choose with hermes cron reassign-owner"
+        )
+    else:
+        new_owner, action, detail, assign_as = principal, "would_assign", "", "principal"
+    for job in jobs:
+        if str(job.get("owner_email") or "").strip():
+            continue
+        kind = "script" if job.get("no_agent") else "agent"
+        if agent_only and kind == "script":
+            continue
+        item = {
+            "id": str(job["id"]),
+            "name": str(job.get("name") or ""),
+            "kind": kind,
+            "enabled": job.get("enabled", True) is not False,
+            "action": action,
+            "new_owner": new_owner,
+            "detail": detail,
+            "assign_as": assign_as,
+        }
+        creator = _job_creator(job)
+        if creator and known_policies:
+            try:
+                standing = _creator_standing(known_policies, creator)
+            except Exception as exc:
+                logging.getLogger(__name__).error("inspect_store: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
+                errors.append(f"The creator of job {item['id']} could not be checked: {exc}")
+                standing = "unknown"
+            if standing == "person":
+                item.update(
+                    action="would_assign",
+                    new_owner=creator,
+                    detail=f"created by {creator}",
+                    assign_as="creator",
+                )
+            elif standing == "unknown":
+                item.update(
+                    action="left",
+                    new_owner="",
+                    detail=(
+                        f"created by {creator}, who has no entry in the governance policy: "
+                        "an administrator must choose with hermes cron reassign-owner"
+                    ),
+                    assign_as="",
+                )
+        items.append(item)
+    return items
+
+
+def _profile_owners(home, policy, platform_policy, root, errors):
+    # Whose own profile this is: the people are defined in the platform
+    # policy, and a profile with a policy of its own may name them too.
+    people: list[str] = []
+    if policy is not None and root is not None:
+        try:
+            for known in (policy, platform_policy):
+                if known is not None:
+                    people.extend(p for p in _profile_people(known, home.name) if p not in people)
+        except Exception as exc:
+            logging.getLogger(__name__).error("inspect_store: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
+            errors.append(f"Who this profile belongs to could not be read: {exc}")
+    people.sort()
+    return people
+
+
 def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> dict[str, Any]:
     """Read one store and decide what ``--apply`` would do. Writes nothing.
 
@@ -280,6 +359,8 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> d
     try:
         config = _read_yaml(home / "config.yaml")
     except Exception as exc:
+        logging.getLogger(__name__).error("inspect_store: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         report["errors"].append(f"config.yaml could not be read: {exc}")
         config = {}
     configured = system_principal_from_config(config)
@@ -314,6 +395,8 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> d
         report["policy_file"] = str(policy_path)
         policy = load_governance_policy(path=policy_path)
     except Exception as exc:
+        logging.getLogger(__name__).error("inspect_store: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         report["errors"].append(f"The governance policy could not be read: {exc}")
     if policy is not None:
         report["governance_mode"] = policy.mode
@@ -347,6 +430,8 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> d
                 hermes_home=root, config=read_config_file(root / "config.yaml")
             )
         except Exception as exc:
+            logging.getLogger(__name__).error("inspect_store: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             report["errors"].append(f"The platform governance policy could not be read: {exc}")
         else:
             report["warnings"].append(
@@ -355,77 +440,18 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> d
                 "the platform policy governs this profile instead."
             )
 
-    # Whose own profile this is: the people are defined in the platform
-    # policy, and a profile with a policy of its own may name them too.
-    people: list[str] = []
-    if policy is not None and root is not None:
-        try:
-            for known in (policy, platform_policy):
-                if known is not None:
-                    people.extend(p for p in _profile_people(known, home.name) if p not in people)
-        except Exception as exc:
-            report["errors"].append(f"Who this profile belongs to could not be read: {exc}")
-    people.sort()
+    people = _profile_owners(home, policy, platform_policy, root, report["errors"])
     report["profile_people"] = people
 
     try:
         jobs = _read_jobs(home)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
         report["errors"].append(f"cron/jobs.json could not be read: {exc}")
         jobs = []
-    if len(people) == 1:
-        new_owner, action, detail, assign_as = people[0], "would_assign", "", "profile_person"
-    elif people:
-        new_owner, action, assign_as = "", "left", ""
-        detail = (
-            "this profile belongs to several people ("
-            + ", ".join(people)
-            + "): an administrator must choose with hermes cron reassign-owner"
-        )
-    else:
-        new_owner, action, detail, assign_as = principal, "would_assign", "", "principal"
     known_policies = [known for known in (policy, platform_policy) if known is not None]
-    for job in jobs:
-        if str(job.get("owner_email") or "").strip():
-            continue
-        kind = "script" if job.get("no_agent") else "agent"
-        if agent_only and kind == "script":
-            continue
-        item = {
-            "id": str(job["id"]),
-            "name": str(job.get("name") or ""),
-            "kind": kind,
-            "enabled": job.get("enabled", True) is not False,
-            "action": action,
-            "new_owner": new_owner,
-            "detail": detail,
-            "assign_as": assign_as,
-        }
-        creator = _job_creator(job)
-        if creator and known_policies:
-            try:
-                standing = _creator_standing(known_policies, creator)
-            except Exception as exc:
-                report["errors"].append(f"The creator of job {item['id']} could not be checked: {exc}")
-                standing = "unknown"
-            if standing == "person":
-                item.update(
-                    action="would_assign",
-                    new_owner=creator,
-                    detail=f"created by {creator}",
-                    assign_as="creator",
-                )
-            elif standing == "unknown":
-                item.update(
-                    action="left",
-                    new_owner="",
-                    detail=(
-                        f"created by {creator}, who has no entry in the governance policy: "
-                        "an administrator must choose with hermes cron reassign-owner"
-                    ),
-                    assign_as="",
-                )
-        report["jobs"].append(item)
+    report["jobs"] = _inspect_ownerless_jobs(
+        jobs, people, principal, known_policies, agent_only, report["errors"],
+    )
     if any(item["assign_as"] == "principal" for item in report["jobs"]):
         report["errors"].extend(principal_errors)
     else:
@@ -443,7 +469,7 @@ def inspect_other_store(home: Path) -> dict[str, Any]:
     report: dict[str, Any] = {"home": str(home), "ownerless_agent_jobs": [], "errors": []}
     try:
         report["ownerless_agent_jobs"] = _left_ownerless_agent_jobs(home)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
         report["errors"].append(f"cron/jobs.json could not be read: {exc}")
     return report
 

@@ -18,6 +18,16 @@ config/provider later), `max_iterations` (default 500, shared with subagents),
 `chat(message) -> str` is the simple interface; `run_conversation(user_message, system_message=None,
 conversation_history=None, task_id=None) -> dict` returns `final_response` + `messages`.
 
+Provider matching and governance admission live in `agent_init_provider_routes.py` and
+`agent_init_governance.py`. Gateway routing and watchdog resolution live in
+`chat_completion_gateway.py` and `chat_completion_watchdogs.py`; auxiliary gateway admission is
+in `auxiliary_client_gateway.py`. Import these owners directly, without facade re-exports.
+`model_metadata.py` retains the shared caches/locks; its `model_metadata_{disk,endpoint,payloads,protocol}`
+siblings own parsing, probing and persistence. Preserve per-profile/credential cache keys and
+the single-flight/stale-while-revalidate behavior when changing those boundaries. Request dumps,
+recovery logs and compression image eviction live in `runtime_request_diagnostics.py`,
+`turn_recovery_diagnostics.py` and `compression_media.py`, respectively.
+
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
 Entirely synchronous, with interrupt checks, budget tracking, and a one-turn grace call:

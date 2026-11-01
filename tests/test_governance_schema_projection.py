@@ -274,27 +274,28 @@ def test_invalid_continuation_cannot_project_tools(catalog, continuation):
     assert project(replace(context(), continuation_contexts=(payload,)), catalog) == []
 
 
-@pytest.mark.parametrize("restriction", ["whitelist", "deny", "resource_deny", "user_role", "bot_cli", "bot_revoke"])
-def test_projection_matches_native_per_tool_policy_and_python_barrier(catalog, restriction):
-    ctx = context()
-    if restriction == "whitelist":
-        ctx = replace(ctx, access=replace(ctx.access, access_mode="whitelist", grants=GrantSet(tools=frozenset({NAMES[0]}))))
-    elif restriction == "deny":
-        ctx = replace(ctx, access=replace(ctx.access, deny=GrantSet(tools=frozenset({NAMES[0]}))))
-    elif restriction == "resource_deny":
-        ctx = replace(ctx, access=replace(ctx.access, deny=GrantSet(file_read_roots=frozenset({"/fixture/bunq"}))))
-    elif restriction == "user_role":
-        ctx = replace(ctx, access=replace(ctx.access, access_level="user"))
-    elif restriction == "bot_cli":
-        ceiling = replace(ctx.access, grants=replace(ctx.access.grants, cli_commands=frozenset()))
-        ctx = replace(ctx, bot_access_ceiling=ceiling, bot_access_check=lambda: True)
-    else:
-        ctx = replace(ctx, bot_access_ceiling=ctx.access, bot_access_check=lambda: False)
+@pytest.mark.parametrize("build_context, blocks_host", [
+    pytest.param(lambda ctx: replace(ctx, access=replace(ctx.access,
+        access_mode="whitelist", grants=GrantSet(tools=frozenset({NAMES[0]})))), False, id="whitelist"),
+    pytest.param(lambda ctx: replace(ctx, access=replace(ctx.access,
+        deny=GrantSet(tools=frozenset({NAMES[0]})))), False, id="deny"),
+    pytest.param(lambda ctx: replace(ctx, access=replace(ctx.access,
+        deny=GrantSet(file_read_roots=frozenset({"/fixture/bunq"})))), True, id="resource_deny"),
+    pytest.param(lambda ctx: replace(ctx, access=replace(ctx.access,
+        access_level="user")), True, id="user_role"),
+    pytest.param(lambda ctx: replace(ctx, bot_access_ceiling=replace(ctx.access,
+        grants=replace(ctx.access.grants, cli_commands=frozenset())),
+        bot_access_check=lambda: True), False, id="bot_cli"),
+    pytest.param(lambda ctx: replace(ctx, bot_access_ceiling=ctx.access,
+        bot_access_check=lambda: False), False, id="bot_revoke"),
+])
+def test_projection_matches_native_per_tool_policy_and_python_barrier(catalog, build_context, blocks_host):
+    ctx = build_context(context())
     schemas = catalog + [{"type": "function", "function": {"name": name}}
                          for name in ("terminal", "execute_code", "read_file")]
     expected = [td for td in schemas if tool_allowed_for_context(ctx, td["function"]["name"], model_tools.registry).allowed]
     assert project(ctx, schemas) == expected
-    if restriction in {"resource_deny", "user_role"}:
+    if blocks_host:
         assert not {"terminal", "execute_code"} & {td["function"]["name"] for td in expected}
 
 

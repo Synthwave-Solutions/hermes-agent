@@ -441,6 +441,22 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_installed_profile_scope(_hermetic_environment, monkeypatch):
+    """The legacy scope loader uses the passwd home, which HOME cannot isolate.
+
+    Ordinary tests get an empty installation; scope-contract tests explicitly
+    install their fixture module and policy in this private location instead.
+    """
+    import tools.profile_scope_bridge as bridge
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setattr(bridge, "_PROFILE_SCOPE_PATH", str(get_hermes_home() / "profile_scope.py"))
+    bridge._reset_for_tests()
+    yield
+    bridge._reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _reset_foreground_exit_fence():
     """A test that drives a hard-exit path raises the one-way foreground-spawn fence; lower it after."""
     yield

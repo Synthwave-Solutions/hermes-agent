@@ -128,7 +128,8 @@ def compact_categories(
             if str(name).strip()
         }
 
-        root = Path(skills_dir) if skills_dir else Path.home() / ".hermes" / "skills"
+        from hermes_constants import get_hermes_home
+        root = Path(skills_dir) if skills_dir else get_hermes_home() / "skills"
         if not root.is_dir():
             return frozenset()
         usage = _usage_map(root)

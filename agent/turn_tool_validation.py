@@ -88,7 +88,7 @@ def _wrap_direct_deferred_call(agent: Any, tc: Any, valid_names: Any) -> bool:
 def _wrapped_name(tc: Any) -> str:
     try:
         return json.loads(tc.function.arguments)["calls"][0]["name"]
-    except Exception:
+    except (AttributeError, ValueError, TypeError, KeyError, IndexError):
         return tc.function.name
 
 

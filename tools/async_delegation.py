@@ -177,8 +177,8 @@ def _capture_routing_origin() -> dict[str, Any]:
         from gateway.session_context import get_session_env
         origin.update(
             {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))})
-    except Exception:
-        pass
+    except ImportError:
+        logger.debug("Session routing context is unavailable during delegation capture")
     return origin
 
 

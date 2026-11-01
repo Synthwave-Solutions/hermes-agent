@@ -535,6 +535,19 @@ async def _pty_channel_marker_state(
     return active_session_file, marker_preexisting, resume
 
 
+def _pty_attachment_identity(raw_attach_token, raw_resume, profile, env):
+    """Resolve a reconnect key against the canonical explicit resume target."""
+    attach_token = raw_attach_token
+    registry_resume = raw_resume
+    if raw_resume and env:
+        registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
+    if attach_token is not None and (registry_resume or profile):
+        # Key explicit resumes on their canonical target, never the active-session fallback.
+        attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+
+    return attach_token, registry_resume
+
+
 @router.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     from hermes_cli.web_server_chat import PTY_REGISTRY, PtyBridge, PtyUnavailableError, _PTY_BRIDGE_AVAILABLE, _RESIZE_RE
@@ -609,13 +622,7 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     raw_attach_token = ws.query_params.get("attach") or None
-    attach_token = raw_attach_token
-    registry_resume = raw_resume
-    if raw_resume and env:
-        registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
-    if attach_token is not None and (registry_resume or profile):
-        # Key explicit resumes on their canonical target, never the active-session fallback.
-        attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+    attach_token, registry_resume = _pty_attachment_identity(raw_attach_token, raw_resume, profile, env)
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)

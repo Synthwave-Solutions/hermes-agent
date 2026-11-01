@@ -744,7 +744,8 @@ class OpenAICompatRoutesMixin:
         self, body: dict[str, Any], *, session_id, gateway_session_key, model_alias) -> tuple:
         """Resolve the model_routes alias + per-request overrides ->
         ``(route, agent_overrides, error_response_or_None)``."""
-        from gateway.platforms.api_server import _error_response, _request_agent_overrides
+        from gateway.platforms.api_server import _error_response
+        from gateway.platforms.api_server_runtime_options import _request_agent_overrides
         route = self._resolve_route(model_alias)
         overrides = _request_agent_overrides(
             body, virtual_model=self._model_name, allow_bare_model=self._direct_model_requests)
@@ -824,10 +825,8 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
-        from gateway.platforms.api_server import (
-            ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
-            _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
-            _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+        from gateway.platforms.api_server import ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request, _openai_error, _redact_api_error_text, _resolve_media_to_data_urls
+        from gateway.platforms.api_server_runtime_options import _coerce_request_bool
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -836,7 +835,7 @@ class OpenAICompatRoutesMixin:
             body = await request.json()
         except Exception:
             return _error_response("Invalid JSON in request body", 400)
-        from gateway.platforms.api_server import _request_relay_metadata
+        from gateway.platforms.api_server_runtime_options import _request_relay_metadata
         relay_metadata = _request_relay_metadata(body)
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -1332,10 +1331,8 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_responses(self, request: web.Request) -> web.Response:
         """POST /v1/responses — OpenAI Responses API format."""
-        from gateway.platforms.api_server import (
-            ThreadSafeAsyncQueue, _coerce_request_bool,
-            _error_response, _invalid_request, _redact_api_error_text,
-            _resolve_media_to_data_urls, _responses_usage_payload)
+        from gateway.platforms.api_server import ThreadSafeAsyncQueue, _error_response, _invalid_request, _redact_api_error_text, _resolve_media_to_data_urls, _responses_usage_payload
+        from gateway.platforms.api_server_runtime_options import _coerce_request_bool
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:

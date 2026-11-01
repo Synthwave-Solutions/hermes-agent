@@ -53,7 +53,7 @@ def _safe_log(home: Path, record: dict[str, Any], policy: Optional[pe.Policy] = 
         max_bytes = policy.max_bytes if policy else pe.DEFAULT_MAX_BYTES
         keep = policy.keep if policy else pe.DEFAULT_KEEP
         pe.append_jsonl(_decision_log_path(home), record, max_bytes=max_bytes, keep=keep)
-    except Exception as exc:  # logging must never break a tool call
+    except (OSError, TypeError, ValueError) as exc:  # logging must never break a tool call
         logger.debug("synthwave-policy: decision log write failed: %s", exc)
 
 
@@ -125,7 +125,7 @@ def _lease_held_by_human(home: Path) -> bool:
         if not path.exists():
             return False
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
         return True
     return not isinstance(data, dict) or data.get("holder") != "agent"
 
@@ -160,7 +160,7 @@ def _jobs_by_id(home: Path) -> dict[str, dict[str, Any]]:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         jobs = data.get("jobs", []) if isinstance(data, dict) else data
         table = {str(j.get("id")): j for j in jobs if isinstance(j, dict) and j.get("id")}
-    except Exception:
+    except (OSError, ValueError, TypeError):
         table = {}
     _JOBS_CACHE[str(path)] = (key, table)
     return table
@@ -169,7 +169,7 @@ def _jobs_by_id(home: Path) -> dict[str, dict[str, Any]]:
 def is_scout_run(home: Path, kw: dict[str, Any]) -> bool:
     """True for a Scout cron run: the scheduler's HERMES_CRON_MANAGED_BY says scout, or the cron job
     behind this task is marked managed_by scout or runs the Scout collector script."""
-    if os.environ.get("HERMES_CRON_MANAGED_BY", "").strip().lower() == "scout":
+    if os.environ.get("HERMES_CRON_MANAGED_BY", "").strip().lower() == "scout":  # health: allow HX002 -- server-owned cron execution metadata from script_environment(), not a configurable policy setting
         return True
     job_id = _cron_job_id(kw)
     if not job_id:
@@ -216,7 +216,7 @@ def check(tool_name: str, args: Any, home: Optional[Path] = None, profile: Optio
     if sources:
         try:
             pe.write_enforced_marker(home, profile, sources)
-        except Exception as exc:
+        except OSError as exc:
             logger.debug("synthwave-policy: cannot write enforce marker: %s", exc)
 
     name = str(tool_name or "")
@@ -276,7 +276,9 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any) -> Optio
                 if path is not None and (pe.raw_mode_hint(path) == "enforce"
                                          or _CACHE.last_good_mode_for(path, profile) == "enforce"):
                     mode = "enforce"
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_on_pre_tool_call: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             mode = "enforce" if _CACHE.last_good else "observe"
         if mode == "enforce":
             return {"action": "block",
@@ -293,7 +295,7 @@ def _on_post_tool_call(tool_name: str = "", args: Any = None, result: Any = None
         data = json.loads(result) if isinstance(result, str) else result
         if isinstance(data, dict) and isinstance(data.get("url"), str):
             _remember_page(_hook_ids(kw), data["url"])
-    except Exception:
+    except (TypeError, ValueError):
         return
 
 

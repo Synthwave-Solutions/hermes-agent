@@ -142,7 +142,7 @@ def test_owner_sees_keys_and_only_the_secret_mount_is_masked(tmp_path, workroot)
 
 
 def test_caller_denied_paths_are_masked(tmp_path, workroot):
-    creds = os.path.join(str(opencode_tool._HOME), ".config/synthwave/clients")
+    creds = os.path.join(str(opencode_tool._host_home()), ".config/synthwave/clients")
     access, _, _ = _blacklist(tmp_path, workroot,
                               grants={"files": {"denied_globs": [creds, creds + "/**"]}})
     dirs, _, patterns = opencode_tool.mask_plan(access)
@@ -228,7 +228,8 @@ def test_tool_blocks_non_granted_caller(tmp_path, workroot):
 def _wrapper_copy(tmp_path, slots=1):
     fake = tmp_path / "fake-opencode"
     fake.write_text("#!/usr/bin/env bash\necho \"ARGS:$*\"\necho \"KEY:${OMNIROUTE_API_KEY:-}\"\n"
-                    "[ -n \"${SLEEP:-}\" ] && sleep \"$SLEEP\"\nexit 0\n")
+                    'if [ -n "${READY:-}" ]; then touch "$READY"; fi\n'
+                    'if [ -n "${RELEASE:-}" ]; then while [ ! -f "$RELEASE" ]; do sleep 0.01; done; fi\nexit 0\n')
     fake.chmod(0o755)
     keyfile = tmp_path / "omniroute.key"
     keyfile.write_text("secret-key\n")
@@ -256,16 +257,19 @@ def test_wrapper_guard_default_model_key_and_slots(tmp_path):
     nested = subprocess.run([str(wrapper), "run", "x"], env={**env, "OPENCODE_RECURSION_GUARD": "1"},
                             capture_output=True, text=True, timeout=20, check=False)
     assert nested.returncode == 1 and "recursion guard" in nested.stderr
-    busy = subprocess.Popen([str(wrapper), "run", "long"], env={**env, "SLEEP": "4"},
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    busy = subprocess.Popen([str(wrapper), "run", "long"],
+                            env={**env, "READY": str(ready), "RELEASE": str(release)},
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        import time
-        time.sleep(1)
+        from tests.waiting import wait_until
+        wait_until(ready.exists, timeout=10, what="first OpenCode process holds the slot")
         second = subprocess.run([str(wrapper), "run", "x"], env={**env, "OPENCODE_SLOT_WAIT": "0"},
                                 capture_output=True, text=True, timeout=20, check=False)
         assert second.returncode == 75 and "slots" in second.stderr
     finally:
-        busy.wait(timeout=20)
+        release.touch()
+        busy.communicate(timeout=20)
 
 
 def test_whitelist_gets_allowlist_home(tmp_path, workroot):

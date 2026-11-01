@@ -86,7 +86,9 @@ async def put_governance_policy(request: Request, body: dict[str, Any]):
             path = save_governance_policy(body)
         except GovernancePolicyError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("put_governance_policy: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             _log.exception("PUT /api/governance/policy failed")
             raise HTTPException(status_code=500, detail="Internal server error")
 

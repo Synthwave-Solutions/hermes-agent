@@ -1,7 +1,7 @@
 """Send-path image eviction policy shared by both stateless outbound passes.
 
 Two passes retire old tool-result images from the per-request copy of the conversation:
-``agent.context_compressor.evict_stale_outbound_tool_images`` on the OpenAI-shaped list and
+``agent.compression_media.evict_stale_outbound_tool_images`` on the OpenAI-shaped list and
 ``agent.anthropic_message_convert._evict_old_screenshots`` on the Anthropic wire list. Both run
 from scratch on a fresh clone every request, so they must agree on one policy or the second
 pass re-evicts on a different frontier than the first (#113517). This module is stdlib-only so

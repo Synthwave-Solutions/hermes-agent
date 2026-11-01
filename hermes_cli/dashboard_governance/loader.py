@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import os
 import tempfile
 from pathlib import Path
@@ -39,7 +41,9 @@ def resolve_policy_path(
     if cfg is None:
         try:
             cfg = load_config()
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("resolve_policy_path: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             cfg = {}
     dash = cfg.get("dashboard") if isinstance(cfg.get("dashboard"), Mapping) else {}
     gov = dash.get("governance") if isinstance(dash.get("governance"), Mapping) else {}

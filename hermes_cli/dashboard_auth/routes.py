@@ -560,7 +560,9 @@ async def api_auth_me(request: Request):
 
         access = getattr(request.state, "governance_access", None) or effective_access_for_request(request)
         payload["governance"] = serialize_effective_access(access)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("api_auth_me: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         _log.exception("dashboard-auth: failed to attach governance summary to /api/auth/me")
     return payload
 

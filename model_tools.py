@@ -210,7 +210,9 @@ def _current_dashboard_governance_context():
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
         return current_governance_context()
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_current_dashboard_governance_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return None
 
 
@@ -223,7 +225,9 @@ def _governance_cache_fingerprint():
                 and not getattr(ctx, "workspace_path", "")):
             return None
         return ctx.cache_fingerprint()
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_governance_cache_fingerprint: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return None
 
 
@@ -233,6 +237,8 @@ def _governance_tool_decision(tool_name: str):
         from hermes_cli.dashboard_governance.tool_policy import tool_allowed_for_context
         return tool_allowed_for_context(ctx, tool_name, registry)
     except Exception as exc:
+        logging.getLogger(__name__).error("_governance_tool_decision: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("dashboard governance tool policy failed for %s: %s", tool_name, exc)
         # Fail closed only when an enforce context is active; otherwise preserve
         # legacy CLI/gateway behavior if the governance package cannot import.
@@ -240,8 +246,9 @@ def _governance_tool_decision(tool_name: str):
             if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 from hermes_cli.dashboard_governance.models import AccessDecision
                 return AccessDecision(False, "governance_policy_error")
-        except Exception:
-            pass
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_governance_tool_decision: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return None
 
 
@@ -267,13 +274,16 @@ def _governance_argument_decision(tool_name: str, function_args: dict[str, Any])
         from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
         return tool_arguments_allowed_for_context(ctx, tool_name, function_args)
     except Exception as exc:
+        logging.getLogger(__name__).error("_governance_argument_decision: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("dashboard governance argument policy failed for %s: %s", tool_name, exc)
         try:
             if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 from hermes_cli.dashboard_governance.models import AccessDecision
                 return AccessDecision(False, "governance_argument_policy_error")
-        except Exception:
-            pass
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_governance_argument_decision: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return None
 
 
@@ -283,13 +293,16 @@ def _governance_usage_decision(tool_name: str, args: Optional[dict[str, Any]] = 
         from hermes_cli.dashboard_governance.usage import check_usage_caps
         return check_usage_caps(ctx, tool_name, args or {})
     except Exception as exc:
+        logging.getLogger(__name__).error("_governance_usage_decision: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("dashboard governance usage cap check failed for %s: %s", tool_name, exc)
         try:
             if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
                 from hermes_cli.dashboard_governance.models import AccessDecision
                 return AccessDecision(False, "governance_usage_policy_error")
-        except Exception:
-            pass
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_governance_usage_decision: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return None
 
 
@@ -299,6 +312,8 @@ def _governance_record_tool_usage(tool_name: str, args: Optional[dict[str, Any]]
         from hermes_cli.dashboard_governance.usage import record_tool_usage
         record_tool_usage(ctx, tool_name, args or {})
     except Exception as exc:
+        logging.getLogger(__name__).error("_governance_record_tool_usage: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("dashboard governance usage recording failed for %s: %s", tool_name, exc)
 
 
@@ -314,7 +329,9 @@ def _filter_tools_by_governance(tool_defs: list[dict[str, Any]], *, _scope_statu
         if _scope_status is not None:
             _scope_status.append(projection.scope_allowed)
         return [td for td, name in zip(tool_defs, names) if name in projection.names]
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_filter_tools_by_governance: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         if _scope_status is not None:
             _scope_status.append(False)
         return []
@@ -330,7 +347,9 @@ def _recheck_cached_tool_projection(tool_defs):
         try:
             from hermes_cli.dashboard_governance.tool_policy import tool_projection_scope_allowed
             allowed = tool_projection_scope_allowed(ctx)
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_recheck_cached_tool_projection: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             allowed = False
     result = list(tool_defs) if allowed else []
     global _last_resolved_tool_names
@@ -1124,8 +1143,9 @@ def _wait_for_governance_grant(ctx, tool_name, function_args, reason, detail, to
             if callable(finish):
                 try:
                     finish(operation.get("operation_id"), False)
-                except Exception:
-                    pass
+                except Exception as _boundary_error:
+                    logging.getLogger(__name__).error("_wait_for_governance_grant: operation failed",
+                        exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
 
@@ -1147,7 +1167,9 @@ def _governance_denial_payload(ctx, tool_name, reason, detail="", *, tool_call_i
 
         filed = record_denial(ctx, tool_name, reason, detail, tool_call_id=tool_call_id, dispatch_session_id=dispatch_session_id)
         approvers = approver_emails() if filed else []
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_governance_denial_payload: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         approvers = []
     payload = {
         "required_behavior": _GOVERNANCE_DENY_GUIDANCE,

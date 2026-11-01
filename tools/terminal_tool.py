@@ -1537,7 +1537,9 @@ def terminal_tool(
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 env=env,
             )
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("terminal_tool: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             _guard_cwd = getattr(env, "cwd", None) or cwd
 
         # Profile scope guard runs UNCONDITIONALLY, before the force

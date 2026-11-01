@@ -270,7 +270,9 @@ def _is_scoped_profile_home() -> bool:
     try:
         from tools import profile_scope_bridge
         return profile_scope_bridge.is_scoped_home()
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_is_scoped_profile_home: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 
@@ -318,7 +320,9 @@ def _check_profile_scope_path(filepath: str, mode: str = "read",
             return None
         return (f"Blocked by profile scope ({profile}): {reason}. This profile "
                 f"may only access its assigned project folders.")
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_check_profile_scope_path: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         if _is_scoped_profile_home():
             return "Blocked: profile-scope guard error (fail-closed)."
         return None
@@ -406,14 +410,17 @@ def _filter_profile_scope_search_results(result, task_id: str = "default") -> in
         try:
             from tools.memory_tool import personal_memory_scope_active
             governed = governed or personal_memory_scope_active()
-        except Exception:
-            pass
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_filter_profile_scope_search_results: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         mod = _profile_scope_mod()
         if not governed and mod is not None and not mod.is_scoped(mod.resolve_profile()):
             return 0
         if not governed and mod is None and not _is_scoped_profile_home():
             return 0
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_filter_profile_scope_search_results: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         if not locals().get("governed") and not _is_scoped_profile_home():
             return 0
 
@@ -796,6 +803,23 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     return count
 
 
+def _special_read_refusal(path, resolved, task_id):
+    """Refuse host FIFOs/sockets before document extraction or regular reads."""
+    # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
+    if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        kind = _special_file_kind(resolved)
+        if kind is not None:
+            return json.dumps({
+                "success": False,
+                "note": (
+                    f"'{path}' is {kind}, not a regular file — reading "
+                    "it would block indefinitely, so no read was "
+                    "attempted. Use terminal utilities if you need to "
+                    "interact with it.")})
+
+    return None
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers.
 
@@ -829,17 +853,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
-        # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
-            kind = _special_file_kind(_resolved)
-            if kind is not None:
-                return json.dumps({
-                    "success": False,
-                    "note": (
-                        f"'{path}' is {kind}, not a regular file — reading "
-                        "it would block indefinitely, so no read was "
-                        "attempted. Use terminal utilities if you need to "
-                        "interact with it.")})
+        special_result = _special_read_refusal(path, _resolved, task_id)
+        if special_result is not None:
+            return special_result
 
         # Hermes internal denylist (prompt injection via catalog metadata,
         # credential stores). Runs BEFORE document extraction so a

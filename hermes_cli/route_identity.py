@@ -112,7 +112,7 @@ def should_clear_context_pin(configured_model: Any, active_model: Any, configure
     if configured_model and configured_model != str(active_model or "").strip():
         return True
     try:
-        from agent.agent_init import _context_route_mismatch
+        from agent.agent_init_provider_routes import _context_route_mismatch
         return _context_route_mismatch(configured_base_url, active_base_url, configured_provider, active_provider)
     except Exception:
         return True

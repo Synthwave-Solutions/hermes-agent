@@ -8,6 +8,8 @@ and a duplicate refusal must say which claim came from the environment.
 """
 from __future__ import annotations
 
+import gateway.run_profile_config as _run_profile_config
+
 from pathlib import Path
 from typing import Sequence
 
@@ -59,7 +61,7 @@ class TestProfileEnvIsNotThePrimaryClaim:
         default_home, worker_home = _two_homes(tmp_path)
         _inherit_worker_env(monkeypatch, worker_home)
 
-        cfg = run_mod.load_gateway_config_for_runner()
+        cfg = _run_profile_config.load_gateway_config_for_runner()
 
         assert cfg.multiplex_profiles is True
         telegram = cfg.platforms.get(Platform.TELEGRAM)

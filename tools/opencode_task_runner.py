@@ -25,6 +25,8 @@ The report (stdout) is what the completion notification delivers to the agent.
 
 from __future__ import annotations
 
+import logging
+
 import fnmatch
 import hashlib
 import json
@@ -329,6 +331,8 @@ def main(job_dir: str) -> int:
             try:
                 workroot, git_info = prepare_worktree(job)
             except Exception as exc:
+                logging.getLogger(__name__).error("main: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
                 print("\n".join(report + ["status: failed", f"reason: {exc}"]))
                 return 1
         else:

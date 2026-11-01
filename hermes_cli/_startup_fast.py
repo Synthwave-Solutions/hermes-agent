@@ -24,6 +24,8 @@ toward the slow path, which then does the authoritative parse).
 
 from __future__ import annotations
 
+import logging
+
 import os
 import sys
 
@@ -206,7 +208,9 @@ def print_fast_version_info(*, check_updates: bool = True) -> None:
             from hermes_cli.skin_engine import get_active_skin
 
             agent_name = get_active_skin().get_branding("agent_name", "Hermes Agent") or "Hermes Agent"
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("print_fast_version_info: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             agent_name = "Hermes Agent"
         print(f"{agent_name} v{get_version_info().derived_version} ({__release_date__})")
     print(f"Install directory: {project_root_str()}")

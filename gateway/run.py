@@ -3,6 +3,8 @@
 Provides ``start_gateway()`` (start all configured adapters) and ``GatewayRunner`` (lifecycle).
 Run via ``python -m gateway.run`` or ``python cli.py --gateway``."""
 
+import gateway.run_profile_config as _run_profile_config
+
 # hermes_bootstrap must be the very first import (UTF-8 stdio on Windows; no-op on POSIX).
 try:
     import hermes_bootstrap
@@ -1850,81 +1852,8 @@ _ROOT_CREDENTIAL_VARS = (
 _ROOT_CREDENTIAL_CACHE: dict = {"mtime": None, "values": set()}
 
 
-def _synthpulse_root_shared_credential(adapter: Any, profile_home: Any = None) -> bool:
-    """True when the adapter's credential equals one in the root profile's .env
-    while this process is NOT the root profile's gateway (multiplexer next to
-    the main gateway). The root is derived from the REAL profile directory
-    (<root>/profiles/<name>, symlinks resolved), because a multiplexer runs
-    under its own HERMES_HOME. Compared by the same fingerprint the duplicate
-    detection uses, so plugin adapters that keep the token elsewhere are
-    covered. Fail-open: any error means "not shared"."""
-    try:
-        from hermes_constants import get_hermes_home
-        real = Path(profile_home).resolve() if profile_home else None
-        if real is None or real.parent.name != "profiles":
-            return False
-        root = real.parent.parent
-        if Path(get_hermes_home()).resolve() == root.resolve():
-            return False
-        env_path = root / ".env"
-        st = env_path.stat()
-        if _ROOT_CREDENTIAL_CACHE["mtime"] != st.st_mtime_ns:
-            from agent.secret_scope import load_env_file
-            import hashlib
-            values = load_env_file(env_path)
-            _ROOT_CREDENTIAL_CACHE["values"] = {
-                hashlib.sha256(("hermes-mux:" + str(values.get(k) or "").strip()).encode("utf-8")).hexdigest()[:16]
-                for k in _ROOT_CREDENTIAL_VARS if str(values.get(k) or "").strip()
-            }
-            _ROOT_CREDENTIAL_CACHE["mtime"] = st.st_mtime_ns
-        fingerprint = GatewayRunner._adapter_credential_fingerprint(adapter)
-        shared = bool(fingerprint) and fingerprint in _ROOT_CREDENTIAL_CACHE["values"]
-        logger.info("[MULTIPLEX] root-credential guard: profile_home=%s root=%s shared=%s", profile_home, root, shared)
-        return shared
-    except Exception:
-        logger.warning("[MULTIPLEX] root-credential guard failed open", exc_info=True)
-        return False
 
 
-def load_gateway_config_for_runner() -> "GatewayConfig":
-    """Load gateway config for the process-level GatewayRunner. An UNSET ``multiplex_profiles`` is
-    settled first by ``resolve_multiplex_mode`` (the default is on; the boot guard keeps a fleet that
-    still runs per-profile gateways standalone). Multiplexed: set multiplex-active, then reload
-    under the default root's ``_profile_runtime_scope`` — not ``get_hermes_home()``, which is the
-    named launcher when a profile-scoped process started the host. A scope miss must not fall
-    through to that process's ``os.environ``. Off -> identical to ``load_gateway_config()``.
-
-    See #64674.
-
-    The probe load above only decides whether this process is a multiplexer. The primary
-    config is the scoped reload: multiplex must already be active (a scope miss must not
-    fall through to the launching profile's ``os.environ``) and the home must be the
-    default root, not ``get_hermes_home()`` — a named launcher's home is not the owner
-    of the primary adapter map.
-    """
-    from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode
-    cfg = load_gateway_config()
-    log_multiplex_decision(resolve_multiplex_mode(cfg))
-    if not cfg.multiplex_profiles:
-        return cfg
-    try:
-        from agent.secret_scope import set_multiplex_active
-        set_multiplex_active(True)
-    except Exception:
-        logger.debug("could not set multiplex-active before primary config load", exc_info=True)
-    try:
-        from hermes_constants import get_default_hermes_root
-        home = get_default_hermes_root()
-    except Exception:
-        return cfg
-    try:
-        with _profile_runtime_scope(Path(home)):
-            scoped = load_gateway_config()
-    except Exception:
-        logger.debug("multiplex default-scope config reload failed; using unscoped load", exc_info=True)
-        return cfg
-    scoped.multiplex_profiles = cfg.multiplex_profiles  # the verdict above, not a second unset flag
-    return scoped
 
 
 async def _discover_gateway_mcp_tools(config: object) -> None:
@@ -3488,7 +3417,7 @@ class GatewayRunner(
         # See #64674.
         # Injected configs keep their mode (including None), except the launching profile's
         # standalone opt-out: --config must not turn that profile into a host multiplexer.
-        self.config = config if config is not None else load_gateway_config_for_runner()
+        self.config = config if config is not None else _run_profile_config.load_gateway_config_for_runner()
         if config is not None:
             from hermes_cli.gateway_multiplex_mode import standalone_launcher_decision, log_multiplex_decision
             decision = standalone_launcher_decision(self.config)

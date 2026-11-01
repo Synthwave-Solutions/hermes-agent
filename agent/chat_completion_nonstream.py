@@ -1,5 +1,7 @@
 """Request-local worker lifecycle, watchdog polling, and wait status."""
 
+import agent.chat_completion_watchdogs as _chat_completion_watchdogs
+
 from agent import chat_completion_helpers as h
 from agent import chat_completion_wait_notice as wn
 
@@ -26,7 +28,7 @@ class _NonStreamRequest:
         # (run_codex_stream._request_is_current). ``codex_retired`` mirrors it locally.
         self.codex_token = object() if agent.api_mode == "codex_responses" else None
         self.codex_retired = False
-        self.wd = h._resolve_nonstream_watchdogs(agent, api_kwargs)
+        self.wd = _chat_completion_watchdogs._resolve_nonstream_watchdogs(agent, api_kwargs)
         self.codex_watchdog_state = (
             h.SimpleNamespace(
                 token=self.codex_token,

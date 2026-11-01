@@ -53,38 +53,7 @@ class FinalResponseVerdict:
     result: Optional[dict[str, Any]] = None
 
 
-def finish_text_response(
-    agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
-    api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
-    active_system_prompt: Any, final_response: Any, _turn_exit_reason: Any,
-    _preflight_compression_blocked: Any, codex_ack_continuations: Any,
-    truncated_response_parts: Any, length_continue_retries: Any,
-    _pending_verification_response: Any, _pending_verification_response_previewed: Any,
-    effective_task_id: Any,
-) -> FinalResponseVerdict:
-    """Finish (or defer) a text-only assistant response in the original guard order. Every
-    continuation path sets ``final_response = None`` so an acknowledgment never suppresses
-    iteration-limit summarization; the final message is appended and flushed only after the
-    stop gates accept it."""
-    from agent.conversation_loop import (
-        _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
-        _join_truncated_parts
-    )
-
-    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> FinalResponseVerdict:
-        return FinalResponseVerdict(
-            action=action, active_system_prompt=active_system_prompt, final_response=final_response,
-            _turn_exit_reason=_turn_exit_reason,
-            _preflight_compression_blocked=_preflight_compression_blocked,
-            codex_ack_continuations=codex_ack_continuations,
-            truncated_response_parts=truncated_response_parts,
-            length_continue_retries=length_continue_retries,
-            _pending_verification_response=_pending_verification_response,
-            _pending_verification_response_previewed=_pending_verification_response_previewed,
-            api_call_count=api_call_count,
-            result=result,
-        )
-
+def _promote_reasoning_answer(agent, assistant_message, finish_reason, messages, api_call_count):
     # Reasoning-only clean stop on a trusted route (elsewhere reasoning is private and takes the
     # ladder): some parsers (vLLM nemotron_v3 past ~500K prompt tokens) file the whole answer as
     # reasoning when the closing delimiter is missing; ``stop`` means generation is complete, so
@@ -122,6 +91,44 @@ def finish_text_response(
                 len(_promoted), agent.model, agent.provider, api_call_count,
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
+    return _promoted
+
+
+def finish_text_response(
+    agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
+    api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
+    active_system_prompt: Any, final_response: Any, _turn_exit_reason: Any,
+    _preflight_compression_blocked: Any, codex_ack_continuations: Any,
+    truncated_response_parts: Any, length_continue_retries: Any,
+    _pending_verification_response: Any, _pending_verification_response_previewed: Any,
+    effective_task_id: Any,
+) -> FinalResponseVerdict:
+    """Finish (or defer) a text-only assistant response in the original guard order. Every
+    continuation path sets ``final_response = None`` so an acknowledgment never suppresses
+    iteration-limit summarization; the final message is appended and flushed only after the
+    stop gates accept it."""
+    from agent.conversation_loop import (
+        _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
+        _join_truncated_parts
+    )
+
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> FinalResponseVerdict:
+        return FinalResponseVerdict(
+            action=action, active_system_prompt=active_system_prompt, final_response=final_response,
+            _turn_exit_reason=_turn_exit_reason,
+            _preflight_compression_blocked=_preflight_compression_blocked,
+            codex_ack_continuations=codex_ack_continuations,
+            truncated_response_parts=truncated_response_parts,
+            length_continue_retries=length_continue_retries,
+            _pending_verification_response=_pending_verification_response,
+            _pending_verification_response_previewed=_pending_verification_response_previewed,
+            api_call_count=api_call_count,
+            result=result,
+        )
+
+    _promoted = _promote_reasoning_answer(
+        agent, assistant_message, finish_reason, messages, api_call_count,
+    )
     final_response = _promoted or assistant_message.content or ""
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.

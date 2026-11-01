@@ -9,6 +9,10 @@ forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 
 from __future__ import annotations
 
+import agent.chat_completion_watchdogs as _chat_completion_watchdogs
+
+import agent.chat_completion_gateway as _chat_completion_gateway
+
 import contextlib
 import contextvars
 import json
@@ -83,68 +87,8 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 _STREAM_5XX_PROBE_WINDOW_S = 60.0
 
 
-def _extract_omniroute_route(http_response) -> tuple[str, str] | None:
-    """Extract the provider and model routed by OmniRoute response headers."""
-    headers = getattr(http_response, "headers", None)
-    if headers is None:
-        return None
-    try:
-        model = headers.get("x-omniroute-model")
-        provider = headers.get("x-omniroute-provider")
-    except Exception:
-        return None
-    if model and provider:
-        return provider, model
-    return None
 
 
-def capture_omniroute_route(agent, response) -> None:
-    """Update context compression for the model actually selected by OmniRoute."""
-    route_info = getattr(agent, "_omniroute_route_info", None)
-    agent._omniroute_route_info = None
-    if route_info:
-        provider, model = route_info
-        resolved_model = f"{provider}/{model}"
-    else:
-        resolved_model = getattr(response, "model", None) if response else None
-    if not resolved_model or resolved_model == agent.model:
-        return
-    # OmniRoute's response header uses the short provider id "cx" for
-    # requests addressed to "codex". This is the same model, not a route
-    # change. Preserve the compressor's already-resolved context window;
-    # probing the unrecognized alias here blocks terminal delivery on HTTP
-    # metadata timeouts after the answer has already streamed to the user.
-    def canonical_route(model):
-        if isinstance(model, str) and model.startswith("cx/"):
-            return "codex/" + model[3:]
-        return model
-
-    compressor = getattr(agent, "context_compressor", None)
-    current_model = getattr(compressor, "model", None)
-    if canonical_route(resolved_model) == canonical_route(current_model):
-        return
-    if getattr(agent, "_effective_routed_model", None) == resolved_model:
-        return
-    from agent.model_metadata import get_model_context_length
-    try:
-        context_length = get_model_context_length(
-            resolved_model, base_url=agent.base_url, api_key=agent.api_key,
-            provider=agent.provider,
-        )
-    except Exception:
-        logger.debug("Failed to resolve context length for routed model %r", resolved_model, exc_info=True)
-        return
-    if context_length is None:
-        logger.debug("No context length resolved for routed model %r", resolved_model)
-        return
-    agent._effective_routed_model = resolved_model
-    agent._effective_context_length = context_length
-    agent.context_compressor.update_model(
-        model=resolved_model, context_length=context_length,
-        base_url=agent.base_url or "", api_key=agent.api_key or "",
-        provider=agent.provider or "", api_mode=agent.api_mode or "",
-        max_tokens=getattr(agent, "max_tokens", None),
-    )
 
 
 def _context_thread_target(callback):
@@ -1059,7 +1003,7 @@ def direct_api_call(agent, api_kwargs: dict):
     aborts in-flight sockets via the registered hook, and a per-call ``timeout``
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
-    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    from agent.agent_init_governance import _enforce_dashboard_governance_model_policy
     _enforce_dashboard_governance_model_policy(agent)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
@@ -1234,92 +1178,6 @@ class _NonStreamWatchdogs:
     progress_timeout: float = 0.0
 
 
-def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs:
-    """Stale-call timeout plus the Codex Responses stream watchdogs.
-
-    The stale detector kills a hung provider early so the retry loop can rotate
-    credentials / fall back. Codex adds two failure modes: accepting the connection
-    but never emitting an event (no-event TTFB cutoff; a reconnect succeeds in ~2s)
-    and stalling after substantive model progress begins (event-idle gap; any parsed SSE
-    event remains transport activity). Only the implicit official OpenAI Codex policy
-    for large contexts defers arming until progress; small requests, compatible backends,
-    and explicit overrides retain the legacy first-event semantics. Tunables:
-    HERMES_CODEX_TTFB_TIMEOUT_SECONDS,
-    HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS (0 disables each),
-    HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS / HERMES_CODEX_TTFB_STRICT,
-    HERMES_CODEX_TTFB_MAX_SECONDS (opt-in ceiling, default 0 = none), HERMES_CODEX_HARD_TIMEOUT_SECONDS.
-    """
-    # The effort floor on the STALE timeout lives inside _compute_non_stream_stale_timeout so the
-    # run-budget cap still bounds it; here the floor only raises the TTFB/idle implicit defaults.
-    stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
-    codex = agent.api_mode == "codex_responses"
-    openai_codex_backend = _is_openai_codex_backend(agent)
-    est_tokens = estimate_request_context_tokens(api_kwargs)
-    effort_floor = _high_effort_silence_floor(agent) if codex else 0.0
-    codex_floor = 0.0
-    # Local Responses servers keep their configured local stale/TTFB grace: the hosted
-    # large-context floor, hard ceiling and TTFB scale-up/cap below must not tighten it.
-    base_url = getattr(agent, "base_url", None)
-    local = uses_local_inference_patience(agent, base_url)
-    if codex and not local:
-        codex_floor = openai_codex_stale_timeout_floor(est_tokens)
-        stale_timeout = _bound_openai_codex_stale_timeout(stale_timeout, est_tokens)
-
-    idle_default = max(effort_floor, next(
-        (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
-        12.0))
-
-    # No-event TTFB cutoff. Default 120s: the SDK's own read timeout is 600s,
-    # and a tight 12s killed subscription-backed requests mid-prefill.
-    ttfb_enabled = codex
-    ttfb_explicit = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", -1.0) != -1.0
-    ttfb_timeout = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
-    if ttfb_timeout <= 0:
-        ttfb_enabled = False
-    elif codex and not local:
-        # Large requests legitimately spend tens of seconds in admission/prefill before the
-        # first SSE event: scale the cutoff up to the idle default unless TTFB_STRICT is set.
-        disable_above = env_float("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0)
-        strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
-        if not strict and disable_above > 0 and est_tokens >= disable_above and ttfb_timeout < idle_default:
-            logger.info("Scaling codex-responses no-event TTFB watchdog from %.0fs to %.0fs "
-                "for large request (context=~%s tokens >= %.0f). "
-                "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.", ttfb_timeout, idle_default,
-                f"{est_tokens:,}", disable_above)
-            ttfb_timeout = idle_default
-        # Opt-in ceiling (0 = off): a 120s default here silently undid the scale-up above (#91621).
-        ttfb_cap = env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
-        if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
-            logger.info("Capping codex-responses no-event TTFB timeout from %.0fs to %.0fs "
-                "(context=~%s tokens) per HERMES_CODEX_TTFB_MAX_SECONDS.", ttfb_timeout, ttfb_cap,
-                f"{est_tokens:,}")
-            ttfb_timeout = ttfb_cap
-    elif not ttfb_explicit and local:
-        # A local server prefills for minutes before its first event; the chat-completions
-        # siblings already grant local endpoints the local stale ceiling, so the Responses
-        # transport gets the same grace instead of the 120s hosted cutoff (#92302).
-        local_ceiling = _local_stream_stale_timeout_default()
-        if local_ceiling > ttfb_timeout:
-            logger.info("Local provider detected (%s) — no-event TTFB watchdog raised from %.0fs to %.0fs "
-                "(agent.local_stream_stale_timeout); set HERMES_CODEX_TTFB_TIMEOUT_SECONDS for an explicit cutoff.",
-                base_url, ttfb_timeout, local_ceiling)
-            ttfb_timeout = local_ceiling
-    if ttfb_enabled and not ttfb_explicit:
-        # High-effort thinking precedes the first event; the floor outranks the cap.
-        ttfb_timeout = max(ttfb_timeout, effort_floor)
-
-    # An operator-set idle timeout keeps first-event semantics; only the implicit
-    # default defers arming until model progress. Sentinel: env_float returns the
-    # default for unset AND unparseable values, so both count as implicit.
-    idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
-    idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
-    progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
-    return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
-        ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
-        idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
-        # A lifecycle frame proves transport liveness, not model progress. Bound that phase
-        # from the physical-attempt start; events cannot restart the grace period.
-        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
@@ -1337,7 +1195,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
-    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    from agent.agent_init_governance import _enforce_dashboard_governance_model_policy
     _enforce_dashboard_governance_model_policy(agent)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
@@ -1577,44 +1435,8 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     )
 
 
-def _agent_request_base_url(agent) -> str:
-    if getattr(agent, "api_mode", "") == "anthropic_messages":
-        return str(getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", "") or "")
-    return str(getattr(agent, "base_url", "") or "")
 
-def _check_model_gateway_route(agent) -> None:
-    """Refuse a main-model request that bypasses the model gateway (R2).
 
-    Under ``model_gateway.enforce`` every completion path (chat, Responses,
-    Messages) must target the gateway; Bedrock's native Converse API never
-    does. MoA's facade is exempt because each of its slots is an auxiliary
-    call that resolves to the gateway itself.
-    """
-    from agent import model_gateway
-
-    if not model_gateway.enforced():
-        return
-    if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
-        return
-    if getattr(agent, "api_mode", "") == "bedrock_converse" or not model_gateway.is_gateway_url(
-        _agent_request_base_url(agent)
-    ):
-        raise model_gateway.ModelGatewayRefused(
-            "model",
-            getattr(agent, "provider", "") or "unknown",
-            "the agent's endpoint is not the model gateway",
-        )
-
-def _apply_model_gateway_identity(agent, kwargs: dict) -> dict:
-    """The ``user`` field and session header on every gateway completion."""
-    from agent import model_gateway
-
-    return model_gateway.apply_request_identity(
-        kwargs,
-        base_url=_agent_request_base_url(agent),
-        api_mode=str(getattr(agent, "api_mode", "") or "chat_completions"),
-        session_id=getattr(agent, "session_id", None),
-    )
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode.
@@ -1626,7 +1448,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """
     from agent.opencode_affinity import merge_session_affinity_headers
 
-    _check_model_gateway_route(agent)
+    _chat_completion_gateway._check_model_gateway_route(agent)
     kwargs = merge_session_affinity_headers(
         _build_api_kwargs_for_mode(agent, api_messages, tools_for_api),
         getattr(agent, "provider", None),
@@ -1641,7 +1463,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         apply_model_tiering(agent, kwargs, api_messages)
     except Exception:
         logger.debug("model tiering unavailable", exc_info=True)
-    return _apply_model_gateway_identity(agent, kwargs)
+    return _chat_completion_gateway._apply_model_gateway_identity(agent, kwargs)
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -2146,7 +1968,7 @@ def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_b
     config injected — a caller override of the same key won at init and differs, so it survives;
     keys the new provider redefines are re-added by the merge."""
     try:
-        from agent.agent_init import _custom_provider_extra_body_for_agent, _merge_custom_provider_extra_body
+        from agent.agent_init_provider_routes import _custom_provider_extra_body_for_agent, _merge_custom_provider_extra_body
         custom_providers = getattr(agent, "_custom_providers", None) or []
         old_provider_eb = _custom_provider_extra_body_for_agent(provider=old_provider, model=old_model, base_url=old_base_url, custom_providers=custom_providers) or {}
         overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -2293,7 +2115,8 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
     # Compression/resume can orphan a tool result whose parent tool_call was summarized away.
     api_messages = agent._sanitize_api_messages(api_messages)
     # Same send-path vision eviction as the main loop (#89296).
-    from agent.context_compressor import evict_stale_outbound_tool_images, outbound_retired_image_ids
+    from agent.context_compressor import outbound_retired_image_ids
+    from agent.compression_media import evict_stale_outbound_tool_images
     evict_stale_outbound_tool_images(api_messages, outbound_retired_image_ids(agent))
     # Same per-model image strip as turn_api_request.build_api_request: this path builds
     # api_messages by hand and calls _build_api_kwargs directly, so a model recorded in
@@ -3096,7 +2919,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._stream_diag_capture_response(self.clients.diag, response)
         self.agent._check_openrouter_cache_status(response)
         # SYNTHWAVE fork: remember OmniRoute's routed provider/model for capture_omniroute_route.
-        omniroute_route = _extract_omniroute_route(response)
+        omniroute_route = _chat_completion_gateway._extract_omniroute_route(response)
         if omniroute_route:
             self.agent._omniroute_route_info = omniroute_route
         self._writer_token = claim_stream_writer(self.agent)
@@ -4148,7 +3971,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
-    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    from agent.agent_init_governance import _enforce_dashboard_governance_model_policy
     _enforce_dashboard_governance_model_policy(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")

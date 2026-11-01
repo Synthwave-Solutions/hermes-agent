@@ -7,7 +7,8 @@ from unittest.mock import MagicMock
 
 import pytest
 from agent import turn_finalizer as finalizer
-from tests.agent.test_background_review_trace import parent
+
+pytest_plugins = ["tests.agent.test_background_review_trace"]
 from tests.agent.test_background_review_trace import test_actual_native_provider_loop_emits_noop_completion as _native_provider_review
 
 

@@ -2013,7 +2013,9 @@ def resolve_cron_policy_path(
             from hermes_cli.config import load_config
 
             config = load_config() or {}
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("resolve_cron_policy_path: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             config = {}
     own = resolve_policy_path(config=config, hermes_home=home)
     root = platform_root_for(home)
@@ -2404,7 +2406,7 @@ def _cron_run_delivery_targets() -> set[str]:
     """
     try:
         from gateway.session_context import _UNSET, _VAR_MAP
-    except Exception:
+    except ImportError:
         return set()
 
     def _bound(name: str) -> str:
@@ -2643,8 +2645,8 @@ def _session_marker_value(name: str) -> str:
 
         if name in _VAR_MAP:
             values.append(get_session_env(name, "") or "")
-    except Exception:
-        pass
+    except ImportError:
+        logging.getLogger(__name__).debug("_session_marker_value: optional fallback used")
     for value in values:
         text = str(value).strip()
         if text.lower() not in _SESSION_MARKER_OFF_VALUES:
@@ -2676,7 +2678,9 @@ def _is_operator_shell() -> bool:
         return True
     try:
         return current_governance_context() is None
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_is_operator_shell: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 
@@ -4716,7 +4720,7 @@ def _audit_host() -> str:
         import socket
 
         return socket.gethostname()
-    except Exception:
+    except OSError:
         return ""
 
 

@@ -28,6 +28,8 @@ The only write is the Scout's own ledger (``<HERMES_HOME>/scout/seen.db`` or
 
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 import re
@@ -41,11 +43,11 @@ import scout_ledger
 
 WAKE_FALSE = json.dumps({"wakeAgent": False})
 MAX_ITEMS = 40
-MAX_CHARS = int(os.environ.get("SCOUT_MAX_CHARS", "6000"))
+MAX_CHARS = 6000
 SUMMARY_CHARS = 400
 STALE_DAYS = 3
 FIRST_RUN_LOOKBACK_HOURS = 72
-TOPIC_INTERVAL_HOURS = float(os.environ.get("SCOUT_TOPIC_INTERVAL_HOURS", "20"))
+TOPIC_INTERVAL_HOURS = 20.0
 MAX_TOPICS = 8
 RUNTIME_BUDGET_S = 50.0
 OK_STATUSES = {"ok", "success", "silent", "skipped", None, ""}
@@ -77,7 +79,7 @@ def resolve_context() -> dict:
         kanban_db = (Path(khome).expanduser() if khome else root) / "kanban.db"
     return {"home": home, "profile": profile, "root": root, "kanban_db": kanban_db,
             "ledger": scout_ledger.ledger_path(home),
-            "self_job": os.environ.get("HERMES_CRON_JOB_ID", "").strip()}
+            "self_job": os.environ.get("HERMES_CRON_JOB_ID", "").strip()}  # health: allow HX002 -- server-owned current-job identifier excludes the running collector from its own feed; not a user setting
 
 
 # --- profile metadata ----------------------------------------------------------------------
@@ -594,7 +596,7 @@ def apply_feedback(ctx: dict, led, now: float) -> list[str]:
 
 def render(meta: dict, ctx: dict, items: list[dict], notes: list[str], topics: list[str],
            budget: int | None = None, known_web: list[tuple[str, str]] | None = None) -> tuple[str, list[dict]]:
-    budget = MAX_CHARS if budget is None else budget
+    budget = int(os.environ.get("SCOUT_MAX_CHARS", MAX_CHARS)) if budget is None else budget
     head = [f"# Scout digest: {meta['title']} (profiel {ctx['profile']})"]
     who = " | ".join(x for x in (meta.get("role"), meta.get("category")) if x)
     if who:
@@ -656,6 +658,8 @@ def run() -> int:
         try:
             notes.extend(apply_feedback(ctx, led, now))
         except Exception as exc:  # feedback must never stop the digest
+            logging.getLogger(__name__).error("run: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             notes.append(f"ledger-terugkoppeling: niet gelezen ({type(exc).__name__}: {clean(exc, 120)})")
         led.auto_ignore(now=int(now))
         # Job-output watermark: outputs newer than this are candidates. It only advances past
@@ -677,6 +681,8 @@ def run() -> int:
                 if label == "cron-jobs":
                     jobs_ok = time.monotonic() - started <= RUNTIME_BUDGET_S
             except Exception as exc:
+                logging.getLogger(__name__).error("run: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
                 notes.append(f"{label}: niet gelezen ({type(exc).__name__}: {clean(exc, 120)})")
 
         fresh: list[dict] = []
@@ -699,7 +705,7 @@ def run() -> int:
 
         topics = scout.get("topics") or []
         last_topics = float(led.get_meta("last_topic_sweep") or 0)
-        topics_due = bool(topics) and (now - last_topics) >= TOPIC_INTERVAL_HOURS * 3600
+        topics_due = bool(topics) and (now - last_topics) >= float(os.environ.get("SCOUT_TOPIC_INTERVAL_HOURS", TOPIC_INTERVAL_HOURS)) * 3600
         last_notes_wake = float(led.get_meta("last_notes_wake") or 0)
         notes_due = bool(notes) and (now - last_notes_wake) >= NOTES_WAKE_HOURS * 3600
 

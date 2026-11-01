@@ -8,7 +8,9 @@ from copy import deepcopy
 import pytest
 
 from hermes_cli.dashboard_governance import action_approval as review
-from tests.test_governance_per_user_actions import Registry, fixture, model
+from tests.test_governance_per_user_actions import Registry, model
+
+pytest_plugins = ["tests.test_governance_per_user_actions"]
 
 
 @pytest.fixture

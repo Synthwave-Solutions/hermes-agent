@@ -13,6 +13,8 @@ socket guard records every outbound connection attempt.
 
 from __future__ import annotations
 
+import agent.auxiliary_client_gateway as _auxiliary_client_gateway
+
 import json
 import socket
 import threading
@@ -528,7 +530,7 @@ def test_provider_chain_is_the_gateway_alone(enforced):
         (aux._try_openrouter, ()),
         (aux._try_nous, ()),
         (aux._try_custom_endpoint, ()),
-        (aux._resolve_api_key_provider, ()),
+        (_auxiliary_client_gateway._resolve_api_key_provider, ()),
         (aux._try_anthropic, ()),
         (aux._build_codex_client, ("gpt-5.4",)),
         (aux._build_xai_oauth_aux_client, ("grok-4",)),

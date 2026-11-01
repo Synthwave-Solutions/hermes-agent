@@ -1314,7 +1314,7 @@ class GatewayAdapterLifecycleMixin:
             # bot) must not start a second poller: Telegram answers 409 to the
             # main gateway and it misses updates. Skip it quietly (never connected,
             # so nothing to disconnect).
-            from gateway.run import _synthpulse_root_shared_credential
+            from gateway.run_profile_config import _synthpulse_root_shared_credential
             if _synthpulse_root_shared_credential(adapter, profile_home):
                 logger.info(
                     "[MULTIPLEX] Profile '%s': %s credential is the root profile's "

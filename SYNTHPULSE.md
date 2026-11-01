@@ -43,6 +43,28 @@ turn against a local model stub. These checks do not prove live-provider perform
 The integration PRs record exact results and remaining lint or inherited test failures;
 the existence of these branches does not mean they have been deployed.
 
+SynthPulse-specific settings now resolve from the current profile's `config.yaml` through
+`hermes_cli.synthpulse_settings`. Explicit values, including `false`, `0` and an empty string,
+take precedence. Missing/null values retain the existing launcher's environment fallback:
+
+| Profile setting | Legacy launcher fallback |
+| --- | --- |
+| `model.tiering` | `HERMES_MODEL_TIERING` |
+| `opencode.binary` | `HERMES_OPENCODE_BIN` |
+| `opencode.max_slots` | `HERMES_OPENCODE_MAX_SLOTS` |
+| `webui.state_dir` | `HERMES_WEBUI_STATE_DIR` |
+| `webui.attachment_dir` | `HERMES_WEBUI_ATTACHMENT_DIR` |
+| `api_server.disable_caller_governance` | `HERMES_DISABLE_CALLER_GOVERNANCE` |
+
+The embedding WebUI can continue to supply its shared spool/inbox paths. Without an explicit
+path or legacy override, those paths follow the active profile. OpenCode job logs follow the
+profile; concurrency slots remain shared by the installation. No settings are captured at import.
+
+The health check's five documented `HX002` exceptions are process metadata, not configuration:
+the inherited governed caller, the scheduler's current job/manager, and the legacy scoped-profile
+attestation. Moving these into editable YAML would change the trusted source of execution identity.
+Their producers, validation and fail-closed consumers remain intact; the general check stays enabled.
+
 ## Branding note
 
 "SynthPulse Agentic Workstation" is the Synthwave product name. The engine's internal protocol,

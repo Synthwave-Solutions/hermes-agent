@@ -11,10 +11,8 @@ from __future__ import annotations
 import json
 
 from agent.agent_runtime_helpers import sanitize_api_messages
-from agent.context_compressor import (
-    _tool_content_has_images,
-    evict_stale_outbound_tool_images,
-)
+from agent.context_compressor import _tool_content_has_images
+from agent.compression_media import evict_stale_outbound_tool_images
 from agent.image_eviction_policy import (
     IMAGE_EVICTION_BATCH,
     OUTBOUND_IMAGE_FLOOR,

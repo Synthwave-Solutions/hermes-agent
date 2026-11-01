@@ -173,7 +173,9 @@ def _is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
     try:
         from tools.mcp_tool import is_mcp_tool_parallel_blocked
         return is_mcp_tool_parallel_blocked(tool_name)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_is_mcp_tool_parallel_blocked: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 

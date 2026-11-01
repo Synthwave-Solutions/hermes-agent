@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from copy import deepcopy
 from typing import Any
 
@@ -80,11 +82,15 @@ def model_allowed_for_context(ctx, *, provider: str, model: str) -> AccessDecisi
                 try:
                     if not callable(check) or check() is not True:
                         return AccessDecision(False, "bot_access_revoked")
-                except Exception:
+                except Exception as _boundary_error:
+                    logging.getLogger(__name__).error("model_allowed_for_context: operation failed",
+                        exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
                     return AccessDecision(False, "bot_access_revoked")
             decision = decide_model_access(bounded.access, provider=provider, model=model)
             if not decision.allowed:
                 return decision
         return AccessDecision(True, "allowed")
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("model_allowed_for_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return AccessDecision(False, "continuation_policy_unavailable")

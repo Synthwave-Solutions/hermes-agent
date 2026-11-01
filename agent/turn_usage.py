@@ -82,7 +82,7 @@ def record_response_usage(
     # report the model they actually routed to (response headers / response.model);
     # retarget the compressor after every successful response, streaming or not,
     # even when the provider omitted usage accounting for this completion.
-    from agent.chat_completion_helpers import capture_omniroute_route
+    from agent.chat_completion_gateway import capture_omniroute_route
     capture_omniroute_route(agent, response)
     compressor = agent.context_compressor
     # Count every completed provider attempt, including providers that omit usage.

@@ -1256,7 +1256,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _sp_source = getattr(event, "source", None)
         try:
             from gateway import synthpulse_identity as _sp_identity
-        except Exception:
+        except ImportError:
             _sp_identity = None
         _sp_platform = getattr(_sp_source, "platform", None)
         if str(getattr(_sp_platform, "value", _sp_platform) or "").lower() == "a2a":
@@ -1282,7 +1282,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             try:
                 _sp_handle = _sp_identity.bind_for_source(
                     _sp_source, str(getattr(_sp_source, "chat_id", "") or ""), multiplexed=_sp_multiplexed)
-            except Exception:
+            except Exception as _boundary_error:
+                logging.getLogger(__name__).error("GatewayInboundMixin._handle_message: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
                 _sp_handle = None
         try:
             return await self._handle_message_unbound(event)
@@ -1290,8 +1292,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if _sp_handle is not None and _sp_identity is not None:
                 try:
                     _sp_identity.reset(_sp_handle)
-                except Exception:
-                    pass
+                except ValueError:
+                    logging.getLogger(__name__).debug("GatewayInboundMixin._handle_message: optional fallback used")
 
     async def _handle_message_unbound(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent

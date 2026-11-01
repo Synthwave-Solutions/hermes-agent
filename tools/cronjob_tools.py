@@ -103,7 +103,7 @@ def _local_time_string(value: Any, tzinfo=None) -> Optional[str]:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=tzinfo)
         return dt.astimezone(tzinfo).strftime("%a %Y-%m-%d %H:%M %Z")
-    except Exception:
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -152,7 +152,7 @@ def _one_shot_in_past_error(schedule: str) -> Optional[str]:
                 "Recompute the intended timestamp from now_local (or ask the user "
                 "whether they meant the next occurrence) and create again."
             )
-    except Exception:
+    except (ValueError, TypeError, OverflowError):
         return None
     return None
 

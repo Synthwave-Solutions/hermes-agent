@@ -46,7 +46,7 @@ def _key(model: Any, base_url: Any) -> str:
 
 
 def _read_cache() -> dict[str, int]:
-    from agent.model_metadata import _load_json_dict
+    from agent.model_metadata_disk import _load_json_dict
 
     return {k: v for k, v in _load_json_dict(_cache_path()).items()
             if isinstance(v, int) and _MIN_PLAUSIBLE <= v <= _MAX_PLAUSIBLE}

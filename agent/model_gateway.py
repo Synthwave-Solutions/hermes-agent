@@ -450,7 +450,7 @@ def _current_person_email() -> str:
         from hermes_cli.dashboard_governance.context import current_governance_context
 
         ctx = current_governance_context()
-    except Exception:
+    except ImportError:
         return ""
     subject = getattr(ctx, "subject", None) if ctx is not None else None
     email = getattr(subject, "email", "") if subject is not None else ""
@@ -492,7 +492,7 @@ def current_session_id() -> str:
         from gateway.session_context import get_session_env
 
         return (get_session_env("HERMES_SESSION_ID", "") or "").strip()
-    except Exception:
+    except (ImportError, AttributeError):
         return ""
 
 
@@ -557,7 +557,7 @@ def active_profile_name() -> str:
         from hermes_cli.profiles import get_active_profile_name
 
         return get_active_profile_name() or "default"
-    except Exception:
+    except (ImportError, OSError, ValueError):
         return "default"
 
 
@@ -702,7 +702,9 @@ def registry_provider_base_url(
             value = getattr(provider, attr, None)
             if callable(value):
                 value = value()
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("registry_provider_base_url: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             value = None
         if isinstance(value, str) and value.strip():
             return value.strip()

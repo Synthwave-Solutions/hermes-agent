@@ -14,7 +14,7 @@ import base64
 import pytest
 
 from agent.anthropic_message_convert import _evict_old_screenshots
-from agent.context_compressor import evict_stale_outbound_tool_images
+from agent.compression_media import evict_stale_outbound_tool_images
 from agent.image_eviction_policy import (
     IMAGE_EVICTION_BATCH,
     OUTBOUND_IMAGE_BUDGET_BYTES,

@@ -60,8 +60,10 @@ def trace_background_review(agent: Any, event: str, *, review_run=None, **fields
             elif name == "reason" and value in _TRACE_REASONS or name == "result" and value in _TRACE_RESULTS:
                 record[name] = value
         logger.info("Background review trace: %s", json.dumps(record, sort_keys=True))
-    except Exception:
-        pass  # Observability must not change a gate, request or cleanup outcome.
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("trace_background_review: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
+        # Observability must not change a gate, request or cleanup outcome.
 
 
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
@@ -78,7 +80,7 @@ class _BackgroundReviewRun:
         self._request_finished = self._cancel_dispatched = False
         try:
             self.trace_id = uuid.uuid4().hex
-        except Exception:
+        except OSError:
             self.trace_id = None
 
     def begin_request(self, review_agent: Any) -> bool:
@@ -1229,6 +1231,8 @@ def _observe_review_actions(agent: Any, messages_snapshot: list[dict], st: _Revi
             notification_mode=getattr(agent, "memory_notifications", "on"),
         )
     except Exception as e:
+        logging.getLogger(__name__).error("_observe_review_actions: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(e).__name__), e.__traceback__))
         logger.warning(
             "summarize_background_review_actions returned partial results "
             "after exception (treating as empty); suppressing AttributeError "
