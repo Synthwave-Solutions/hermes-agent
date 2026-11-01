@@ -84,9 +84,12 @@ def resolve_context() -> dict:
 
 def _load_yaml(text: str):
     try:
-        import yaml  # the engine's interpreter ships PyYAML
+        import hermes_yaml as yaml
     except ImportError:
-        return _mini_yaml(text)
+        try:
+            import yaml  # Standalone installations and older engines.
+        except ImportError:
+            return _mini_yaml(text)
     return yaml.safe_load(text)
 
 

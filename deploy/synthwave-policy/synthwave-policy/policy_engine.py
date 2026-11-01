@@ -941,11 +941,14 @@ def compile_policy(data: Any, source: str = "") -> Policy:
 
 def load_policy_file(path: Path) -> Policy:
     try:
-        import yaml  # PyYAML ships with Hermes
+        try:
+            import hermes_yaml as yaml
+        except ImportError:
+            import yaml  # Standalone installations and older engines.
     except ImportError as exc:  # pragma: no cover
-        raise PolicyError(f"PyYAML is not available: {exc}") from exc
+        raise PolicyError(f"No supported YAML parser is available: {exc}") from exc
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise PolicyError(f"cannot read {path}: {exc.strerror or exc}") from exc
     try:
@@ -961,7 +964,7 @@ _ENFORCE_HINT = re.compile(r"^mode:\s*['\"]?enforce\b", re.MULTILINE)
 def raw_mode_hint(path: Path) -> Optional[str]:
     """Best-effort mode for a file that does not parse: a top-level ``mode: enforce`` line."""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return None
     return "enforce" if _ENFORCE_HINT.search(text) else None
