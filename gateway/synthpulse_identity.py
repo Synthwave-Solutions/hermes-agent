@@ -100,7 +100,7 @@ def _load() -> dict:
     if _CACHE["path"] == str(path) and _CACHE["mtime"] == st.st_mtime_ns:
         return _CACHE["data"]
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             data = {}
     except (OSError, ValueError):

@@ -316,7 +316,7 @@ def _read_secret_file(path: str) -> str:
         if cached and (cached[0], cached[1]) == key:
             return cached[2]
     try:
-        value = Path(expanded).read_text(encoding="utf-8").strip()
+        value = Path(expanded).read_text(encoding="utf-8-sig").strip()
     except OSError:
         _warn_once(f"unreadable:{expanded}", "model_gateway: secret file %s is not readable", expanded)
         return ""

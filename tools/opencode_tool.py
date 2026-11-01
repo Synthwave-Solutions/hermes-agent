@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import pwd
 import secrets
 import shlex
 import subprocess
@@ -54,7 +53,12 @@ RUNNER = Path(__file__).resolve().with_name("opencode_task_runner.py")
 # Pinned on the passwd home: under the profile multiplexer $HOME points at
 # ~/.hermes-mux/home, and a guard that reads the wrong home silently does
 # nothing (see the synthpulse-governance skill, "De stille storing").
-_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+if sys.platform == "win32":
+    _HOME = Path.home()
+else:
+    import pwd
+
+    _HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX branch.
 OPENCODE_BIN = os.environ.get("HERMES_OPENCODE_BIN") or str(
     _HOME / ".npm-global" / "lib" / "node_modules" / "opencode-ai" / "bin" / "opencode.exe")
 JOBS_DIR = _HOME / ".hermes" / "cache" / "opencode-tasks"
@@ -362,12 +366,12 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
 
     run_dir = JOBS_DIR / job_id
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (run_dir / "job.json").write_text(json.dumps(job, indent=1))
+    (run_dir / "job.json").write_text(json.dumps(job, indent=1), encoding="utf-8")
     key = os.environ.get("OMNIROUTE_API_KEY", "")
     if key:
         key_path = run_dir / "omniroute.key"
         fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(key)
 
     command = f"{shlex.quote(sys.executable)} -I {shlex.quote(str(RUNNER))} {shlex.quote(str(run_dir))}"
@@ -389,7 +393,9 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
 
 
 def check_opencode_requirements() -> bool:
-    return Path(OPENCODE_BIN).is_file() and RUNNER.is_file()
+    # The worker depends on Linux bubblewrap; keep discovery importable on
+    # other hosts without advertising an unavailable sandbox.
+    return sys.platform == "linux" and Path(OPENCODE_BIN).is_file() and RUNNER.is_file()
 
 
 def _handle_opencode_task(args, **kw):

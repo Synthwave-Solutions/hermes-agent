@@ -73,7 +73,7 @@ def _subject_key(ctx: DashboardGovernanceContext) -> str:
 
 def _load_state(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}

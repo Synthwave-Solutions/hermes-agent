@@ -1957,7 +1957,7 @@ def read_config_file(path: Path) -> Dict[str, Any]:
         if not path.exists():
             return {}
         import hermes_yaml as yaml
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
     except Exception as exc:
         raise ValueError(f"{path} could not be read: {exc}") from exc
     if not isinstance(loaded, dict):

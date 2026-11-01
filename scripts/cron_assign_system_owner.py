@@ -93,7 +93,7 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
     import hermes_yaml as yaml
     if not path.exists():
         return {}
-    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
     if not isinstance(loaded, dict):
         raise ValueError(f"{path} is not a mapping")
     return loaded

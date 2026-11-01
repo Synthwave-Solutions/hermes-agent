@@ -25,7 +25,6 @@ The report (stdout) is what the completion notification delivers to the agent.
 
 from __future__ import annotations
 
-import fcntl
 import fnmatch
 import hashlib
 import json
@@ -69,11 +68,13 @@ def _run(argv, cwd=None, env=None, timeout=None, input_text=None):
 
 def acquire_slot(slot_dir: Path, slots: int, wait_seconds: int):
     """Hold one of *slots* flock slots; None when all stay busy for wait_seconds."""
+    import fcntl
+
     slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     deadline = time.monotonic() + max(0, wait_seconds)
     while True:
         for index in range(max(1, slots)):
-            handle = open(slot_dir / f"slot-{index}.lock", "w")
+            handle = open(slot_dir / f"slot-{index}.lock", "w", encoding="utf-8")
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 handle.write(str(os.getpid()))
@@ -148,10 +149,10 @@ def prepare_worktree(job: dict) -> tuple[Path, dict]:
     exclude = top / ".git" / "info" / "exclude"
     try:
         marker = "/.opencode-worktrees/"
-        current = exclude.read_text() if exclude.exists() else ""
+        current = exclude.read_text(encoding="utf-8-sig") if exclude.exists() else ""
         if marker not in current:
             exclude.parent.mkdir(parents=True, exist_ok=True)
-            with open(exclude, "a") as fh:
+            with open(exclude, "a", encoding="utf-8") as fh:
                 fh.write(("\n" if current and not current.endswith("\n") else "") + marker + "\n")
     except OSError:
         pass
@@ -177,6 +178,7 @@ def commit_worktree(git_info: dict, task: str) -> None:
 def bwrap_argv(job: dict, run_dir: Path, workroot: Path, git_info: dict) -> list[str]:
     home = Path(job["home"])
     argv = ["bwrap", "--die-with-parent", "--unshare-pid", "--new-session",
+            # no-tmp: ok — this is a private tmpfs inside the Linux sandbox, not host scratch.
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
     visible = None
     if job.get("home_mode") == "allowlist":
@@ -257,7 +259,7 @@ def sandbox_env(job: dict, run_dir: Path, key: str) -> dict:
         "XDG_STATE_HOME": str(state / "state"),
         "XDG_CACHE_HOME": str(Path(home) / ".cache"),
         "XDG_CONFIG_HOME": str(Path(home) / ".config"),
-        "TMPDIR": "/tmp",
+        "TMPDIR": "/tmp",  # no-tmp: ok — points to the private sandbox tmpfs above.
         "PYTHONDONTWRITEBYTECODE": "1",
         "OPENCODE_RECURSION_GUARD": "1",
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
@@ -271,7 +273,7 @@ def sandbox_env(job: dict, run_dir: Path, key: str) -> dict:
 def take_key(run_dir: Path) -> str:
     path = run_dir / "omniroute.key"
     try:
-        key = path.read_text().strip()
+        key = path.read_text(encoding="utf-8-sig").strip()
     except OSError:
         key = ""
     try:
@@ -281,7 +283,7 @@ def take_key(run_dir: Path) -> str:
     if not key:
         fallback = Path(os.path.expanduser("~/.config/opencode/omniroute.key"))
         try:
-            key = fallback.read_text().strip()
+            key = fallback.read_text(encoding="utf-8-sig").strip()
         except OSError:
             key = ""
     return key
@@ -306,7 +308,7 @@ def collect_git(git_info: dict, workroot: Path, files: list[str]) -> str:
 
 def main(job_dir: str) -> int:
     run_dir = Path(job_dir)
-    job = json.loads((run_dir / "job.json").read_text())
+    job = json.loads((run_dir / "job.json").read_text(encoding="utf-8-sig"))
     started = time.time()
     report = [f"# opencode_task {job['id']}", f"task: {' '.join(job['task'].split())[:300]}"]
 

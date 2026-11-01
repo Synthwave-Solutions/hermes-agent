@@ -64,7 +64,7 @@ def index_mode(config: Optional[dict[str, Any]] = None) -> str:
 
 def _usage_map(skills_dir: Path) -> dict:
     try:
-        raw = (skills_dir / ".usage.json").read_text(encoding="utf-8")
+        raw = (skills_dir / ".usage.json").read_text(encoding="utf-8-sig")
         data = json.loads(raw)
     except (OSError, ValueError):
         return {}
@@ -94,7 +94,7 @@ def _skill_identifiers(skill_md: Path) -> tuple[str, str]:
     directory = skill_md.parent.name
     declared = directory
     try:
-        head = skill_md.read_text(encoding="utf-8", errors="replace")[:1500]
+        head = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:1500]
     except OSError:
         return directory, declared
     for line in head.splitlines():

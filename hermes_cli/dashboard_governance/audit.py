@@ -71,7 +71,7 @@ def append_audit_event(
 def read_audit_events(*, limit: int = 100) -> list[dict[str, Any]]:
     path_obj = _audit_file()
     try:
-        lines = path_obj.read_text(encoding="utf-8").splitlines()
+        lines = path_obj.read_text(encoding="utf-8-sig").splitlines()
     except FileNotFoundError:
         return []
     rows: list[dict[str, Any]] = []

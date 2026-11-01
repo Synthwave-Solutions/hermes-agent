@@ -209,7 +209,7 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "", *, tool_ca
             except Exception:
                 pass  # windows / no fcntl: best-effort without the lock
             try:
-                store = json.loads(store_file.read_text(encoding="utf-8"))
+                store = json.loads(store_file.read_text(encoding="utf-8-sig"))
                 if not isinstance(store, dict):
                     store = {}
             except (FileNotFoundError, ValueError):
@@ -291,7 +291,7 @@ def approver_emails() -> list[str]:
 def load_store() -> dict:
     """Read the aggregated request store (empty dict when absent/corrupt)."""
     try:
-        data = json.loads(_store_path().read_text(encoding="utf-8"))
+        data = json.loads(_store_path().read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, ValueError):
         return {}

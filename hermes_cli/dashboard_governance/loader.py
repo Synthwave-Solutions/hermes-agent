@@ -140,7 +140,7 @@ def load_governance_policy(
     if not policy_path.exists():
         return GovernancePolicy(mode="off", default_effect="deny")
     try:
-        loaded = fast_safe_load(policy_path.read_text(encoding="utf-8")) or {}
+        loaded = fast_safe_load(policy_path.read_text(encoding="utf-8-sig")) or {}
     except yaml.YAMLError as exc:
         raise GovernancePolicyError(f"invalid YAML in dashboard governance policy: {exc}") from exc
     if not isinstance(loaded, Mapping):
