@@ -31,7 +31,7 @@ def isolated_route(monkeypatch, tmp_path):
     monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
     monkeypatch.setattr(models_dev, "_models_dev_retry_after", 0)
     monkeypatch.setattr(models_dev, "_models_dev_refresh_in_flight", False)
-    monkeypatch.setattr(models_dev, "_load_disk_cache", lambda: {})
+    monkeypatch.setattr(models_dev, "_load_disk_cache", dict)
     monkeypatch.setattr(models_dev, "_disk_cache_age_seconds", lambda: None)
     monkeypatch.setattr(model_metadata, "_endpoint_probe_path_cache", {})
     monkeypatch.setattr(model_metadata, "_local_probe_disk_get", lambda *a: None)

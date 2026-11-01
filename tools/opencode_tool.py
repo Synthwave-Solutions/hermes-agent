@@ -111,7 +111,7 @@ def _current_context():
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
         return current_governance_context(), None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return None, exc
 
 
@@ -124,12 +124,12 @@ def _governed_without_context() -> bool:
         mod = profile_scope_bridge.load_profile_scope()
         if mod is not None and mod.is_scoped(mod.resolve_profile()):
             return True
-    except Exception:  # noqa: BLE001
+    except Exception:
         return True
     return False
 
 
-def check_governance(args: Dict[str, Any]):
+def check_governance(args: dict[str, Any]):
     """(context, error). Fail closed whenever the caller's access cannot be resolved."""
     ctx, exc = _current_context()
     if exc is not None:
@@ -149,7 +149,7 @@ def check_governance(args: Dict[str, Any]):
         if not decision.allowed:
             detail = f" ({decision.detail})" if getattr(decision, "detail", "") else ""
             return ctx, f"Blocked by governance: {decision.reason}{detail}."
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("opencode_task governance check failed", exc_info=True)
         return ctx, "Blocked by governance: policy check failed (fail-closed)."
     return ctx, None
@@ -159,14 +159,14 @@ def check_folderguard(workdir: str) -> Optional[str]:
     try:
         from tools import profile_scope_bridge
         mod = profile_scope_bridge.load_profile_scope()
-    except Exception:  # noqa: BLE001
+    except Exception:
         mod = None
     if mod is None:
         return "Blocked: profile scope guard unavailable (fail-closed)." if _governed_without_context() else None
     try:
         profile = mod.resolve_profile()
         ok, reason = mod.check_path(profile, workdir, "write")
-    except Exception:  # noqa: BLE001
+    except Exception:
         return "Blocked: profile scope check failed (fail-closed)."
     return None if ok else f"Blocked by folder scope: {reason}"
 
@@ -174,7 +174,7 @@ def check_folderguard(workdir: str) -> Optional[str]:
 def _git_top(workdir: Path) -> Optional[Path]:
     try:
         done = subprocess.run(["git", "-C", str(workdir), "rev-parse", "--show-toplevel"],
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if done.returncode != 0 or not done.stdout.strip():
@@ -186,8 +186,7 @@ def _literal_path(glob: str) -> Optional[str]:
     """A denied glob that names one concrete place (optionally with /**)."""
     raw = os.path.expanduser(str(glob).strip())
     for suffix in ("/**", "/*"):
-        if raw.endswith(suffix):
-            raw = raw[: -len(suffix)]
+        raw = raw.removesuffix(suffix)
     if not raw.startswith("/") or any(ch in raw for ch in "*?["):
         return None
     return raw.rstrip("/") or None
@@ -199,7 +198,7 @@ def _caller_may_read(access, path: str) -> bool:
     try:
         from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
         return decide_tool_argument_access(access, "read_file", {"path": path}).allowed
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -318,7 +317,7 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
     try:
         from tools.terminal_tool import _get_env_config
         env_type = _get_env_config().get("env_type", "local")
-    except Exception:  # noqa: BLE001
+    except Exception:
         env_type = "unknown"
     if env_type != "local":
         return tool_error(f"opencode_task needs the host terminal backend; this profile uses '{env_type}'.")
@@ -326,7 +325,7 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
     access = getattr(ctx, "access", None) if ctx is not None else None
     top = _git_top(resolved)
     job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    job: Dict[str, Any] = {
+    job: dict[str, Any] = {
         "id": job_id, "task": task, "workdir": str(resolved), "model": (model or DEFAULT_MODEL).strip(),
         "opencode_bin": OPENCODE_BIN, "home": str(_HOME), "slot_dir": str(SLOT_DIR), "slots": MAX_SLOTS,
         "slot_wait": 600, "timeout": max(60, min(int(timeout or 3600), 7200)),

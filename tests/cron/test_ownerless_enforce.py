@@ -1140,7 +1140,7 @@ def test_the_cli_scope_does_not_stamp_the_principal_for_a_bridged_session(monkey
     is not the operator's shell either."""
     import contextvars
 
-    import gateway.session_context as session_context
+    from gateway import session_context
     from cron.jobs import system_principal_create_scope
 
     _write_config(PRINCIPAL)
@@ -1446,7 +1446,7 @@ def test_the_migration_dry_run_changes_nothing(tmp_path):
     }
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--all-profiles"],
-        env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+        env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=120, check=False,
     )
 
     assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -67,9 +67,9 @@ def get_memory_dir() -> Path:
     return _personal_memory_dir.get() or (get_hermes_home() / "memories")
 
 
-from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
+from tools.memory_tool_store import (
     ENTRY_DELIMITER, FAILURE_CLASS, MEMORY_BLOCK_HEADERS, PATCH_DROP_HINT, _scan_memory_content)
-from tools.memory_tool_store import MemoryStore as _BaseMemoryStore  # noqa: E402
+from tools.memory_tool_store import MemoryStore as _BaseMemoryStore
 
 
 class MemoryStore(_BaseMemoryStore):
@@ -92,8 +92,7 @@ class MemoryStore(_BaseMemoryStore):
     def _memory_directory(self) -> Path:
         root = self._bound_memory_dir
         if root is None:
-            from tools import memory_tool as _mt  # get_memory_dir is monkeypatched there (as in the base)
-            return _mt.get_memory_dir()
+            return get_memory_dir()
         if any(p.is_symlink() for p in (root, *root.parents)):
             raise PermissionError("Personal memory directory cannot contain symlinks")
         return root

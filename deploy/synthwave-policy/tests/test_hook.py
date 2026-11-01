@@ -259,7 +259,7 @@ def test_policy_reload_on_change(plugin, home):
 # ---- CLIs -------------------------------------------------------------------------------------
 
 def run_cli(*args, env=None):
-    return subprocess.run([sys.executable, *args], capture_output=True, text=True, timeout=60, env=env)
+    return subprocess.run([sys.executable, *args], capture_output=True, text=True, timeout=60, env=env, check=False)
 
 
 def test_policy_check_cli_explains(tmp_path):

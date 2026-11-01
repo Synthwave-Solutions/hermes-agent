@@ -3877,7 +3877,7 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_anthropic_client(reason="anthropic_stream_request"), kind="anthropic_messages")
         return self._call_anthropic(request_client)
 
-    def _log_attempt_timing(self, stream_attempt: int, error: "BaseException | None") -> None:
+    def _log_attempt_timing(self, stream_attempt: int, error: BaseException | None) -> None:
         """SYNTHWAVE fork: one content-free ``stream_attempt_timing`` row per chat-completions
         attempt (``agent.stream_diag``); the anthropic wire records no timing boundaries."""
         if self.agent.api_mode == "anthropic_messages":

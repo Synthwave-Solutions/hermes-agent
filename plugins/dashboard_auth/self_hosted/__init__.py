@@ -319,7 +319,7 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         session_groups, session_roles, identity_claims = self._governance_facets(claims, email=email)
         return dataclasses.replace(session, groups=session_groups, roles=session_roles, claims=identity_claims)
 
-    def _session_from_tokens(self, *, id_token: str, refresh_token: str, claims: Dict[str, Any]) -> Session:
+    def _session_from_tokens(self, *, id_token: str, refresh_token: str, claims: dict[str, Any]) -> Session:
         """Keyword-only alias of :meth:`_session` kept for the governance claim-mapping tests."""
         return self._session(id_token, refresh_token, claims)
 
@@ -337,8 +337,8 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         return ()
 
     def _governance_facets(
-        self, claims: Dict[str, Any], *, email: str,
-    ) -> tuple[tuple[str, ...], tuple[str, ...], Dict[str, Any]]:
+        self, claims: dict[str, Any], *, email: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
         """``(groups, roles, identity_claims)`` from verified claims.
 
         Groups: the configured group claim plus the Google ``hd`` and ``email`` pseudo-groups,

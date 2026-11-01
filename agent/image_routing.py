@@ -410,7 +410,7 @@ def decide_image_input_mode(
     if _explicit_aux_vision_override(cfg):  # auto: an explicit auxiliary.vision backend wins
         return "text"
     # Keep the three-argument call contract for callers/tests that replace the lookup hook.
-    extra: Dict[str, Any] = {"requested_provider": requested_provider} if requested_provider else {}
+    extra: dict[str, Any] = {"requested_provider": requested_provider} if requested_provider else {}
     if not allow_network:
         extra["allow_network"] = False
     return "native" if _lookup_supports_vision(provider, model, cfg, **extra) is True else "text"
@@ -565,7 +565,7 @@ def _attach_limit(env_name: str, default: int) -> int:
         return default
 
 
-def _downscale_for_attachment(raw: bytes, mime: str, *, source: str = "") -> Tuple[bytes, str]:
+def _downscale_for_attachment(raw: bytes, mime: str, *, source: str = "") -> tuple[bytes, str]:
     """Shrink oversized attachment images before they are base64-embedded.
 
     Full-resolution phone photos and 4K screenshots (2-4 MB PNG each) become

@@ -210,12 +210,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
         # Agent Cards are public; profile/tenant topology is not leaked on remote unauthenticated GETs.
-        sec = adapter._security_context
         if self._admitted_peer() is not None:
             payload["served_agents"] = adapter._served_agent_summary(public_url=public_url)
         self._json(200, payload)
 
-    def _admitted_peer(self) -> Optional["synthpulse_governance.PeerAdmission"]:
+    def _admitted_peer(self) -> Optional[synthpulse_governance.PeerAdmission]:
         """The admission of this request's caller, or None (no audit row)."""
         client_ip = self.client_address[0] if self.client_address else ""
         identity = self.adapter._security_context.authenticate(self.headers.get("Authorization"), client_ip)
@@ -231,7 +230,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         return None if isinstance(admission, synthpulse_governance.Refusal) else admission
 
 
-    def _refuse(self, refusal: "synthpulse_governance.Refusal", req_id: Any = None, *,
+    def _refuse(self, refusal: synthpulse_governance.Refusal, req_id: Any = None, *,
                 peer: str = "", actor: str = "", agent: str = "", task_id: str = "",
                 rpc_method: str = "", mode: str = "", org_scope: str = "",
                 caller_installation: str = "") -> None:
@@ -244,7 +243,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self._json(refusal.http_status, refusal.jsonrpc(req_id))
 
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         adapter = self.adapter
         # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
         identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())

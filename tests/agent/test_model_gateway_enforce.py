@@ -36,7 +36,7 @@ PROVIDER_KEY = "sk-or-provider-must-not-leak"
 class _GatewayHandler(BaseHTTPRequestHandler):
     server_version = "FakeGateway/1"
 
-    def log_message(self, *args, **kwargs):  # noqa: D401 - silence
+    def log_message(self, *args, **kwargs):
         pass
 
     def _record(self, body):
@@ -57,14 +57,14 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         self._record(None)
         if self.path.rstrip("/").endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": "gw-model", "object": "model"}]})
             return
         self._send_json(404, {"error": {"message": "not found"}})
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         try:

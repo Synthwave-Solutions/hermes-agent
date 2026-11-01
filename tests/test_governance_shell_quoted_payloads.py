@@ -106,7 +106,7 @@ def test_quoted_interpreter_payload_reaches_real_dispatch_without_phantom_approv
         calls.append(args['command'])
         completed = subprocess.run(['/bin/bash', '-c', args['command']], cwd=tmp_path,
             env={'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'},
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, timeout=5, check=False)
         return json.dumps({'exit_code': completed.returncode, 'output': completed.stdout})
     monkeypatch.setattr(model_tools.registry, 'dispatch', dispatch)
     with governance_context(ctx):

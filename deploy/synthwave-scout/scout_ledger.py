@@ -82,7 +82,7 @@ def ledger_path(home: Path | None = None) -> Path:
 
 # --- hashing -----------------------------------------------------------------------------
 
-_TRACKING_PARAMS = re.compile(r"^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$|ref$)", re.I)
+_TRACKING_PARAMS = re.compile(r"^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$|ref$)", re.IGNORECASE)
 
 
 def normalize_url(url: str) -> str:
@@ -91,8 +91,7 @@ def normalize_url(url: str) -> str:
              if not _TRACKING_PARAMS.match(k)]
     path = parts.path.rstrip("/") or "/"
     host = parts.netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
+    host = host.removeprefix("www.")
     return urlunsplit((parts.scheme.lower() or "https", host, path, urlencode(sorted(query)), ""))
 
 
@@ -102,7 +101,7 @@ def _norm_text(text: str) -> str:
 
 def item_hash(source: str, id_or_url: str, title: str = "") -> str:
     ref = str(id_or_url or "").strip()
-    if re.match(r"^https?://", ref, re.I):
+    if re.match(r"^https?://", ref, re.IGNORECASE):
         key = "url|" + normalize_url(ref)
     else:
         key = "|".join((_norm_text(source), _norm_text(ref), _norm_text(title)))

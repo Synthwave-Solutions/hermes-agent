@@ -55,7 +55,7 @@ def _run(argv, cwd=None, env=None, timeout=None, input_text=None):
         # the message and would wait for EOF forever.
         extra = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
         done = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout,
-                              capture_output=True, text=True, **extra)
+                              capture_output=True, text=True, **extra, check=False)
         return done.returncode, (done.stdout or "") + (done.stderr or "")
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or b"") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
@@ -328,7 +328,7 @@ def main(job_dir: str) -> int:
         if job.get("worktree"):
             try:
                 workroot, git_info = prepare_worktree(job)
-            except Exception as exc:  # noqa: BLE001 - reported to the agent
+            except Exception as exc:
                 print("\n".join(report + ["status: failed", f"reason: {exc}"]))
                 return 1
         else:

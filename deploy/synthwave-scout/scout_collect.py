@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import scout_ledger  # noqa: E402
+import scout_ledger
 
 WAKE_FALSE = json.dumps({"wakeAgent": False})
 MAX_ITEMS = 40
@@ -177,7 +177,7 @@ def load_meta(home: Path) -> dict:
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _BOX = re.compile(r"[─-╿▀-▟⠀-⣿]")
-_INVISIBLE = re.compile(r"[​-‏‪-‮⁠-⁤﻿\x00-\x08\x0b-\x1f\x7f]")
+_INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff\x00-\x08\x0b-\x1f\x7f]")
 # Copied from synthwave-policy (policy_engine._SECRET_PATTERNS) plus AWS access keys and Telegram
 # bot tokens. Kept in this repo on purpose: the Scout script must run without the plugin.
 _SECRET_PATTERNS = [
@@ -241,7 +241,7 @@ _NOISE_LINE = re.compile(
 def summarize_output(text: str) -> tuple[str, str]:
     """``(status, summary)`` from a cron output markdown document."""
     status = ""
-    m = re.search(r"^\*\*Status:\*\*\s*(.+)$", text, re.M)
+    m = re.search(r"^\*\*Status:\*\*\s*(.+)$", text, re.MULTILINE)
     if m:
         status = m.group(1).strip()
     body = text.rpartition("## Response")[2] if "## Response" in text else text
@@ -249,7 +249,7 @@ def summarize_output(text: str) -> tuple[str, str]:
     return status, clean(" ".join(kept), SUMMARY_CHARS)
 
 
-def iso(ts: float | int | None) -> str:
+def iso(ts: float | None) -> str:
     if not ts:
         return ""
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
@@ -260,7 +260,7 @@ def _parse_iso(value) -> float | None:
         return None
     try:
         from datetime import datetime
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(str(value)).timestamp()
     except ValueError:
         return None
 
@@ -461,10 +461,10 @@ def collect_kanban(ctx: dict, now: float) -> list[dict]:
 
 # --- ledger feedback from the previous Scout answer ---------------------------------------------
 
-LEDGER_LINE = re.compile(r"^[ \t>*`_-]{0,6}SCOUT-LEDGER:[ \t]*(?P<body>[^\n]{0,4000})", re.M)
+LEDGER_LINE = re.compile(r"^[ \t>*`_-]{0,6}SCOUT-LEDGER:[ \t]*(?P<body>[^\n]{0,4000})", re.MULTILINE)
 LEDGER_ENTRY = re.compile(r"^(?P<hash>[0-9a-f]{8,12})=(?P<status>ignored|saved|attached|notified)$")
 WEB_LINE = re.compile(r"^[ \t>*`_-]{0,6}SCOUT-WEB:[ \t]*(?P<url>https?://[^\s|]{1,2000})[ \t]*\|[ \t]*"
-                      r"(?P<title>[^|\n]{0,300}?)[ \t]*(?:\|[ \t]*(?P<status>ignored|saved|notified)[ \t]*)?`?$", re.M)
+                      r"(?P<title>[^|\n]{0,300}?)[ \t]*(?:\|[ \t]*(?P<status>ignored|saved|notified)[ \t]*)?`?$", re.MULTILINE)
 MAX_LEDGER_ENTRIES = 100
 MAX_WEB_LINES = 30
 MAX_FEEDBACK_FILES = 5
@@ -491,10 +491,10 @@ def classify_run_doc(text: str) -> tuple[str, str]:
     ``gate`` (the collector said wakeAgent=false, no agent ran) or ``failed``.
     """
     head = text[:4000]
-    if re.search(r"^# Cron Job: .*\(FAILED\)\s*$", head, re.M) or re.search(
-            r"^\*\*Status:\*\* (script failed|monitor source failed|BLOCKED)", head, re.M):
+    if re.search(r"^# Cron Job: .*\(FAILED\)\s*$", head, re.MULTILINE) or re.search(
+            r"^\*\*Status:\*\* (script failed|monitor source failed|BLOCKED)", head, re.MULTILINE):
         return "failed", ""
-    if re.search(r"^\*\*Status:\*\* (silent|no_change)", head, re.M):
+    if re.search(r"^\*\*Status:\*\* (silent|no_change)", head, re.MULTILINE):
         return "gate", ""
     frames = list(_RESPONSE_FRAME.finditer(text))
     if frames:

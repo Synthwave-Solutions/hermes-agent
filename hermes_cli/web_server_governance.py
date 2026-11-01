@@ -63,7 +63,7 @@ def governance_policy_etag(raw: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def governance_policy_summary(raw: Any) -> Dict[str, Any]:
+def governance_policy_summary(raw: Any) -> dict[str, Any]:
     data = raw if isinstance(raw, dict) else {}
     users = data.get("users") if isinstance(data.get("users"), dict) else {}
     groups = data.get("groups") if isinstance(data.get("groups"), dict) else {}
@@ -100,7 +100,7 @@ def audit_governance_policy_change(
         return
 
 
-def validated_governance_entry(raw_entry: Any, *, kind: str) -> Dict[str, Any]:
+def validated_governance_entry(raw_entry: Any, *, kind: str) -> dict[str, Any]:
     if raw_entry is None:
         return {}
     if not isinstance(raw_entry, dict):
@@ -124,13 +124,13 @@ def validated_governance_entry(raw_entry: Any, *, kind: str) -> Dict[str, Any]:
     return dict(raw_entry)
 
 
-def governance_raw_policy(request: Request) -> Dict[str, Any]:
+def governance_raw_policy(request: Request) -> dict[str, Any]:
     from hermes_cli.dashboard_governance.enforcement import policy_for_request
 
     return dict(policy_for_request(request).raw or {})
 
 
-def save_governance_raw_policy(raw: Dict[str, Any], *, label: str) -> Path:
+def save_governance_raw_policy(raw: dict[str, Any], *, label: str) -> Path:
     from hermes_cli.dashboard_governance.loader import GovernancePolicyError, save_governance_policy
 
     try:
@@ -142,7 +142,7 @@ def save_governance_raw_policy(raw: Dict[str, Any], *, label: str) -> Path:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-def subject_from_payload(raw_subject: Dict[str, Any]):
+def subject_from_payload(raw_subject: dict[str, Any]):
     """Build a hypothetical :class:`GovernanceSubject` for preview/simulate requests."""
     from hermes_cli.dashboard_governance.models import GovernanceSubject
 
@@ -189,7 +189,7 @@ def ensure_model_allowed(governance_access, provider: str, model: str) -> None:
 
 
 def dashboard_governance_context_env_for_ws(
-    ws: "WebSocket", *, credential: str, profile: Optional[str], resume: Optional[str],
+    ws: WebSocket, *, credential: str, profile: Optional[str], resume: Optional[str],
     channel: Optional[str],
 ) -> Optional[str]:
     """Serialize the accepted WS principal's effective governance for PTY children.

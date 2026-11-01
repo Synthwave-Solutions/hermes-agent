@@ -11,8 +11,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-import scout_collect  # noqa: E402
-import scout_ledger  # noqa: E402
+import scout_collect
+import scout_ledger
 
 WAKE_FALSE = '{"wakeAgent": false}'
 
@@ -132,17 +132,17 @@ def test_second_run_reshows_until_classified(env, capsys):
     write_jobs(env["home"], [{"id": "j1", "name": "Daily", "last_status": "error",
                               "last_error": "boom 123", "failure_streak": 2}])
     write_output(env["home"], "j1", "a.md", "## Response\n\nsomething happened")
-    code, out = run(capsys)
+    _code_135, out = run(capsys)
     assert "Job faalt: Daily" in out and "Output: Daily" in out
     # no Scout answer recorded (run failed or absent): the items come back, marked as repeats
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert "Job faalt: Daily" in out and "opnieuw, 1x getoond" in out
 
 
 def test_failure_disabled_job_ignored(env, capsys):
     write_profile(env["home"])
     write_jobs(env["home"], [{"id": "j1", "name": "Old", "enabled": False, "last_status": "error"}])
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
 
 
@@ -152,7 +152,7 @@ def test_silent_output_skipped_and_old_output_skipped(env, capsys):
                              {"id": "j2", "name": "B", "last_status": "ok"}])
     write_output(env["home"], "j1", "a.md", "**Status:** silent (empty output)\n")
     write_output(env["home"], "j2", "b.md", "## Response\n\nold news", mtime=time.time() - 10 * 86400)
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
 
 
@@ -167,7 +167,7 @@ def test_kanban_blocked_task_picked_up(env, capsys):
         ("t_5", "Done", None, "testbot", "done", now - 9 * 86400),
         ("t_6", "Review me", None, "testbot", "review", now),
     ])
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert "Taak t_1: Need invoice data" in out and "Geblokkeerd" in out
     assert "Taak t_2" in out and "Stil sinds" in out
     assert "Taak t_6" in out
@@ -188,9 +188,9 @@ def test_kanban_source_error_is_noted_not_fatal(env, capsys):
 
 def test_topics_wake_once_per_interval(env, capsys):
     write_profile(env["home"], topics=["AI act", "MKB automatisering"])
-    code, out = run(capsys)
+    _code_191, out = run(capsys)
     assert WAKE_FALSE not in out and "Webonderwerpen" in out and "- AI act" in out
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
 
 
@@ -226,9 +226,9 @@ def test_ledger_cli(tmp_path):
     r = subprocess.run(cli + ["add", "web", "https://example.com/x/", "Other"],
                        env=env, capture_output=True, text=True, check=True)
     assert r.stdout.split()[1:] == ["known", "new"]
-    r = subprocess.run(cli + ["mark", h, "notified"], env=env, capture_output=True, text=True)
+    r = subprocess.run(cli + ["mark", h, "notified"], env=env, capture_output=True, text=True, check=False)
     assert r.returncode == 0 and "notified" in r.stdout
-    r = subprocess.run(cli + ["mark", h, "nope"], env=env, capture_output=True, text=True)
+    r = subprocess.run(cli + ["mark", h, "nope"], env=env, capture_output=True, text=True, check=False)
     assert r.returncode == 1
     r = subprocess.run(cli + ["list"], env=env, capture_output=True, text=True, check=True)
     assert "notified" in r.stdout
@@ -240,7 +240,7 @@ def test_output_size_caps(env, capsys, monkeypatch):
     write_jobs(env["home"], jobs)
     for j in jobs:
         write_output(env["home"], j["id"], "a.md", "## Response\n\n" + ("lorem ipsum " * 200))
-    code, out = run(capsys)
+    _code_243, out = run(capsys)
     assert len(out) <= scout_collect.MAX_CHARS + 200
     assert out.count("(job_output)") < 40
     assert "niet getoond" in out
@@ -251,7 +251,7 @@ def test_output_size_caps(env, capsys, monkeypatch):
         if line.startswith("  "):
             assert len(line) <= scout_collect.SUMMARY_CHARS + 2
     # remaining items surface on the next run
-    code, out2 = run(capsys)
+    _code, out2 = run(capsys)
     assert WAKE_FALSE not in out2 and "(job_output)" in out2
 
 
@@ -262,7 +262,7 @@ def test_item_cap_40(env, capsys, monkeypatch):
     write_jobs(env["home"], jobs)
     for j in jobs:
         write_output(env["home"], j["id"], "a.md", "## Response\n\nshort")
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert out.count("(job_output)") == 40
 
 
@@ -276,7 +276,7 @@ def test_script_runs_standalone_like_cron(env, tmp_path):
     """Run as a subprocess with no args and HERMES_HOME only, cwd = scripts dir parent."""
     write_profile(env["home"], enabled=False)
     r = subprocess.run([sys.executable, str(REPO / "scout_collect.py")], cwd=str(tmp_path),
-                       env=dict(os.environ), capture_output=True, text=True, timeout=60)
+                       env=dict(os.environ), capture_output=True, text=True, timeout=60, check=False)
     assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == WAKE_FALSE
 
 

@@ -128,7 +128,7 @@ def test_a_ceiled_sessions_terminal_forwards_no_run(relay_store, posts, monkeypa
 
 def test_a_ceiled_run_that_is_not_relay_fronted_reports_no_execution(relay_store, posts, monkeypatch):
     """The refusal is a plain refusal, not a claimed run that failed."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from hermes_cli.dashboard_governance.context import governance_context
     from tools.cronjob_tools import cronjob
 

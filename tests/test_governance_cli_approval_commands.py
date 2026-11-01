@@ -45,7 +45,7 @@ def runtime(tmp_path, monkeypatch):
         assert name == "terminal"
         dispatched.append(args["command"])
         completed = subprocess.run(args["command"], shell=True, cwd=tmp_path,
-            env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5)
+            env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5, check=False)
         return json.dumps({"exit_code": completed.returncode, "output": completed.stdout})
     monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
     monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)

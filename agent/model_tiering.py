@@ -43,22 +43,22 @@ TIER_TO_MODEL = {
 # Explicit deep-thinking requests from the user.
 _XHIGH_RE = re.compile(
     r"\b(think\s+(?:very\s+)?(?:hard|deep(?:ly)?)|ultrathink|denk\s+(?:heel\s+)?(?:diep|hard)"
-    r"|maximum\s+reasoning|xhigh)\b", re.I)
+    r"|maximum\s+reasoning|xhigh)\b", re.IGNORECASE)
 # Work where reasoning depth genuinely pays off.
 _HIGH_RE = re.compile(
     r"\b(architect(?:ure|uur)?|security\s*review|root\s*cause|design\s+(?:a|the|een)"
     r"|waarom\s+faalt|why\s+does\s+.{0,40}\s+fail|deadlock|race\s*condition"
-    r"|migration\s+plan|migratieplan|proof|bewijs|complex)\b", re.I)
+    r"|migration\s+plan|migratieplan|proof|bewijs|complex)\b", re.IGNORECASE)
 # Ordinary coding / editing / analysis work.
 _MEDIUM_RE = re.compile(
     r"\b(implement|refactor|debug|fix|bouw|build|schrijf|write|analyseer|analy[sz]e"
-    r"|deploy|genereer|generate|maak\s+(?:een|de|het)|create|review)\b", re.I)
+    r"|deploy|genereer|generate|maak\s+(?:een|de|het)|create|review)\b", re.IGNORECASE)
 # Capability cues that want the big model regardless of thinking depth.
 _SOL_RE = re.compile(
     r"\b(productie|production|klant|client[-\s]facing|deliverable|volledige?\s+(?:app|rapport|document)"
-    r"|hele\s+codebase|end[-\s]to[-\s]end|architect\w*)\b", re.I)
+    r"|hele\s+codebase|end[-\s]to[-\s]end|architect\w*)\b", re.IGNORECASE)
 
-_ERROR_MARKER_RE = re.compile(r"(traceback|error|failed|exception|denied)", re.I)
+_ERROR_MARKER_RE = re.compile(r"(traceback|error|failed|exception|denied)", re.IGNORECASE)
 
 
 def _msg_text(msg: Any) -> str:
@@ -93,7 +93,7 @@ def tiering_request_user(agent, messages: list, original_user_message: Any):
         _REQUEST_USER.reset(token)
 
 
-def classify_turn(api_messages: list) -> Tuple[str, str, str]:
+def classify_turn(api_messages: list) -> tuple[str, str, str]:
     """Return (tier, effort, reason) for the upcoming call."""
     last_user = ""
     recent_error_count = 0

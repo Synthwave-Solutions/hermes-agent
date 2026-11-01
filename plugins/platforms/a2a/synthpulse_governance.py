@@ -44,7 +44,7 @@ import os
 import time
 import urllib.parse
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from fnmatch import fnmatchcase
 from typing import Any, Mapping, Optional
 
@@ -621,7 +621,7 @@ def record_decision(decision: str, reason: str, *, peer: str = "", actor: str = 
                    reason, peer or "-", agent or "-", rpc_method or "-")
     try:
         _append_central_event({
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "service": CENTRAL_EVENT_SERVICE,
             "kind": CENTRAL_EVENT_KIND,
             "level": "warning",

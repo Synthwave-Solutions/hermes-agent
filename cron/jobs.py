@@ -1928,7 +1928,7 @@ def cron_system_principal() -> str:
 # ---------------------------------------------------------------------------
 
 
-def platform_root_for(home: Union[str, Path]) -> Optional[Path]:
+def platform_root_for(home: str | Path) -> Optional[Path]:
     """The platform root home that ``home`` is a named profile of, or None.
 
     ``<root>/profiles/<name>`` gives ``<root>``. A root home (or any path
@@ -1947,7 +1947,7 @@ def platform_root_for(home: Union[str, Path]) -> Optional[Path]:
     return profile.parent.parent
 
 
-def read_config_file(path: Path) -> Dict[str, Any]:
+def read_config_file(path: Path) -> dict[str, Any]:
     """Read a config.yaml as a plain mapping; {} when it does not exist.
 
     Raises ValueError when the file exists but cannot be read or is not a
@@ -1974,9 +1974,9 @@ def _configured_policy_file(config: Any) -> str:
 
 def resolve_cron_policy_path(
     *,
-    hermes_home: Optional[Union[str, Path]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Tuple[Path, str]:
+    hermes_home: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> tuple[Path, str]:
     """Where the governance policy of a cron store lives, and why.
 
     Returns ``(path, source)``: ``"store"`` when the store's own policy
@@ -2047,8 +2047,8 @@ def _policy_mode(path: Path) -> str:
 
 def load_cron_governance_policy(
     *,
-    hermes_home: Optional[Union[str, Path]] = None,
-    config: Optional[Dict[str, Any]] = None,
+    hermes_home: Optional[str | Path] = None,
+    config: Optional[dict[str, Any]] = None,
 ):
     """The governance policy a cron store's fires run under.
 
@@ -2159,7 +2159,7 @@ def _governed_caller_identities(*, include_ceiling: bool = True) -> Optional[fro
     An address that cannot be used, or a context that cannot be read, is
     "" and matches no job, so the caller acts on nothing (fail closed).
     """
-    identities: Set[str] = set()
+    identities: set[str] = set()
     raw = str(os.environ.get(_GOVERNED_SHELL_IDENTITY_ENV) or "").strip()
     if raw:
         identities.add(_owner_or_blank(raw))
@@ -2232,7 +2232,7 @@ def _ensure_owned_by_caller(job: Any, identities: Optional[frozenset]) -> None:
         raise CronJobAccessDenied(_FOREIGN_JOB_ERROR)
 
 
-def _check_context_sources(refs: Any, jobs: List[Dict[str, Any]], identities: Optional[frozenset]) -> None:
+def _check_context_sources(refs: Any, jobs: list[dict[str, Any]], identities: Optional[frozenset]) -> None:
     """A governed person may chain only the output of their own jobs."""
     if identities is None or not refs:
         return
@@ -2302,7 +2302,7 @@ def _ensure_no_bot_ceiling() -> None:
         raise CronJobAccessDenied(_BOT_CEILING_ERROR)
 
 
-def _update_only_pauses(updates: Dict[str, Any]) -> bool:
+def _update_only_pauses(updates: dict[str, Any]) -> bool:
     """Whether ``updates`` only stops the job (what ``pause_job`` writes)."""
     for key, value in (updates or {}).items():
         if key in ("paused_at", "paused_reason"):
@@ -2337,7 +2337,7 @@ def _same_job_value(stored: Any, value: Any) -> bool:
     return stored == value
 
 
-def _ensure_no_admin_only_values(values: Dict[str, Any], stored: Optional[Dict[str, Any]]) -> None:
+def _ensure_no_admin_only_values(values: dict[str, Any], stored: Optional[dict[str, Any]]) -> None:
     """Refuse a governed person a script, monitor or script-only job.
 
     Clearing a field is always allowed, and so is saving back the value an
@@ -2366,7 +2366,7 @@ def _ensure_no_admin_only_values(values: Dict[str, Any], stored: Optional[Dict[s
         raise CronJobAccessDenied(_ADMIN_ONLY_JOB_FIELDS_ERROR.format(fields=", ".join(refused)))
 
 
-def _delivery_elements(deliver: Any) -> List[str]:
+def _delivery_elements(deliver: Any) -> list[str]:
     if deliver is None:
         return []
     raw = deliver if isinstance(deliver, (list, tuple)) else str(deliver).split(",")
@@ -2378,7 +2378,7 @@ def _delivery_target_key(element: str) -> str:
     return f"{platform.strip().lower()}:{rest.strip()}"
 
 
-def _origin_delivery_targets(origin: Any) -> Set[str]:
+def _origin_delivery_targets(origin: Any) -> set[str]:
     """The explicit ``platform:chat_id[:thread_id]`` forms of ``origin``."""
     if not isinstance(origin, dict):
         return set()
@@ -2393,7 +2393,7 @@ def _origin_delivery_targets(origin: Any) -> Set[str]:
     return targets
 
 
-def _cron_run_delivery_targets() -> Set[str]:
+def _cron_run_delivery_targets() -> set[str]:
     """The delivery target of the cron run this call is made from.
 
     A job created from a cron run stores that run's own target in place of
@@ -2478,7 +2478,7 @@ def _ensure_viewable_skills(skills: Any, stored: Any) -> None:
     if not new:
         return
     try:
-        import tools.skills_tool  # noqa: F401 (registers skill_view with its toolset)
+        import tools.skills_tool
         from agent.skill_utils import normalize_skill_lookup_name
         from hermes_cli.dashboard_governance.context import (
             DashboardGovernanceContext,
@@ -2564,7 +2564,7 @@ def _ownerless_create_refusal() -> Optional[str]:
     creating it would only hide that. Same policy, same rule.
     """
     try:
-        import hermes_cli.dashboard_governance.loader  # noqa: F401 (governance installed?)
+        import hermes_cli.dashboard_governance.loader
     except ImportError:
         return None
     try:
@@ -2758,7 +2758,7 @@ def owner_audit_file() -> Path:
     return _current_cron_store().cron_dir / OWNER_AUDIT_FILE_NAME
 
 
-def _append_owner_audit(row: Dict[str, Any]) -> None:
+def _append_owner_audit(row: dict[str, Any]) -> None:
     """Append one audit row and flush it to disk before returning."""
     path = owner_audit_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4621,7 +4621,7 @@ def reassign_job_owner(
     reason: str = "",
     source: str = "cli",
     expected_owner: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Give a job a new owner: the only way to change ``owner_email``.
 
     ``update_job`` refuses the identity fields, so this admin path is the one

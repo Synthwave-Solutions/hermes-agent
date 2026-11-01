@@ -310,7 +310,7 @@ def test_real_agent_context_and_usage_accounting_share_scoped_snapshot(monkeypat
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock())
         monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
-        monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
         agent = run_agent.AIAgent(model=MODEL, provider="custom", requested_provider="custom:fixture",
                                  base_url=url, api_key="key-A", quiet_mode=True,
                                  skip_context_files=True, skip_memory=True, skip_background_review=True)

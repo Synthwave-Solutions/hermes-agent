@@ -355,7 +355,7 @@ class TaskStore:
     def __init__(self) -> None:
         self._tasks: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
-        self._context_owners: "OrderedDict[str, str]" = OrderedDict()
+        self._context_owners: OrderedDict[str, str] = OrderedDict()
         self._lock = threading.Lock()
 
     @staticmethod

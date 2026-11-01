@@ -1206,7 +1206,7 @@ class TestOwnSessionAttachmentsAreReadable:
         from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
         from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
         workspace = str(tmp_path / "clients" / "_synthwave")
-        members_only = lambda path: path == workspace  # noqa: E731
+        members_only = lambda path: path == workspace
         mine = replace(DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID),
                        workspace_path=workspace, workspace_access_check=members_only)
         assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed

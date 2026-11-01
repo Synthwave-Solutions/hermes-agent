@@ -2889,7 +2889,7 @@ def _ownerless_fire_refusal(job: dict) -> Optional[str]:
     if job.get("no_agent"):
         return None
     try:
-        import hermes_cli.dashboard_governance.loader  # noqa: F401 (governance installed?)
+        import hermes_cli.dashboard_governance.loader
     except ImportError:
         return None
     from cron.jobs import load_cron_governance_policy
@@ -4805,7 +4805,7 @@ from cron.scheduler_tick import tick
 # Split modules. Imported at the bottom (import cycle: they late-bind ``cron.scheduler`` as
 # ``_sched``). Only names this module itself calls; everything else lives in the split module.
 # ---------------------------------------------------------------------------
-from cron.scheduler_delivery import (  # noqa: E402
+from cron.scheduler_delivery import (
     _KNOWN_DELIVERY_PLATFORMS,  # SynthPulse WebUI compatibility (cron delivery picker)
     _deliver_result, _delivery_lane_value, _normalize_deliver_value, _resolve_delivery_target,
     _resolve_delivery_targets,

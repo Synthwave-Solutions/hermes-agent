@@ -646,7 +646,6 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
     if tool_name == OPENCODE_TOOL_NAME:
         return _decide_opencode_tool_access(access, registry)
     identity = identify_tool(tool_name, registry)
-    grants = access.grants
     from .models import grant_matches
     if grant_matches(access.deny.tools, tool_name) or (identity.toolset and grant_matches(access.deny.toolsets, identity.toolset)):
         return AccessDecision(False, "explicit_deny", detail=tool_name)

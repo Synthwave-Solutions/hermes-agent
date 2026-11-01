@@ -916,7 +916,7 @@ def detect_local_server_type(
 _SPECULATION_INCOMPLETE = object()
 
 
-def _speculative_protocol_outcomes(legs, serial_probe, headers: Dict[str, str], verify) -> Iterator[Tuple[Optional[str], Any]]:
+def _speculative_protocol_outcomes(legs, serial_probe, headers: dict[str, str], verify) -> Iterator[tuple[Optional[str], Any]]:
     """Run the remaining protocol probes of ``detect_local_server_type`` concurrently and return
     their outcomes in priority order, stopping after the first match or connect timeout.
 
@@ -1332,7 +1332,7 @@ def _run_endpoint_metadata_fetch(memo_key, normalized, api_key, options, flight,
 
 def _fetch_endpoint_model_metadata_uncached(
     normalized: str, api_key: str, *, native_protocol_probes: bool = True,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """The probe ladder; invoked once per in-flight metadata scope (callers store the result)."""
     local = is_local_endpoint(normalized)
     alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"

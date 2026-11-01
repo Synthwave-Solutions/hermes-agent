@@ -316,7 +316,7 @@ class TestTokensRequired:
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
 
         def check_unconfigured(base, adapter, seen):
-            status, card = _get(base + "/.well-known/agent-card.json")
+            _status, card = _get(base + "/.well-known/agent-card.json")
             assert card["security"] == [{"bearer": []}]
 
         _run_live(monkeypatch, check_unconfigured)

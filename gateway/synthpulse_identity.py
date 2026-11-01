@@ -262,7 +262,7 @@ def fail_closed_reason(source, *, multiplexed: bool) -> str:
 
 
 class Handle:
-    __slots__ = ("token", "scope", "email", "profile")
+    __slots__ = ("email", "profile", "scope", "token")
 
     def __init__(self, token, scope, email, profile):
         self.token, self.scope, self.email, self.profile = token, scope, email, profile

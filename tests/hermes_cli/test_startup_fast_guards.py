@@ -47,7 +47,7 @@ def _product_name(env: dict) -> str:
     brand is the active skin's ``agent_name``, so the parity checks never hard-code it)."""
     probe = "from hermes_cli.banner import _skin_branding; print(_skin_branding('agent_name', 'Hermes Agent'))"
     result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
-                            timeout=60, cwd=REPO_ROOT, env=env)
+                            timeout=60, cwd=REPO_ROOT, env=env, check=False)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip().splitlines()[-1]
 

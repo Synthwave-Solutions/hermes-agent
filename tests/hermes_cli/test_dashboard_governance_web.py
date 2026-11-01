@@ -355,7 +355,7 @@ def test_model_options_are_filtered_by_provider_and_model_grants(
     # Upstream's build_model_options_payload is no longer a thin wrapper (it reads
     # ctx.current_provider to prewarm pricing), so stub the function the live route
     # calls. The route still applies the governance filter to whatever it returns.
-    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: {})
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", dict)
     monkeypatch.setattr("hermes_cli.inventory.build_model_options_payload", fake_payload)
 
     resp = governed_client.get("/api/model/options")

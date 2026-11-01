@@ -97,12 +97,12 @@ class Segment:
     """
 
     raw: str
-    argv: List[str]
-    write_targets: List[str]
-    heredocs: List[str] = field(default_factory=list)
-    touch_targets: List[str] = field(default_factory=list)
-    code: List[str] = field(default_factory=list)
-    herestrings: List[str] = field(default_factory=list)
+    argv: list[str]
+    write_targets: list[str]
+    heredocs: list[str] = field(default_factory=list)
+    touch_targets: list[str] = field(default_factory=list)
+    code: list[str] = field(default_factory=list)
+    herestrings: list[str] = field(default_factory=list)
     dynamic: bool = False
     undecidable: bool = False
 
@@ -111,7 +111,7 @@ class Segment:
         return " ".join(self.argv)
 
 
-def _read_balanced(text: str, i: int) -> Tuple[str, int]:
+def _read_balanced(text: str, i: int) -> tuple[str, int]:
     """Read from text[i] (just after an opening paren) to the matching ``)``. Returns (inner, end_index)."""
     depth = 1
     start = i
@@ -152,7 +152,7 @@ def _lookup_name(inner: str) -> Optional[str]:
 _HEREDOC_START = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z0-9_.\-]+)\2")
 
 
-def split_shell(text: str, _depth: int = 0) -> List[Tuple[str, List[str], bool]]:
+def split_shell(text: str, _depth: int = 0) -> list[tuple[str, list[str], bool]]:
     """Split a shell string into (segment_text, heredoc_bodies, piped) tuples.
 
     Breaks on unquoted ``; & | newline ( )``; command substitutions ``$( )`` and backticks become
@@ -164,11 +164,11 @@ def split_shell(text: str, _depth: int = 0) -> List[Tuple[str, List[str], bool]]
     """
     if _depth > 6:
         return []
-    out: List[Tuple[str, List[str], bool]] = []
-    extra: List[Tuple[str, List[str], bool]] = []
-    cur: List[str] = []
-    cur_heredocs: List[str] = []
-    pending: List[Tuple[str, bool]] = []  # (delimiter, strip_tabs)
+    out: list[tuple[str, list[str], bool]] = []
+    extra: list[tuple[str, list[str], bool]] = []
+    cur: list[str] = []
+    cur_heredocs: list[str] = []
+    pending: list[tuple[str, bool]] = []  # (delimiter, strip_tabs)
     quote = ""
     i = 0
     n = len(text)
@@ -269,10 +269,10 @@ def split_shell(text: str, _depth: int = 0) -> List[Tuple[str, List[str], bool]]
         if ch == "\n":
             if pending:
                 # Consume heredoc bodies that start on the next line.
-                seg_heredocs: List[str] = []
+                seg_heredocs: list[str] = []
                 pos = i + 1
                 for delim, strip_tabs in pending:
-                    body_lines: List[str] = []
+                    body_lines: list[str] = []
                     while pos <= n:
                         j = text.find("\n", pos)
                         line = text[pos:] if j < 0 else text[pos:j]
@@ -308,7 +308,7 @@ def split_shell(text: str, _depth: int = 0) -> List[Tuple[str, List[str], bool]]
     return out + extra
 
 
-def _strip_wrappers(argv: List[str]) -> List[str]:
+def _strip_wrappers(argv: list[str]) -> list[str]:
     """Drop env assignments and transparent wrappers (sudo, env, timeout, nice, xargs, command, ...).
 
     ``env -S 'cmd args'`` is split into words; ``command -v X`` (a lookup, not a run) is kept as is.
@@ -392,16 +392,16 @@ def _strip_wrappers(argv: List[str]) -> List[str]:
     return rest
 
 
-def _tokenize(seg: str) -> List[str]:
+def _tokenize(seg: str) -> list[str]:
     try:
         return shlex.split(seg, comments=False, posix=True)
     except ValueError:
         return seg.split()
 
 
-def _extract_redirects(tokens: List[str], herestrings: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
-    argv: List[str] = []
-    targets: List[str] = []
+def _extract_redirects(tokens: list[str], herestrings: Optional[list[str]] = None) -> tuple[list[str], list[str]]:
+    argv: list[str] = []
+    targets: list[str] = []
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -431,7 +431,7 @@ def _extract_redirects(tokens: List[str], herestrings: Optional[List[str]] = Non
     return argv, targets
 
 
-def _command_write_targets(argv: List[str]) -> List[str]:
+def _command_write_targets(argv: list[str]) -> list[str]:
     """Files a command writes to, for the commands we understand. Conservative: unknown -> []."""
     if not argv:
         return []
@@ -447,7 +447,7 @@ def _command_write_targets(argv: List[str]) -> List[str]:
         return [plain[-1]]
     if cmd in ("sed", "perl") and any(a == "-i" or a.startswith("-i") or a == "--in-place" for a in args):
         # sed -i 'script' files...  /  sed -i -e script files...
-        files: List[str] = []
+        files: list[str] = []
         skip_next = False
         script_seen = any(a in ("-e", "--expression") for a in args)
         for a in args:
@@ -473,7 +473,7 @@ def _command_write_targets(argv: List[str]) -> List[str]:
     return []
 
 
-def _command_touch_targets(argv: List[str]) -> List[str]:
+def _command_touch_targets(argv: list[str]) -> list[str]:
     """Files a command deletes, moves away or changes the mode of (on top of what it writes)."""
     if not argv:
         return []
@@ -506,11 +506,11 @@ def _producer_text(seg: Optional[Segment]) -> Optional[str]:
     return " ".join(words).replace("\\n", "\n").replace("\\t", "\t")
 
 
-def _interpreter_payloads(argv: List[str]) -> Tuple[List[str], bool]:
+def _interpreter_payloads(argv: list[str]) -> tuple[list[str], bool]:
     """Program text given on the command line, and whether the program comes from stdin."""
     cmd = argv[0]
     args = argv[1:]
-    code: List[str] = []
+    code: list[str] = []
     if re.match(r"^[gmn]?awk$", cmd):
         i = 0
         while i < len(args):
@@ -554,7 +554,7 @@ def _interpreter_payloads(argv: List[str]) -> Tuple[List[str], bool]:
     return code, reads_stdin
 
 
-def _ssh_remote_command(argv: List[str]) -> Optional[str]:
+def _ssh_remote_command(argv: list[str]) -> Optional[str]:
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -571,14 +571,14 @@ def _ssh_remote_command(argv: List[str]) -> Optional[str]:
     return None
 
 
-def _find_exec_commands(argv: List[str]) -> List[str]:
+def _find_exec_commands(argv: list[str]) -> list[str]:
     """``find ... -exec cmd args ;`` / ``-execdir`` / ``-ok``: the commands find runs."""
-    out: List[str] = []
+    out: list[str] = []
     i = 1
     while i < len(argv):
         if argv[i] in ("-exec", "-execdir", "-ok", "-okdir"):
             j = i + 1
-            words: List[str] = []
+            words: list[str] = []
             while j < len(argv) and argv[j] not in (";", "\\;", "+"):
                 words.append(argv[j])
                 j += 1
@@ -593,19 +593,19 @@ def _find_exec_commands(argv: List[str]) -> List[str]:
 _VAR_REF = re.compile(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$")
 
 
-def parse_command(command: str, _depth: int = 0, _vars: Optional[Dict[str, str]] = None) -> List[Segment]:
+def parse_command(command: str, _depth: int = 0, _vars: Optional[dict[str, str]] = None) -> list[Segment]:
     """Parse a shell command string into executed simple commands (recursing into ``bash -c``,
     ``eval``, ``ssh host cmd``, ``env -S``, ``find -exec``, heredocs, here-strings and echo/printf
     text piped into a shell). Simple ``VAR=value`` assignments made earlier in the same command are
     substituted when the variable is used in command position."""
-    segments: List[Segment] = []
+    segments: list[Segment] = []
     if not isinstance(command, str) or not command.strip() or _depth > 4:
         return segments
-    variables: Dict[str, str] = _vars if _vars is not None else {}
+    variables: dict[str, str] = _vars if _vars is not None else {}
     prev: Optional[Segment] = None
     prev_piped = False
     for raw, heredocs, piped in split_shell(command):
-        herestrings: List[str] = []
+        herestrings: list[str] = []
         tokens = _tokenize(raw)
         tokens, targets = _extract_redirects(tokens, herestrings)
         lead = tokens[1:] if tokens[:1] in (["export"], ["local"], ["declare"], ["readonly"]) else tokens
@@ -694,7 +694,7 @@ def parse_command(command: str, _depth: int = 0, _vars: Optional[Dict[str, str]]
 # Rules
 # ---------------------------------------------------------------------------------------------
 
-def _as_list(value: Any) -> List[Any]:
+def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
     if isinstance(value, (list, tuple)):
@@ -702,7 +702,7 @@ def _as_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _compile_regex(pattern: Any, where: str) -> "re.Pattern[str]":
+def _compile_regex(pattern: Any, where: str) -> re.Pattern[str]:
     if not isinstance(pattern, str) or not pattern:
         raise PolicyError(f"{where}: regex must be a non-empty string")
     try:
@@ -711,7 +711,7 @@ def _compile_regex(pattern: Any, where: str) -> "re.Pattern[str]":
         raise PolicyError(f"{where}: invalid regex {pattern!r}: {exc}") from exc
 
 
-def _check_globs(values: Any, where: str) -> List[str]:
+def _check_globs(values: Any, where: str) -> list[str]:
     out = []
     for v in _as_list(values):
         if not isinstance(v, str) or not v:
@@ -722,20 +722,20 @@ def _check_globs(values: Any, where: str) -> List[str]:
 
 @dataclass
 class Matchers:
-    tool: List[str] = field(default_factory=list)
-    mcp_server: Optional["re.Pattern[str]"] = None
-    mcp_tool: Optional["re.Pattern[str]"] = None
+    tool: list[str] = field(default_factory=list)
+    mcp_server: Optional[re.Pattern[str]] = None
+    mcp_tool: Optional[re.Pattern[str]] = None
     has_mcp: bool = False
-    command: List["re.Pattern[str]"] = field(default_factory=list)
-    command_text: List["re.Pattern[str]"] = field(default_factory=list)
-    writes_path: List[str] = field(default_factory=list)
-    rm_allow: Optional[List[str]] = None
-    args: Dict[str, "re.Pattern[str]"] = field(default_factory=dict)
-    args_text: List["re.Pattern[str]"] = field(default_factory=list)
-    code_text: List["re.Pattern[str]"] = field(default_factory=list)
+    command: list[re.Pattern[str]] = field(default_factory=list)
+    command_text: list[re.Pattern[str]] = field(default_factory=list)
+    writes_path: list[str] = field(default_factory=list)
+    rm_allow: Optional[list[str]] = None
+    args: dict[str, re.Pattern[str]] = field(default_factory=dict)
+    args_text: list[re.Pattern[str]] = field(default_factory=list)
+    code_text: list[re.Pattern[str]] = field(default_factory=list)
     undecidable: Optional[bool] = None
-    touches_path: List[str] = field(default_factory=list)
-    page_url: List["re.Pattern[str]"] = field(default_factory=list)
+    touches_path: list[str] = field(default_factory=list)
+    page_url: list[re.Pattern[str]] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (self.tool or self.has_mcp or self.command or self.command_text or self.writes_path
@@ -746,7 +746,7 @@ class Matchers:
         return bool(self.command or self.command_text or self.rm_allow is not None or self.undecidable is not None)
 
 
-def _compile_matchers(spec: Dict[str, Any], where: str) -> Matchers:
+def _compile_matchers(spec: dict[str, Any], where: str) -> Matchers:
     m = Matchers()
     m.tool = [t.lower() for t in _check_globs(spec.get("tool"), f"{where}.tool")]
     if "mcp" in spec:
@@ -785,10 +785,10 @@ class Rule:
     description: str
     when: Matchers
     unless: Optional[Matchers]
-    tags: List[str]
+    tags: list[str]
     origin: str  # "global" or "profile:<name>"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "decision": self.decision, "description": self.description,
                 "tags": list(self.tags), "origin": self.origin}
 
@@ -823,17 +823,17 @@ def _compile_rule(spec: Any, where: str, origin: str) -> Rule:
 class ProfilePolicy:
     mode: Optional[str] = None
     default_decision: Optional[str] = None
-    overrides: Dict[str, str] = field(default_factory=dict)
-    disable: List[str] = field(default_factory=list)
-    rules: List[Rule] = field(default_factory=list)
+    overrides: dict[str, str] = field(default_factory=dict)
+    disable: list[str] = field(default_factory=list)
+    rules: list[Rule] = field(default_factory=list)
 
 
 @dataclass
 class Policy:
     mode: str
     default_decision: str
-    rules: List[Rule]
-    profiles: Dict[str, ProfilePolicy]
+    rules: list[Rule]
+    profiles: dict[str, ProfilePolicy]
     max_bytes: int
     keep: int
     source: str = ""
@@ -842,10 +842,10 @@ class Policy:
         p = self.profiles.get(profile)
         return (p.mode if p and p.mode else self.mode)
 
-    def rules_for(self, profile: str) -> List[Tuple[Rule, str]]:
+    def rules_for(self, profile: str) -> list[tuple[Rule, str]]:
         """Effective (rule, decision) list for a profile, profile rules first."""
         p = self.profiles.get(profile) or ProfilePolicy()
-        out: List[Tuple[Rule, str]] = []
+        out: list[tuple[Rule, str]] = []
         for r in p.rules + self.rules:
             if r.id in p.disable:
                 continue
@@ -896,7 +896,7 @@ def compile_policy(data: Any, source: str = "") -> Policy:
         if r.id in seen:
             raise PolicyError(f"duplicate rule id {r.id!r}")
         seen.add(r.id)
-    profiles: Dict[str, ProfilePolicy] = {}
+    profiles: dict[str, ProfilePolicy] = {}
     profiles_raw = data.get("profiles") or {}
     if not isinstance(profiles_raw, dict):
         raise PolicyError("profiles must be a mapping of profile name to settings")
@@ -979,11 +979,11 @@ _V4A_PATH = re.compile(r"(?m)^\*\*\* (?:Update File|Add File|Delete File|Move to
 @dataclass
 class CallContext:
     tool_name: str
-    args: Dict[str, Any]
+    args: dict[str, Any]
     page_url: str = ""
-    _segments: Optional[List[Segment]] = None
+    _segments: Optional[list[Segment]] = None
     _args_text: Optional[str] = None
-    _code_texts: Optional[List[str]] = None
+    _code_texts: Optional[list[str]] = None
 
     @property
     def tool_lower(self) -> str:
@@ -1005,7 +1005,7 @@ class CallContext:
         return 0
 
     @property
-    def segments(self) -> List[Segment]:
+    def segments(self) -> list[Segment]:
         if self._segments is None:
             self._segments = parse_command(self.command) if self.command else []
         return self._segments
@@ -1024,7 +1024,7 @@ class CallContext:
         return self._args_text
 
     @property
-    def code_texts(self) -> List[str]:
+    def code_texts(self) -> list[str]:
         """Program text the call executes: interpreter payloads in a shell command, or the code of
         execute_code. Plain shell words (grep patterns, echo text) are not code."""
         if self._code_texts is None:
@@ -1040,7 +1040,7 @@ class CallContext:
     def undecidable(self) -> bool:
         return any(s.undecidable for s in self.segments)
 
-    def mcp_parts(self) -> Optional[Tuple[str, str]]:
+    def mcp_parts(self) -> Optional[tuple[str, str]]:
         name = self.tool_name or ""
         if name.startswith("mcp__") or name.startswith("connectors__"):
             rest = name.split("__", 1)[1]
@@ -1052,9 +1052,9 @@ class CallContext:
             return "", name[4:]  # legacy single-underscore form: server boundary unknown
         return None
 
-    def write_targets(self) -> List[str]:
+    def write_targets(self) -> list[str]:
         if self.tool_lower in TERMINAL_TOOLS:
-            out: List[str] = []
+            out: list[str] = []
             for s in self.segments:
                 out.extend(s.write_targets)
             return out
@@ -1070,16 +1070,16 @@ class CallContext:
             return out
         return []
 
-    def touch_targets(self) -> List[str]:
+    def touch_targets(self) -> list[str]:
         if self.tool_lower in TERMINAL_TOOLS:
-            out: List[str] = []
+            out: list[str] = []
             for s in self.segments:
                 out.extend(s.touch_targets)
             return out
         return self.write_targets()
 
 
-def _iter_strings(value: Any, depth: int = 0) -> List[str]:
+def _iter_strings(value: Any, depth: int = 0) -> list[str]:
     if depth > 6:
         return []
     if isinstance(value, str):
@@ -1111,12 +1111,12 @@ def _glob_match(path: str, patterns: Iterable[str], basename: bool = True) -> bo
     return False
 
 
-def _rm_recursive_targets(seg: Segment) -> Optional[List[str]]:
+def _rm_recursive_targets(seg: Segment) -> Optional[list[str]]:
     argv = seg.argv
     if not argv or argv[0] != "rm":
         return None
     recursive = False
-    targets: List[str] = []
+    targets: list[str] = []
     end_opts = False
     for a in argv[1:]:
         if not end_opts and a == "--":
@@ -1207,7 +1207,7 @@ def _matchers_hit(m: Matchers, ctx: CallContext) -> bool:
 class Decision:
     decision: str
     rule: Optional[Rule]
-    matched: List[Tuple[Rule, str]]
+    matched: list[tuple[Rule, str]]
     mode: str
     profile: str
 
@@ -1215,7 +1215,7 @@ class Decision:
     def rule_id(self) -> Optional[str]:
         return self.rule.id if self.rule else None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "decision": self.decision, "mode": self.mode, "profile": self.profile,
             "rule": self.rule.to_dict() if self.rule else None,
@@ -1263,7 +1263,7 @@ def evaluate(policy: Policy, tool_name: str, args: Any, profile: str = "default"
     if ctx.primary_text_len() > MAX_EVAL_CHARS:
         return Decision("ASK", TOO_LONG_RULE, [(TOO_LONG_RULE, "ASK")], mode, profile)
     skip = set(skip_tags or ())
-    matched: List[Tuple[Rule, str]] = []
+    matched: list[tuple[Rule, str]] = []
     for rule, decision in policy.rules_for(profile):
         if skip and skip.intersection(rule.tags):
             continue
@@ -1272,7 +1272,7 @@ def evaluate(policy: Policy, tool_name: str, args: Any, profile: str = "default"
         if rule.unless is not None and not rule.unless.is_empty() and _matchers_hit(rule.unless, ctx):
             continue
         matched.append((rule, decision))
-    best: Optional[Tuple[Rule, str]] = None
+    best: Optional[tuple[Rule, str]] = None
     for rule, decision in matched:
         if best is None or SEVERITY[decision] > SEVERITY[best[1]]:
             best = (rule, decision)
@@ -1281,14 +1281,14 @@ def evaluate(policy: Policy, tool_name: str, args: Any, profile: str = "default"
     return Decision(best[1], best[0], matched, mode, profile)
 
 
-def combine(decisions: List[Decision]) -> Decision:
+def combine(decisions: list[Decision]) -> Decision:
     """Stricter decision wins; enforce wins over observe; ties keep the first (the root policy)."""
     best = decisions[0]
     for d in decisions[1:]:
         if SEVERITY[d.decision] > SEVERITY[best.decision]:
             best = d
     mode = "enforce" if any(d.mode == "enforce" for d in decisions) else "observe"
-    matched: List[Tuple[Rule, str]] = []
+    matched: list[tuple[Rule, str]] = []
     seen: set = set()
     for d in decisions:
         for r, dec in d.matched:
@@ -1374,7 +1374,7 @@ def policy_path_for(home: Path) -> Optional[Path]:
     return None
 
 
-def marker_paths(home: Path) -> List[Path]:
+def marker_paths(home: Path) -> list[Path]:
     out = [home / "policy" / ENFORCED_MARKER]
     root_marker = root_home() / "policy" / ENFORCED_MARKER
     if not _same_dir(root_marker.parent, out[0].parent):
@@ -1393,10 +1393,10 @@ def enforced_marker(home: Path) -> Optional[Path]:
     return None
 
 
-def marker_sources(home: Path) -> Dict[str, Path]:
+def marker_sources(home: Path) -> dict[str, Path]:
     """Policy files that were enforcing when a marker was written: {"root"|"profile": marker path}.
     An unreadable marker counts as the root file."""
-    out: Dict[str, Path] = {}
+    out: dict[str, Path] = {}
     for p in marker_paths(home):
         try:
             if not p.exists():
@@ -1419,7 +1419,7 @@ def write_enforced_marker(home: Path, profile: str, sources: Iterable[str] = ("r
     fails closed instead of silently switching the guard off. Removing it is a human-only step."""
     path = home / "policy" / ENFORCED_MARKER
     wanted = sorted(set(sources))
-    current: List[str] = []
+    current: list[str] = []
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8") or "{}")
@@ -1445,11 +1445,11 @@ class PolicyCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: Dict[str, Tuple[Tuple[float, int, int], Any]] = {}
-        self.last_good: Dict[str, Policy] = {}
+        self._entries: dict[str, tuple[tuple[float, int, int], Any]] = {}
+        self.last_good: dict[str, Policy] = {}
 
     @property
-    def last_good_mode(self) -> Dict[str, str]:  # backwards compatible view
+    def last_good_mode(self) -> dict[str, str]:  # backwards compatible view
         return {k: v.mode for k, v in self.last_good.items()}
 
     def last_good_mode_for(self, path: Path, profile: str) -> Optional[str]:
@@ -1488,8 +1488,8 @@ class Effective:
     refused: a policy file is broken or the root file is missing while enforce is (or was) active.
     """
 
-    policies: List[Tuple[Path, Policy]]
-    errors: List[Tuple[Path, Exception]]
+    policies: list[tuple[Path, Policy]]
+    errors: list[tuple[Path, Exception]]
     mode: str
     fail_closed: Optional[str] = None
     marker: Optional[Path] = None
@@ -1498,7 +1498,7 @@ class Effective:
     def inert(self) -> bool:
         return not self.policies and self.fail_closed is None
 
-    def enforcing_sources(self, profile: str) -> List[str]:
+    def enforcing_sources(self, profile: str) -> list[str]:
         root = root_policy_path()
         return ["root" if path == root else "profile" for path, pol in self.policies
                 if pol.mode_for(profile) == "enforce"]
@@ -1516,8 +1516,8 @@ def load_effective(home: Path, profile: str, cache: PolicyCache) -> Effective:
     root_p = root_policy_path()
     prof_p = profile_policy_path(home)
     marker = enforced_marker(home)
-    policies: List[Tuple[Path, Policy]] = []
-    errors: List[Tuple[Path, Exception]] = []
+    policies: list[tuple[Path, Policy]] = []
+    errors: list[tuple[Path, Exception]] = []
     enforce_hint = False
     for path, is_profile in ((root_p, False), (prof_p, True)):
         if path is None or not path.exists():
@@ -1584,11 +1584,11 @@ _SUMMARY_KEYS = ("command", "path", "file_path", "target", "action", "to", "reci
                  "thread_id", "threadId", "space", "url")
 
 
-def summarize_args(tool_name: str, args: Any) -> Dict[str, Any]:
+def summarize_args(tool_name: str, args: Any) -> dict[str, Any]:
     """Small, redacted view of the arguments. Never includes message bodies or file contents."""
     if not isinstance(args, dict):
         return {}
-    out: Dict[str, Any] = {"keys": sorted(str(k) for k in args)[:30]}
+    out: dict[str, Any] = {"keys": sorted(str(k) for k in args)[:30]}
     for k in _SUMMARY_KEYS:
         if k in args and args[k] is not None:
             v = args[k]
@@ -1600,7 +1600,7 @@ def summarize_args(tool_name: str, args: Any) -> Dict[str, Any]:
 _LOG_LOCK = threading.Lock()
 
 
-def append_jsonl(path: Path, record: Dict[str, Any], max_bytes: int = DEFAULT_MAX_BYTES,
+def append_jsonl(path: Path, record: dict[str, Any], max_bytes: int = DEFAULT_MAX_BYTES,
                  keep: int = DEFAULT_KEEP) -> None:
     """Append one JSON line, rotating at ``max_bytes`` (``decisions.jsonl.1`` ... ``.<keep>``)."""
     line = json.dumps(record, ensure_ascii=False, default=str) + "\n"

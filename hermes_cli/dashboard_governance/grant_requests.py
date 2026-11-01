@@ -110,12 +110,12 @@ _TRIGGER_ENV = "HERMES_SESSION_LAST_USER_MESSAGE"
 _TRIGGER_MAX = 400
 
 _SECRET_PATTERNS = (
-    re.compile(r"\b(sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}", re.I),
+    re.compile(r"\b(sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}", re.IGNORECASE),
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"),
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
     re.compile(
         r"((?:api[\s_-]?key|token|secret|password|wachtwoord|bearer)\s*[:=]\s*)\S+",
-        re.I,
+        re.IGNORECASE,
     ),
 )
 

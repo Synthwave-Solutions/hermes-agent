@@ -68,7 +68,7 @@ _SAFE_HEADER_VALUE = re.compile(r"[^A-Za-z0-9._:@/+=-]")
 _SAFE_TAG_VALUE = re.compile(r"[^A-Za-z0-9._:@/+-]")
 _WARNED: set = set()
 _WARN_LOCK = threading.Lock()
-_FILE_CACHE: Dict[str, Tuple[int, int, str]] = {}
+_FILE_CACHE: dict[str, tuple[int, int, str]] = {}
 _FILE_CACHE_LOCK = threading.Lock()
 
 
@@ -111,7 +111,7 @@ class ModelGatewayRefused(ValueError):
             message = f"{message} ({detail})"
         super().__init__(message)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "success": False,
             "error": str(self),
@@ -138,7 +138,7 @@ class GatewaySettings:
     user_field: str = "pseudonym"
     session_header: str = _SESSION_HEADER_DEFAULT
     realtime: bool = False
-    tool_exceptions: Tuple[str, ...] = ()
+    tool_exceptions: tuple[str, ...] = ()
     key_file: str = ""
     key_env: str = ""
     principal: str = ""
@@ -259,7 +259,7 @@ def anthropic_base_url(config: Optional[Mapping[str, Any]] = None) -> str:
     return base
 
 
-def _origin(url: str) -> Optional[Tuple[str, str, int]]:
+def _origin(url: str) -> Optional[tuple[str, str, int]]:
     raw = (url or "").strip()
     if not raw:
         return None
@@ -400,7 +400,7 @@ def gateway_api_key(*, fallback: str = "", config: Optional[Mapping[str, Any]] =
     return ""
 
 
-def require_gateway(*, fallback_key: str = "", config: Optional[Mapping[str, Any]] = None) -> Tuple[str, str]:
+def require_gateway(*, fallback_key: str = "", config: Optional[Mapping[str, Any]] = None) -> tuple[str, str]:
     """Return ``(base_url, key)`` or raise :class:`ModelGatewayUnavailable`."""
     if config is None:
         config = _load_config()
@@ -501,7 +501,7 @@ def _safe_header_value(value: Any) -> str:
     return _SAFE_HEADER_VALUE.sub("", text)[:128]
 
 
-def identity_headers(session_id: Any = None, config: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+def identity_headers(session_id: Any = None, config: Optional[Mapping[str, Any]] = None) -> dict[str, str]:
     """The per-request identity headers (today the session header)."""
     s = settings(config)
     value = _safe_header_value(session_id if session_id else current_session_id())
@@ -511,13 +511,13 @@ def identity_headers(session_id: Any = None, config: Optional[Mapping[str, Any]]
 
 
 def apply_request_identity(
-    kwargs: Dict[str, Any],
+    kwargs: dict[str, Any],
     *,
     base_url: Any,
     api_mode: str = "chat_completions",
     session_id: Any = None,
     config: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add the ``user`` field and the session header to a gateway request.
 
     A request to any other endpoint is returned unchanged, so nothing changes
@@ -565,7 +565,7 @@ def _tag(value: Any) -> str:
     return _SAFE_TAG_VALUE.sub("", str(value or "").strip())[:120]
 
 
-def trace_identity(config: Optional[Mapping[str, Any]] = None, *, environment: str = "") -> Dict[str, Any]:
+def trace_identity(config: Optional[Mapping[str, Any]] = None, *, environment: str = "") -> dict[str, Any]:
     """User, profile, organisation, module and installation for a trace.
 
     ``user_id`` is the pseudonym when a person is behind the call, otherwise
@@ -774,7 +774,7 @@ def provider_credential_env_names() -> frozenset:
 
 def terminal_child_env(
     *, force_prefix: str = "_HERMES_FORCE_", config: Optional[Mapping[str, Any]] = None
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Environment overrides for a terminal child under enforcement.
 
     ``OPENAI_BASE_URL`` and ``ANTHROPIC_BASE_URL`` point at the gateway
@@ -793,7 +793,7 @@ def terminal_child_env(
         return {}
     base = s.base_url
     key = gateway_api_key(config=config) if base else ""
-    env: Dict[str, str] = {}
+    env: dict[str, str] = {}
     for name in provider_credential_env_names():
         if name in os.environ:
             env[f"{force_prefix}{name}"] = ""
@@ -813,7 +813,7 @@ def terminal_child_env(
 # ---------------------------------------------------------------------------
 
 
-def cache_token(config: Optional[Mapping[str, Any]] = None) -> Tuple[str, ...]:
+def cache_token(config: Optional[Mapping[str, Any]] = None) -> tuple[str, ...]:
     """A cache-key suffix for enforcement, endpoint and the scoped credential.
 
     Empty while enforcement is off, so cache keys stay exactly as before.

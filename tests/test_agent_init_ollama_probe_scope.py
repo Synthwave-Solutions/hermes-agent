@@ -29,7 +29,7 @@ def build_agent(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock())
     monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
-    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+    monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
     monkeypatch.setattr(metadata, "_endpoint_probe_path_cache", {})
     monkeypatch.setattr(metadata, "_LOCAL_CTX_PROBE_CACHE", {})
     monkeypatch.setattr(metadata, "_ollama_probe_misses", {})

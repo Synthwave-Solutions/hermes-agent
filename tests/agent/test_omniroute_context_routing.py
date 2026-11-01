@@ -142,13 +142,7 @@ def test_route_info_beats_agent_model_check(monkeypatch):
     capture_omniroute_route(agent, response)
 
     agent.context_compressor.update_model.assert_called_once_with(
-        model="cc/claude-opus-4-8", context_length=1_000_000, **{
-            "base_url": "http://127.0.0.1:20128/v1",
-            "api_key": "test-key",
-            "provider": "custom:omniroute",
-            "api_mode": "chat_completions",
-            "max_tokens": None,
-        },
+        model="cc/claude-opus-4-8", context_length=1_000_000, base_url="http://127.0.0.1:20128/v1", api_key="test-key", provider="custom:omniroute", api_mode="chat_completions", max_tokens=None,
     )
 
 

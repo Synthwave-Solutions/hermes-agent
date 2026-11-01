@@ -95,7 +95,7 @@ def _local_time_string(value: Any, tzinfo=None) -> Optional[str]:
     try:
         from datetime import datetime as _dt
 
-        dt = _dt.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = _dt.fromisoformat(str(value))
         if tzinfo is None:
             from hermes_time import now as _now
 
@@ -107,7 +107,7 @@ def _local_time_string(value: Any, tzinfo=None) -> Optional[str]:
         return None
 
 
-def _time_context(next_run_at: Any = None) -> Dict[str, Any]:
+def _time_context(next_run_at: Any = None) -> dict[str, Any]:
     """Current wall-clock context for scheduling replies: now_local, now_iso, timezone,
     utc_offset and (when given) the resolved next run in the configured timezone. The model
     must repeat both to the user."""
@@ -115,7 +115,7 @@ def _time_context(next_run_at: Any = None) -> Dict[str, Any]:
 
     current = _now()
     zone = getattr(current.tzinfo, "key", None) or current.tzname() or "local"
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "now_local": current.strftime("%a %Y-%m-%d %H:%M %Z"),
         "now_iso": current.isoformat(timespec="seconds"),
         "timezone": str(zone),
@@ -157,10 +157,10 @@ def _one_shot_in_past_error(schedule: str) -> Optional[str]:
     return None
 
 
-def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
+def _format_job(job: dict[str, Any]) -> dict[str, Any]:
     """``cronjob_job_args._format_job`` plus ``next_run_local`` right after ``next_run_at``."""
     base = _format_job_base(job)
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for key, value in base.items():
         out[key] = value
         if key == "next_run_at":

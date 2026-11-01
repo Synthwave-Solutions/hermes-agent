@@ -204,7 +204,7 @@ def test_an_env_dict_value_never_sets_the_ceiling():
 
 
 def test_cron_reads_the_variable_the_spawn_paths_write():
-    import cron.jobs as jobs
+    from cron import jobs
 
     assert jobs._BOT_CEILING_IDENTITY_ENV == local._BOT_CEILING_IDENTITY_ENV == CEILING
     assert jobs._GOVERNED_SHELL_IDENTITY_ENV == IDENTITY

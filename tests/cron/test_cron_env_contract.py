@@ -10,7 +10,7 @@ def home(tmp_path, monkeypatch):
     h = tmp_path / "home"
     (h / "scripts").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(h))
-    import cron.jobs as jobs
+    from cron import jobs
     with jobs.use_cron_store(h):
         yield h
 
@@ -31,7 +31,7 @@ def test_real_no_agent_child_metadata_and_parent_unchanged(home, monkeypatch, tr
     job = create_job(None, "every 1h", name="contract", script=script(home), no_agent=True,
                      notify={"in_app": "quiet", "delivery": "failures"}, managed_by="synthwave")
     before = {k: v for k, v in os.environ.items() if k.startswith("HERMES_CRON_")}
-    ok, doc, response, error = run_job(job, trigger=trigger, trigger_actor="person@example.test", run_prompt=prompt)
+    ok, _doc, response, error = run_job(job, trigger=trigger, trigger_actor="person@example.test", run_prompt=prompt)
     assert ok, error
     data = json.loads(response)
     assert data["HERMES_CRON_JOB_ID"] == job["id"]
@@ -118,7 +118,7 @@ def test_notify_tool_roundtrip_and_legacy_toast(home):
 
 
 def test_real_fire_persists_redacted_script_failure(home, monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from cron.jobs import create_job, get_job
     secret = "ghp_" + "Y" * 36
     (home / "scripts" / "failure.py").write_text(f'print({secret!r})\nraise SystemExit(2)\n')

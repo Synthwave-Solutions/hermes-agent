@@ -146,7 +146,7 @@ def test_native_retry_keeps_attempts_separate_and_unknown_fields_null(monkeypatc
 
 
 def test_native_cancel_does_not_retry_or_log_success(monkeypatch, tmp_path, caplog):
-    agent, clock = setup_agent(monkeypatch, tmp_path, caplog)
+    agent, _clock = setup_agent(monkeypatch, tmp_path, caplog)
     client = MagicMock()
 
     def cancel(**kwargs):
@@ -164,7 +164,7 @@ def test_native_cancel_does_not_retry_or_log_success(monkeypatch, tmp_path, capl
 
 
 def test_native_tool_only_keeps_text_observation_unknown(monkeypatch, tmp_path, caplog):
-    agent, clock = setup_agent(monkeypatch, tmp_path, caplog)
+    agent, _clock = setup_agent(monkeypatch, tmp_path, caplog)
     client = MagicMock()
     tool = SimpleNamespace(index=0, id='private-tool-id', type='function',
         function=SimpleNamespace(name='private-tool-name', arguments='{"private-argument":true}'))
@@ -180,7 +180,7 @@ def test_native_tool_only_keeps_text_observation_unknown(monkeypatch, tmp_path, 
 
 
 def test_native_logger_failure_preserves_answer(monkeypatch, tmp_path, caplog):
-    agent, clock = setup_agent(monkeypatch, tmp_path, caplog)
+    agent, _clock = setup_agent(monkeypatch, tmp_path, caplog)
     client = MagicMock()
     client.chat.completions.create.return_value = iter([chunk('unchanged')])
     monkeypatch.setattr(agent, '_create_request_openai_client', lambda **k: client)
@@ -194,7 +194,7 @@ def test_native_logger_failure_preserves_answer(monkeypatch, tmp_path, caplog):
 
 
 def test_completed_response_adapter_does_not_invent_headers_or_chunks(monkeypatch, tmp_path, caplog):
-    agent, clock = setup_agent(monkeypatch, tmp_path, caplog)
+    agent, _clock = setup_agent(monkeypatch, tmp_path, caplog)
     client = MagicMock()
     complete = SimpleNamespace(id='fixture-complete', model=agent.model, usage=None,
         choices=[SimpleNamespace(message=SimpleNamespace(content='completed adapter',

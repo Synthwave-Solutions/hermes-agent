@@ -695,7 +695,7 @@ registry.register(
     emoji="🔊",
     dynamic_schema_overrides=_tts_schema_overrides)
 
-def _check_tts_model_gateway(provider: str, tts_config: Dict[str, Any]) -> None:
+def _check_tts_model_gateway(provider: str, tts_config: dict[str, Any]) -> None:
     """Refuse a TTS backend that bypasses the model gateway (R2).
 
     No-op unless ``model_gateway.enforce`` is on. Then only ``openai`` with

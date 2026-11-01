@@ -29,7 +29,7 @@ from tools.approval_context import (
     get_current_session_key,
 )
 # SynthPulse WebUI compatibility: the WebUI binds the approval session through this module.
-from tools.approval_context import reset_current_session_key, set_current_session_key  # noqa: E402,F401
+from tools.approval_context import reset_current_session_key, set_current_session_key
 from tools.approval_detection import (
     _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
 )
@@ -39,7 +39,7 @@ from tools.approval_floors import (
 )
 from tools.approval_gateway_wait import _await_gateway_decision
 # SynthPulse WebUI compatibility: the WebUI seeds and inspects gateway queue entries through this module.
-from tools.approval_gateway_wait import _ApprovalEntry  # noqa: E402,F401
+from tools.approval_gateway_wait import _ApprovalEntry
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
 

@@ -3222,10 +3222,10 @@ def _resolve_gateway_client(
         )
         return None, None
     client = _create_openai_client(api_key=api_key, base_url=base_url)
-    setattr(client, "_hermes_aux_effective_provider", _model_gateway.GATEWAY_LABEL)
+    client._hermes_aux_effective_provider = _model_gateway.GATEWAY_LABEL
     if async_mode:
         client, final_model = _to_async_client(client, final_model, is_vision=is_vision)
-        setattr(client, "_hermes_aux_effective_provider", _model_gateway.GATEWAY_LABEL)
+        client._hermes_aux_effective_provider = _model_gateway.GATEWAY_LABEL
     return client, final_model
 
 def _get_provider_chain() -> list[tuple]:

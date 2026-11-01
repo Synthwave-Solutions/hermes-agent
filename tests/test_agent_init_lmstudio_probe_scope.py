@@ -70,7 +70,7 @@ def build(monkeypatch, tmp_path):
     Path(tmp_path, "config.yaml").write_text(json.dumps(cfg))
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock())
     monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
-    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+    monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
     return run_agent.AIAgent(model=MODEL, provider="custom", requested_provider="custom:fixture",
                             base_url=BASE, api_key="fixture-key", quiet_mode=True,
                             skip_context_files=True, skip_memory=True, skip_background_review=True)

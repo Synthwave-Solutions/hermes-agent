@@ -261,7 +261,7 @@ def _normalize_project_file_args(function_name, function_args, task_id):
     return function_args
 
 
-def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any]):
+def _governance_argument_decision(tool_name: str, function_args: dict[str, Any]):
     ctx = _current_dashboard_governance_context()
     try:
         from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
@@ -277,7 +277,7 @@ def _governance_argument_decision(tool_name: str, function_args: Dict[str, Any])
         return None
 
 
-def _governance_usage_decision(tool_name: str, args: Optional[Dict[str, Any]] = None):
+def _governance_usage_decision(tool_name: str, args: Optional[dict[str, Any]] = None):
     ctx = _current_dashboard_governance_context()
     try:
         from hermes_cli.dashboard_governance.usage import check_usage_caps
@@ -293,7 +293,7 @@ def _governance_usage_decision(tool_name: str, args: Optional[Dict[str, Any]] = 
         return None
 
 
-def _governance_record_tool_usage(tool_name: str, args: Optional[Dict[str, Any]] = None) -> None:
+def _governance_record_tool_usage(tool_name: str, args: Optional[dict[str, Any]] = None) -> None:
     ctx = _current_dashboard_governance_context()
     try:
         from hermes_cli.dashboard_governance.usage import record_tool_usage
@@ -302,7 +302,7 @@ def _governance_record_tool_usage(tool_name: str, args: Optional[Dict[str, Any]]
         logger.debug("dashboard governance usage recording failed for %s: %s", tool_name, exc)
 
 
-def _filter_tools_by_governance(tool_defs: List[Dict[str, Any]], *, _scope_status=None) -> List[Dict[str, Any]]:
+def _filter_tools_by_governance(tool_defs: list[dict[str, Any]], *, _scope_status=None) -> list[dict[str, Any]]:
     ctx = _current_dashboard_governance_context()
     if ctx is None or (getattr(ctx.access, "mode", "off") != "enforce" and not getattr(ctx, "continuation_contexts", ())
                        and not getattr(ctx, "workspace_path", "")):
@@ -355,7 +355,7 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
     """
     # Only a per-call status, never a reusable permission snapshot. A denied
     # live governance scope must not cache [] and keep a later re-authorized user empty.
-    scope_status: List[bool] = []
+    scope_status: list[bool] = []
 
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
@@ -992,7 +992,7 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id, ids.turn_id, ids.task_id)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
-    def _dispatch(next_args: Dict[str, Any]) -> Any:
+    def _dispatch(next_args: dict[str, Any]) -> Any:
         # Review the exact arguments AFTER all plugin/middleware edits.
         # The action reviewer rechecks current profile/tool/argument
         # policy and never grants a capability missing from whitelist.

@@ -161,7 +161,7 @@ def _capture_routing_origin() -> dict[str, Any]:
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
     Best-effort: empty values are omitted. A ``webui_continuation_ref`` is stamped
     only by a trusted, already-loaded WebUI helper; a malformed one fails closed."""
-    origin: Dict[str, Any] = {}
+    origin: dict[str, Any] = {}
     # Only a trusted, already-loaded WebUI helper can stamp this reference.
     # Never import a guessed host module or accept a model/tool argument.
     import sys
@@ -177,7 +177,7 @@ def _capture_routing_origin() -> dict[str, Any]:
         from gateway.session_context import get_session_env
         origin.update(
             {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))})
-    except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
+    except Exception:
         pass
     return origin
 

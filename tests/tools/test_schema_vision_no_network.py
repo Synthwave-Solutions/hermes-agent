@@ -18,7 +18,6 @@ def test_cold_schema_does_not_probe_catalog_or_local_server(monkeypatch):
     def caps(*args, **kwargs):
         calls.append(kwargs["allow_network"])
         assert kwargs["allow_network"] is False
-        return None
     monkeypatch.setattr("agent.models_dev.get_model_capabilities", caps)
     monkeypatch.setattr(image_routing, "_should_probe_ollama_vision", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no endpoint probe")))
     assert browser_use_cli._description_header() == browser_use_cli._HEADER_BASE + browser_use_cli._HEADER_AUTO_VISION

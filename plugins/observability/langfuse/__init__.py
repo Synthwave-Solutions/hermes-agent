@@ -180,11 +180,11 @@ def _redact_personal_data(value: str) -> str:
     value = _PD_EMAIL_RE.sub("[email]", value)
     value = _PD_IBAN_RE.sub("[iban]", value)
 
-    def _card(match: "re.Match[str]") -> str:
+    def _card(match: re.Match[str]) -> str:
         digits = re.sub(r"\D", "", match.group(0))
         return "[card]" if 13 <= len(digits) <= 19 and _luhn_valid(digits) else match.group(0)
 
-    def _bsn(match: "re.Match[str]") -> str:
+    def _bsn(match: re.Match[str]) -> str:
         return "[bsn]" if _bsn_valid(match.group(0).replace(".", "")) else match.group(0)
 
     value = _PD_CARD_RE.sub(_card, value)
@@ -459,7 +459,7 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
         return value
     if isinstance(value, bytes):
         return {"type": "bytes", "len": len(value)}
-    recurse = lambda v, d: _safe_value(v, max_chars=max_chars, depth=d, parse_json_strings=parse_json_strings, max_depth=max_depth)  # noqa: E731
+    recurse = lambda v, d: _safe_value(v, max_chars=max_chars, depth=d, parse_json_strings=parse_json_strings, max_depth=max_depth)
     if isinstance(value, str):
         parsed = _maybe_parse_json_string(value) if parse_json_strings else value
         return recurse(parsed, depth) if parsed is not value else _truncate_text(value, max_chars)
@@ -582,7 +582,7 @@ def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
             rate = getattr(entry, rate_attr, None) if rate_attr else None
             tokens = getattr(canonical, attr)
             if rate is not None and tokens:
-                cost_details[key] = float(Decimal(tokens) * rate / Decimal("1000000"))
+                cost_details[key] = float(Decimal(tokens) * rate / Decimal(1000000))
     except Exception:  # pragma: no cover - canonical total remains usable
         pass
 

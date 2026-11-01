@@ -1044,7 +1044,7 @@ def _resolve_model_gateway_runtime(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The runtime under ``model_gateway.enforce``: always the gateway.
 
     A named custom provider whose base URL is the gateway (HQ's
@@ -1066,7 +1066,7 @@ def _resolve_model_gateway_runtime(
             requested_provider or "auto",
         )
 
-    runtime: Optional[Dict[str, Any]] = None
+    runtime: Optional[dict[str, Any]] = None
     runtime_key: Any = None
     if (requested_provider or "").startswith("custom:"):
         named = _get_named_custom_provider(requested_provider)

@@ -21,7 +21,7 @@ def config(home, value):
 
 
 def rpc(name, params):
-    import tui_gateway.server as server
+    from tui_gateway import server
     return server.handle_request({"jsonrpc": "2.0", "id": 1, "method": name, "params": params})
 
 
@@ -71,7 +71,7 @@ def test_denied_rpc_preserves_human_lease_and_never_touches_runtime(home, monkey
 
 
 def test_request_profile_cannot_opt_in_rpc(home, tmp_path, monkeypatch):
-    import tui_gateway.server as server
+    from tui_gateway import server
     other = tmp_path / "named"
     config(other, True)
     monkeypatch.setattr(server, "_profile_home", lambda name: str(other))

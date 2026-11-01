@@ -79,7 +79,7 @@ def _parse_ts(value) -> float:
     try:
         from datetime import datetime
 
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(text).timestamp()
     except (ValueError, TypeError):
         return 0.0
 
@@ -105,7 +105,7 @@ def _skill_identifiers(skill_md: Path) -> tuple[str, str]:
 
 
 def compact_categories(
-    skills_dir: "Path | str | None" = None,
+    skills_dir: Path | str | None = None,
     *,
     config: Optional[dict[str, Any]] = None,
     now: Optional[float] = None,

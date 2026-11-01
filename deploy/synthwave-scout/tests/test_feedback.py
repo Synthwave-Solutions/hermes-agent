@@ -8,10 +8,10 @@ import time
 
 import pytest
 
-from test_scout import WAKE_FALSE, env, last_line, run, write_jobs, write_output, write_profile  # noqa: F401
+from test_scout import WAKE_FALSE, env, last_line, run, write_jobs, write_output, write_profile
 
-import scout_collect  # noqa: E402
-import scout_ledger  # noqa: E402
+import scout_collect
+import scout_ledger
 
 SCOUT = "sc01"
 
@@ -35,7 +35,7 @@ def answer(env, text, failed=False):
 
 
 def shown_hashes(out):
-    return re.findall(r"^- \[([0-9a-f]{8})\]", out, re.M)
+    return re.findall(r"^- \[([0-9a-f]{8})\]", out, re.MULTILINE)
 
 
 def rows(env):
@@ -63,11 +63,11 @@ def scout_env(env, monkeypatch):
 # ---- A1: SCOUT-LEDGER / SCOUT-WEB feedback ---------------------------------------------------
 
 def test_ledger_line_classifies_and_stops_reshow(scout_env, capsys):
-    code, out = run(capsys)
+    _code_66, out = run(capsys)
     hashes = shown_hashes(out)
     assert len(hashes) == 2 and "SCOUT-LEDGER" in out
     answer(scout_env, "Wat is er veranderd: x\nSCOUT-LEDGER: " + f"{hashes[0]}=notified, {hashes[1]}=saved")
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
     r = rows(scout_env)
     assert r[hashes[0]] == "notified" and r[hashes[1]] == "saved"
@@ -75,59 +75,59 @@ def test_ledger_line_classifies_and_stops_reshow(scout_env, capsys):
 
 
 def test_omitted_hash_is_reshown_then_auto_ignored(scout_env, capsys):
-    code, out = run(capsys)
+    _code_78, out = run(capsys)
     a, b = shown_hashes(out)
     answer(scout_env, f"SCOUT-LEDGER: {a}=ignored")
-    code, out = run(capsys)
+    _code_81, out = run(capsys)
     assert shown_hashes(out) == [b] and "opnieuw, 1x getoond" in out
     answer(scout_env, "Niets nieuws.\nSCOUT-LEDGER:")
-    code, out = run(capsys)
+    _code_84, out = run(capsys)
     assert shown_hashes(out) == [b] and "2x getoond" in out
     answer(scout_env, "nog steeds niets")
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
     assert rows(scout_env)[b] == "ignored"
 
 
 def test_silent_answer_ignores_all_shown_items(scout_env, capsys):
-    code, out = run(capsys)
+    _code_93, out = run(capsys)
     hashes = shown_hashes(out)
     answer(scout_env, "[SILENT]")
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
     assert all(rows(scout_env)[h] == "ignored" for h in hashes)
 
 
 def test_empty_answer_counts_as_silent(scout_env, capsys):
-    code, out = run(capsys)
+    _code_102, out = run(capsys)
     answer(scout_env, "(No response generated)")
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
 
 
 def test_failed_run_reshows(scout_env, capsys):
-    code, out = run(capsys)
+    _code_109, out = run(capsys)
     hashes = shown_hashes(out)
     answer(scout_env, "", failed=True)
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert shown_hashes(out) == hashes and "vorige Scout-run mislukte" in out
 
 
 def test_missing_output_reshows(scout_env, capsys):
-    code, out = run(capsys)
+    _code_117, out = run(capsys)
     hashes = shown_hashes(out)
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert shown_hashes(out) == hashes
 
 
 def test_gate_outputs_are_skipped(scout_env, capsys):
-    code, out = run(capsys)
+    _code_124, out = run(capsys)
     hashes = shown_hashes(out)
     answer(scout_env, f"SCOUT-LEDGER: {hashes[0]}=saved,{hashes[1]}=saved")
     gate = "# Cron Job: Scout\n\n**Job ID:** sc01\n**Run Time:** x\n**Schedule:** y\n\n**Status:** silent (wakeAgent=false)\n"
     _n[0] += 1
     write_output(scout_env["home"], SCOUT, f"2026-10-19_07-30-{_n[0]:02d}.md", gate, mtime=time.time() + 2)
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
 
 
@@ -148,12 +148,12 @@ def test_strict_parsing():
 def test_web_lines_recorded_and_listed_as_known(env, capsys, monkeypatch):
     monkeypatch.setenv("HERMES_CRON_JOB_ID", SCOUT)
     write_profile(env["home"], topics=["AI act"])
-    code, out = run(capsys)
+    _code_151, out = run(capsys)
     assert "Webonderwerpen" in out
     answer(env, "Gevonden.\nSCOUT-WEB: https://www.example.com/ai-act/?utm_source=x | AI act update | notified\n"
                 "SCOUT-WEB: https://example.org/old | Oud nieuws | ignored")
     monkeypatch.setattr(scout_collect, "TOPIC_INTERVAL_HOURS", 0)
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert "Al bekend, sla over:" in out and "https://www.example.com/ai-act/?utm_source=x" in out
     led = scout_ledger.Ledger(env["ledger"])
     h = scout_ledger.item_hash("web", "https://example.com/ai-act", "")
@@ -168,10 +168,10 @@ def test_own_job_found_without_env(env, capsys, monkeypatch):
     write_jobs(env["home"], [{"id": "j1", "name": "Daily", "last_status": "error"},
                              {"id": SCOUT, "name": "Scout", "managed_by": "client",
                               "script": "scout/scout_collect.py"}])
-    code, out = run(capsys)
+    _code_171, out = run(capsys)
     (h,) = shown_hashes(out)
     answer(env, f"SCOUT-LEDGER: {h}=ignored")
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert last_line(out) == WAKE_FALSE
 
 
@@ -190,12 +190,12 @@ def test_watermark_not_advanced_when_jobs_source_fails(env, capsys, monkeypatch)
     write_profile(env["home"])
     write_output(env["home"], "j1", "a.md", "## Response\n\nimportant output", mtime=time.time() - 3600)
     (env["home"] / "cron" / "jobs.json").write_text("{broken")
-    code, out = run(capsys)
+    _code_193, out = run(capsys)
     assert "cron-jobs: niet gelezen" in out, "a notes-only run wakes the agent"
-    code, out = run(capsys)
+    _code_195, out = run(capsys)
     assert last_line(out) == WAKE_FALSE, "notes-only wake at most once a day"
     write_jobs(env["home"], [{"id": "j1", "name": "Daily", "last_status": "ok"}])
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert "important output" in out, "the failed source did not move the watermark"
 
 
@@ -207,7 +207,7 @@ def test_notes_wake_again_after_a_day(env, capsys):
     led = scout_ledger.Ledger(env["ledger"])
     led.set_meta("last_notes_wake", str(time.time() - 25 * 3600))
     led.close()
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert "niet gelezen" in out
 
 

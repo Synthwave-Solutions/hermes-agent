@@ -651,7 +651,7 @@ def _gateway_stt_provider(stt_config: dict) -> str:
     logger.warning("STT provider %r refused under model_gateway.enforce", provider)
     return "none"
 
-def _stt_model_gateway_refusal(provider: str, stt_config: dict) -> Optional[Dict[str, Any]]:
+def _stt_model_gateway_refusal(provider: str, stt_config: dict) -> Optional[dict[str, Any]]:
     """The structured refusal for a configured STT backend that bypasses the gateway."""
     from agent import model_gateway
 

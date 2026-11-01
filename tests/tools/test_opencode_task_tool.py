@@ -246,15 +246,15 @@ def _wrapper_copy(tmp_path, slots=1):
 def test_wrapper_guard_default_model_key_and_slots(tmp_path):
     wrapper = _wrapper_copy(tmp_path, slots=1)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
-    done = subprocess.run([str(wrapper), "run", "hello"], env=env, capture_output=True, text=True, timeout=20)
+    done = subprocess.run([str(wrapper), "run", "hello"], env=env, capture_output=True, text=True, timeout=20, check=False)
     assert done.returncode == 0, done.stderr
     assert "-m omniroute/auto/best-coding" in done.stdout
     assert "KEY:secret-key" in done.stdout
     explicit = subprocess.run([str(wrapper), "run", "-m", "omniroute/auto/coding", "hi"], env=env,
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20, check=False)
     assert "auto/best-coding" not in explicit.stdout
     nested = subprocess.run([str(wrapper), "run", "x"], env={**env, "OPENCODE_RECURSION_GUARD": "1"},
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=20, check=False)
     assert nested.returncode == 1 and "recursion guard" in nested.stderr
     busy = subprocess.Popen([str(wrapper), "run", "long"], env={**env, "SLEEP": "4"},
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -262,7 +262,7 @@ def test_wrapper_guard_default_model_key_and_slots(tmp_path):
         import time
         time.sleep(1)
         second = subprocess.run([str(wrapper), "run", "x"], env={**env, "OPENCODE_SLOT_WAIT": "0"},
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, timeout=20, check=False)
         assert second.returncode == 75 and "slots" in second.stderr
     finally:
         busy.wait(timeout=20)
@@ -291,7 +291,7 @@ def test_sandbox_hides_unlisted_home_and_blocks_outside_writes(tmp_path):
            "mask_dirs": [], "mask_files": []}
     argv = runner.bwrap_argv(job, tmp_path / "run", worktree, {"git": False})
     def sh(cmd):
-        return subprocess.run(argv + ["bash", "-c", cmd], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return subprocess.run(argv + ["bash", "-c", cmd], capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False)
     assert sh(f"cat {allowed}/f.txt").stdout == "x"
     assert sh(f"cat {hidden}/f.txt").returncode != 0
     assert sh(f"touch {allowed}/new.txt").returncode != 0

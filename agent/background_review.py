@@ -57,9 +57,7 @@ def trace_background_review(agent: Any, event: str, *, review_run=None, **fields
             elif name in _TRACE_INT_FIELDS:
                 if type(value) is int:
                     record[name] = max(-1, min(value, 1_000_000))
-            elif name == "reason" and value in _TRACE_REASONS:
-                record[name] = value
-            elif name == "result" and value in _TRACE_RESULTS:
+            elif name == "reason" and value in _TRACE_REASONS or name == "result" and value in _TRACE_RESULTS:
                 record[name] = value
         logger.info("Background review trace: %s", json.dumps(record, sort_keys=True))
     except Exception:
@@ -1201,7 +1199,7 @@ class _ReviewForkState:
     """Mutable hand-off between the fork phase and the outer worker's error/cleanup paths."""
 
     review_agent: Any = None
-    review_messages: list[Dict] = field(default_factory=list)
+    review_messages: list[dict] = field(default_factory=list)
     review_usage: dict[str, Any] = field(default_factory=dict)
     # Fork: action lines observed once on the request exit (before the fork's clients are released),
     # whether run_conversation returned, raised or was cancelled after completing real writes.
@@ -1217,7 +1215,7 @@ def _release_fork_clients(review_agent: Any) -> None:
         review_agent.release_clients()
 
 
-def _observe_review_actions(agent: Any, messages_snapshot: List[Dict], st: _ReviewForkState) -> None:
+def _observe_review_actions(agent: Any, messages_snapshot: list[dict], st: _ReviewForkState) -> None:
     """Snapshot the fork's messages and summarize its confirmed tool results exactly once, on every
     request exit. A review may complete real writes before a later provider step raises or is
     cancelled; observing here (after request completion is published, so a waiting foreground turn

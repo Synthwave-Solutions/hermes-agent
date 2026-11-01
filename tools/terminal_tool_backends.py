@@ -402,7 +402,7 @@ def _check_plugin_requirements(config: dict[str, Any]) -> bool:
 _REQUIREMENT_CHECKERS = {name: functools.partial(_check_requirements, name) for name in _BACKEND_SPECS}
 _check_vercel_sandbox_requirements = _REQUIREMENT_CHECKERS["vercel_sandbox"]  # used by code_execution_tool
 
-def _model_gateway_child_env() -> Dict[str, str]:
+def _model_gateway_child_env() -> dict[str, str]:
     """Child environment of a local terminal under ``model_gateway.enforce`` (R2).
 
     ``OPENAI_BASE_URL`` and ``ANTHROPIC_BASE_URL`` point at the model gateway
