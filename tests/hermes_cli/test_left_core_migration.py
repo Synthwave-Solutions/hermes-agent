@@ -435,6 +435,10 @@ def test_old_langfuse_plugin_key_keeps_naming_the_catalog_plugin(tmp_path, monke
     from hermes_cli.plugins_cmd import _find_plugin_entry, _unknown_plugin_message
     from hermes_cli.plugins_discovery import gate_manifest
     from hermes_cli.plugins_manifest import PluginManifest
+    # Exercise an upstream distribution that no longer bundles this plugin.
+    monkeypatch.setattr(lcm, "_retained_bundled_plugin", lambda name: False)
+    from hermes_cli import plugins
+    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: tmp_path / "no-bundled-plugins")
     home = _home(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     for name in ("observability/langfuse", "langfuse"):

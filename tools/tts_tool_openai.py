@@ -46,6 +46,17 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
     origin = _origin()
     openai_cfg = _section(origin._load_tts_config(), "openai")
     selected = read_selection("tts")
+    from agent import model_gateway
+    if model_gateway.enforced() and selected != NOUS_MANAGED_PROVIDER:
+        configured_base = str(openai_cfg.get("base_url") or "").strip()
+        base_url = configured_base or model_gateway.gateway_base_url()
+        model_gateway.check_tool_backend("tts", "openai", base_url)
+        api_key = model_gateway.gateway_api_key(
+            fallback=openai_cfg.get("api_key", "") if model_gateway.is_gateway_url(configured_base) else "",
+        )
+        if not api_key:
+            raise model_gateway.ModelGatewayRefused("tts", "openai", "no gateway key is configured")
+        return api_key, base_url, False
     if selected == NOUS_MANAGED_PROVIDER:
         route = _managed_openai_audio_route()
         if route is None:

@@ -1227,6 +1227,11 @@ def _normalize_codex_response(
     ``recover_leaked_tool_call=False`` is for callers with no continuation (aux): tool-call-shaped text is
     then kept as ordinary content and judged by the same phase/completion gates as any other answer."""
     response_status = _lower_or_none(getattr(response, "status", None))
+    # A failed/cancelled response commonly has no output at all. Preserve its provider cause before
+    # validating the successful-response payload; the generic no-output error otherwise hides
+    # quota/context/entitlement failures from the caller's classifier and recovery policy.
+    if response_status in {"failed", "cancelled"}:
+        raise RuntimeError(_format_responses_error(getattr(response, "error", None), response_status))
     incomplete_reason = str(_field(getattr(response, "incomplete_details", None), "reason", "") or "").strip().lower()
     response_incomplete_content_filter = response_status == "incomplete" and incomplete_reason == "content_filter"
     output = getattr(response, "output", None)
@@ -1246,8 +1251,6 @@ def _normalize_codex_response(
         response.output = output = [
             SimpleNamespace(type="message", role="assistant", status="completed", content=content),
         ]
-    if response_status in {"failed", "cancelled"}:
-        raise RuntimeError(_format_responses_error(getattr(response, "error", None), response_status))
     scan = _OutputScan(response_status)
     scan.scan(output, issuer_kind, issuer_model)
     tool_calls, reasoning_parts = scan.tool_calls, scan.reasoning_parts

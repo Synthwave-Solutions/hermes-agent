@@ -1,0 +1,89 @@
+From ad216726aec206a41d2235642010696e4042598f Mon Sep 17 00:00:00 2001
+From: Michael Ramirez <michael@synthwave.solutions>
+Date: Mon, 19 Oct 2026 23:05:56 +0200
+Subject: [PATCH] perf: skip inert MCP process for tool-free completions
+
+---
+ directsdk.py                            |  8 +++-
+ tests/test_directsdk_empty_inventory.py | 50 +++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_directsdk_empty_inventory.py
+
+diff --git a/directsdk.py b/directsdk.py
+index 4a3aa83..2132dac 100644
+--- a/directsdk.py
++++ b/directsdk.py
+@@ -478,8 +478,12 @@ class Client:
+             # can still hold these open for a moment, and cleanup must not fail the request.
+             with tempfile.TemporaryDirectory(prefix='claude-directsdk-', ignore_cleanup_errors=True) as tmp:
+                 root = Path(tmp)
+-                (root / 'tools.json').write_text(json.dumps(manifest), encoding='utf-8')
+-                mcp = {'mcpServers': {'hermes': {'command': sys.executable, 'args': [str(Path(__file__).with_name('inert_mcp.py')), str(root / 'tools.json')]}}}
++                # Tool-free completions need no inventory process. Keep strict MCP
++                # isolation even with an empty inventory; never inherit user servers.
++                mcp = {'mcpServers': {}}
++                if manifest:
++                    (root / 'tools.json').write_text(json.dumps(manifest), encoding='utf-8')
++                    mcp['mcpServers']['hermes'] = {'command': sys.executable, 'args': [str(Path(__file__).with_name('inert_mcp.py')), str(root / 'tools.json')]}
+                 env = _with_windows_essentials(dict(self.env if self.env is not None else os.environ))
+                 if self.env is None:
+                     conflicts = [key for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_FOUNDRY_API_KEY') if env.get(key)]
+diff --git a/tests/test_directsdk_empty_inventory.py b/tests/test_directsdk_empty_inventory.py
+new file mode 100644
+index 0000000..dd20506
+--- /dev/null
++++ b/tests/test_directsdk_empty_inventory.py
+@@ -0,0 +1,50 @@
++"""Tool-free calls skip the inventory child while preserving native isolation."""
++import json
++import os
++from pathlib import Path
++import sys
++
++import pytest
++import directsdk
++
++
++FAKE = '''import json, pathlib, sys
++args = sys.argv
++config = json.loads(args[args.index('--mcp-config') + 1])
++assert '--strict-mcp-config' in args
++assert args[args.index('--tools') + 1] == ''
++assert args[args.index('--setting-sources') + 1] == ''
++assert args[args.index('--permission-mode') + 1] == 'dontAsk'
++assert args[args.index('--max-turns') + 1] == '1'
++assert '--no-session-persistence' in args
++inventory = config['mcpServers'].get('hermes')
++manifest = json.loads(pathlib.Path(inventory['args'][-1]).read_text()) if inventory else None
++pathlib.Path(sys.argv[1]).write_text(json.dumps({'servers': list(config['mcpServers']), 'manifest': manifest}))
++for line in sys.stdin: pass
++print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'ok'}], 'id': 'm', 'stop_reason': 'end_turn'}}), flush=True)
++print(json.dumps({'type': 'stream_event', 'event': {'type': 'message_stop'}}), flush=True)
++print(json.dumps({'type': 'result', 'subtype': 'success', 'usage': {'input_tokens': 1, 'output_tokens': 1}}), flush=True)
++'''
++
++
++@pytest.mark.parametrize('tools', [None, [], [{'type': 'function', 'function': {
++    'name': 'probe', 'description': 'Inventory only', 'parameters': {'type': 'object'},
++}}]])
++def test_inventory_child_is_needed_only_when_tools_exist(tmp_path, tools):
++    script = tmp_path / 'native.py'
++    script.write_text(FAKE)
++    observed = tmp_path / 'observed.json'
++    client = directsdk.Client(command=[sys.executable, str(script), str(observed)],
++                              env={'PATH': os.environ['PATH'], 'HOME': str(tmp_path)})
++    try:
++        chunks = list(client.create(model='sonnet', tools=tools, stream=True,
++                                   messages=[{'role': 'user', 'content': 'go'}], timeout=5))
++        assert chunks[-1].choices[0].finish_reason == 'stop'
++        result = json.loads(observed.read_text())
++        if tools:
++            assert result['servers'] == ['hermes']
++            assert result['manifest'][0]['name'] == 'probe'
++        else:
++            assert result == {'servers': [], 'manifest': None}
++    finally:
++        client.close()
+-- 
+2.47.3
+

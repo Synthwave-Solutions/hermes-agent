@@ -336,7 +336,7 @@ class TestRunJob:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
-                mock_trigger.assert_called_once_with(VALID_JOB_ID, extra_prompt=None)
+                mock_trigger.assert_called_once_with(VALID_JOB_ID, extra_prompt=None, trigger="api", trigger_actor="api_server:default")
 
     @pytest.mark.asyncio
     async def test_run_job_forwards_transient_prompt(self, adapter):
@@ -352,15 +352,17 @@ class TestRunJob:
             ):
                 resp = await cli.post(
                     f"/api/jobs/{VALID_JOB_ID}/run",
-                    json={"prompt": "focus on the EU numbers"},
+                    json={"prompt": "focus on the EU numbers", "trigger_actor": "forged-admin", "trigger": "schedule"},
                 )
                 assert resp.status == 200
                 mock_trigger.assert_called_once_with(
-                    VALID_JOB_ID, extra_prompt="focus on the EU numbers"
+                    VALID_JOB_ID, extra_prompt="focus on the EU numbers",
+                    trigger="api", trigger_actor="api_server:default"
                 )
 
     @pytest.mark.asyncio
-    async def test_run_job_prompt_too_long_rejected(self, adapter):
+    @pytest.mark.parametrize("prompt", ["x" * 5001, "é" * 4097, "x\0y"])
+    async def test_run_job_prompt_too_long_rejected(self, adapter, prompt):
         """Transient run prompt honors the same length cap as stored prompts."""
         app = _create_app(adapter)
         mock_trigger = MagicMock(return_value=SAMPLE_JOB)
@@ -372,7 +374,7 @@ class TestRunJob:
             ):
                 resp = await cli.post(
                     f"/api/jobs/{VALID_JOB_ID}/run",
-                    json={"prompt": "x" * 5001},
+                    json={"prompt": prompt},
                 )
                 assert resp.status == 400
                 mock_trigger.assert_not_called()

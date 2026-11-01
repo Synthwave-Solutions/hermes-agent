@@ -36,10 +36,60 @@ class ToolValidationVerdict:
     action: str
     result: Optional[dict[str, Any]]
     mixed_invalid_batch: bool
+    # SYNTHWAVE fork: the loop's truncated-tool-call retry counter after this validation.
+    truncated_tool_call_retries: int = 0
+
+
+# SYNTHWAVE fork: re-issues of a request whose tool-call arguments were cut off (same budget as
+# the finish_reason=length tool-call path in agent/turn_truncation.py).
+_TRUNCATED_TOOL_ARGS_MAX_RETRIES = 4
+
+
+def _truncated_tool_args_retry_enabled(agent: Any) -> bool:
+    """``agent.truncated_tool_args_retry`` (default on). Only an explicit ``False`` opts out, so
+    test doubles without the attribute keep the fork default."""
+    return getattr(agent, "_truncated_tool_args_retry", True) is not False
 
 
 def _preview_name(name: str) -> str:
     return name[:80] + "..." if len(name) > 80 else name
+
+
+def _wrap_direct_deferred_call(agent: Any, tc: Any, valid_names: Any) -> bool:
+    """SYNTHWAVE fork: a direct call to a deferred tool this session may reach (the model
+    calls it by name after ``tool_describe``) is rewritten to the ``tool_call`` bridge instead
+    of being rejected as unknown; the bridge still applies its scope and schema checks.
+    Returns True when ``tc`` was rewritten. Fail-closed: anything unexpected leaves it as is."""
+    try:
+        from tools.tool_search_catalog import TOOL_CALL_NAME
+        name = tc.function.name
+        if not name or name in valid_names or TOOL_CALL_NAME not in valid_names:
+            return False
+        from agent.tool_executor import _tool_search_scoped_names
+        if name not in _tool_search_scoped_names(agent):
+            return False
+        raw = tc.function.arguments
+        if isinstance(raw, dict):
+            args = raw
+        elif isinstance(raw, str) and raw.strip():
+            args = json.loads(raw)
+        else:
+            args = {}
+        if not isinstance(args, dict):
+            return False
+        tc.function.name = TOOL_CALL_NAME
+        tc.function.arguments = json.dumps({"calls": [{"name": name, "arguments": args}]}, ensure_ascii=False)
+        return True
+    except Exception:
+        logger.debug("direct deferred call not rewritten", exc_info=True)
+        return False
+
+
+def _wrapped_name(tc: Any) -> str:
+    try:
+        return json.loads(tc.function.arguments)["calls"][0]["name"]
+    except Exception:
+        return tc.function.name
 
 
 def _append_tool_error_results(messages, tool_calls, content_for) -> None:
@@ -72,19 +122,24 @@ def _partial_exit(agent, messages, conversation_history, api_call_count, final_r
 def validate_tool_calls(
     agent: Any, assistant_message: Any, finish_reason: str, *, messages: list[dict[str, Any]],
     conversation_history: Any, api_call_count: int, effective_task_id: Any,
+    truncated_tool_call_retries: int = 0, api_kwargs: Any = None,
 ) -> ToolValidationVerdict:
     """Validate ``assistant_message.tool_calls`` in place (ids uniquified, names
     repaired, dict/empty args normalized to JSON strings). Strikes for invalid names
     advance only when a turn has NO valid call, so a degenerate model still halts at
-    3; args cut off mid-stream (routers rewrite ``length`` → ``tool_calls``) are refused
-    outright rather than retried."""
+    3; args cut off mid-stream (routers rewrite ``length`` → ``tool_calls``) are
+    re-requested up to 4 times with a doubled output budget (SYNTHWAVE fork,
+    ``agent.truncated_tool_args_retry``), then refused rather than executed."""
     from agent.conversation_loop import _invalid_tool_name_error_content
 
     tool_calls = assistant_message.tool_calls
     valid_names = agent.valid_tool_names
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ToolValidationVerdict:
-        return ToolValidationVerdict(action=action, result=result, mixed_invalid_batch=_mixed_invalid_batch)
+        return ToolValidationVerdict(
+            action=action, result=result, mixed_invalid_batch=_mixed_invalid_batch,
+            truncated_tool_call_retries=truncated_tool_call_retries,
+        )
 
     # Uniquify duplicate tool-call ids BEFORE any downstream consumer: the
     # pre-API sanitizer keeps only the first call/result per id, and the desktop
@@ -101,6 +156,11 @@ def validate_tool_calls(
     # Repair mismatched tool names before validating (model hallucinations).
     repaired_ids = set()
     for tc in tool_calls:
+        if _wrap_direct_deferred_call(agent, tc, valid_names):
+            agent._vprint(f"{agent.log_prefix}🔧 Routed direct deferred call through tool_call: "
+                          f"'{_preview_name(_wrapped_name(tc))}'", force=True, diagnostic=True)
+            repaired_ids.add(id(tc))
+            continue
         if tc.function.name not in valid_names:
             repaired = agent._repair_tool_call(tc.function.name)
             if repaired:
@@ -185,12 +245,36 @@ def validate_tool_calls(
             for tc in tool_calls if tc.function.name in invalid_names
         )
         if _truncated:
+            agent._invalid_json_retries = 0
+            # SYNTHWAVE fork: some routers report finish_reason='tool_calls' even when the
+            # tool-argument JSON was cut off by the output cap. Treat it like the
+            # finish_reason='length' tool-call branch: never execute the partial arguments,
+            # re-issue the same API call (nothing is appended) with a raised output budget.
+            if (
+                _truncated_tool_args_retry_enabled(agent)
+                and truncated_tool_call_retries < _TRUNCATED_TOOL_ARGS_MAX_RETRIES
+            ):
+                from agent.turn_truncation import boosted_output_cap
+
+                truncated_tool_call_retries += 1
+                agent._buffer_vprint(
+                    f"⚠️  Truncated tool call arguments detected "
+                    f"(finish_reason={finish_reason!r}), retrying API call "
+                    f"({truncated_tool_call_retries}/{_TRUNCATED_TOOL_ARGS_MAX_RETRIES})..."
+                )
+                _cap_of = getattr(agent, "_requested_output_cap_from_api_kwargs", None)
+                _requested_cap = _cap_of(api_kwargs) if callable(_cap_of) else None
+                agent._ephemeral_max_output_tokens = boosted_output_cap(
+                    agent, _requested_cap, truncated_tool_call_retries,
+                    base=getattr(agent, "max_tokens", None) or _requested_cap or 4096,
+                )
+                return _verdict("continue")
+            # Retries exhausted (or disabled): upstream refusal.
             agent._vprint(
                 f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
                 f"(finish_reason={finish_reason!r}) — refusing to execute.",
                 force=True, diagnostic=True,
             )
-            agent._invalid_json_retries = 0
             agent._cleanup_task_resources(effective_task_id)
             # Blame the output cap only when the model reported one; otherwise the args
             # were cut by a stream break or a router rewriting finish_reason (#91717).

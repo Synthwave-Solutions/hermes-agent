@@ -11,6 +11,13 @@ import pytest
 from hermes_cli.dashboard_auth import ws_tickets
 
 
+@pytest.fixture(autouse=True)
+def _allow_engine_viewer(monkeypatch):
+    # These tests exercise the explicitly enabled upstream viewer contract.
+    from tools.bot_desktop import dashboard_viewer
+    monkeypatch.setattr(dashboard_viewer, "enabled", lambda: True)
+
+
 def test_install_worker_keeps_the_requested_profile_scope(tmp_path, monkeypatch):
     from hermes_constants import get_hermes_home
     from tools.bot_desktop import install, runtime

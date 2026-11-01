@@ -41,6 +41,11 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         api_mode=api_mode)
     if client is None:
         return None
+    from agent import model_gateway
+    if model_gateway.enforced() and provider != "moa":
+        provider = "custom"
+        api_mode = "chat_completions"
+        api_mode_explicit = True
     if provider == "moa":
         # A MoA entry means the preset itself, exactly like ``provider: moa`` in config. The client
         # is the preset's aggregator and only proves the preset resolves; bind the facade with the

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from agent.agent_runtime_helpers import _ra
-from agent.model_metadata import is_local_endpoint, query_ollama_num_ctx
+from agent.model_metadata import is_local_endpoint, is_explicit_remote_router, query_ollama_num_ctx
 
 
 def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
@@ -16,7 +16,8 @@ def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
             agent._ollama_num_ctx = int(_override)
         except (TypeError, ValueError):
             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
+    if (agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url)
+            and not is_explicit_remote_router(agent.provider, getattr(agent, "requested_provider", ""))):
         try:
             # api_key may be a callable (Entra token provider); detection needs a string.
             _key = agent.api_key if isinstance(agent.api_key, str) else ""

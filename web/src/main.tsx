@@ -4,6 +4,7 @@ import "./index.css";
 import App from "./App";
 import { ProfileProvider } from "./contexts/ProfileProvider";
 import { SystemActionsProvider } from "./contexts/SystemActions";
+import { GovernanceProvider } from "./contexts/GovernanceProvider";
 import { I18nProvider } from "./i18n";
 import { exposePluginSDK } from "./plugins";
 import { ThemeProvider } from "./themes";
@@ -17,13 +18,23 @@ createRoot(document.getElementById("root")!).render(
   <BrowserRouter basename={HERMES_BASE_PATH || undefined}>
     <I18nProvider>
       <ThemeProvider>
-        <SystemActionsProvider>
-          {/* Above App, so its plugin loader follows the selected profile. */}
-          <ProfileProvider>
-            <App />
-          </ProfileProvider>
-        </SystemActionsProvider>
+        <GovernanceProvider>
+          <SystemActionsProvider>
+            {/* Above App, so its plugin loader follows the selected profile. */}
+            <ProfileProvider>
+              <App />
+            </ProfileProvider>
+          </SystemActionsProvider>
+        </GovernanceProvider>
       </ThemeProvider>
     </I18nProvider>
   </BrowserRouter>,
 );
+
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js").catch((error) => {
+      console.warn("Synthwave Control service worker registration failed", error);
+    });
+  });
+}

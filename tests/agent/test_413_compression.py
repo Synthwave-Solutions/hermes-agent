@@ -21,6 +21,7 @@ from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_ST
 from hermes_state import SessionDB
 from run_agent import AIAgent
 import run_agent
+from tests.agent.raw_response_mock import wire_raw_response
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ def _new_test_agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        wire_raw_response(a.client)
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         # Default matches production (`compression.enabled` defaults to True).
@@ -878,6 +880,9 @@ class TestPreflightCompression:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            # The window is pinned by hand above; SynthPulse's routed-window
+            # capture would resize it for the mock's "test/model" answer.
+            patch("agent.chat_completion_helpers.capture_omniroute_route"),
         ):
             mock_compress.return_value = (
                 [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
@@ -1436,6 +1441,9 @@ class TestToolResultPreflightCompression:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            # The window is pinned by hand above; SynthPulse's routed-window
+            # capture would resize it for the mock's "test/model" answer.
+            patch("agent.chat_completion_helpers.capture_omniroute_route"),
         ):
             mock_compress.return_value = (
                 [{"role": "user", "content": "hello"}], "compressed prompt",
@@ -1493,6 +1501,8 @@ class TestToolResultPreflightCompression:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            # Window pinned by hand; skip the routed-window resize (SynthPulse).
+            patch("agent.chat_completion_helpers.capture_omniroute_route"),
         ):
             result = agent.run_conversation("hello")
 

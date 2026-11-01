@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from agent import chat_completion_wait_notice as wn
-from agent.model_metadata import is_local_endpoint
+from hermes_cli.timeouts import uses_local_inference_patience
 from agent.proxy_bypass import is_loopback_host
 from agent.sleep_clock import SleepWatch
 
@@ -111,7 +111,7 @@ class StreamingWaitMonitor:
             load_notice_shown=False, load_notice_misses=0, wait_notice_started_ts=None,
             wait_notice=wn.WaitNoticeState(),
         )
-        _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
+        _is_local_base = uses_local_inference_patience(self.agent)
         # Only a server on this machine sleeps with it; a remote one kept working (or died).
         sleep_watch = (SleepWatch(interval=0.3) if self.agent.base_url
                        and is_loopback_host(urlsplit(self.agent.base_url).hostname) else None)

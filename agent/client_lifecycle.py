@@ -10,7 +10,7 @@ from contextlib import suppress
 from typing import Any, Optional
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
-from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_cli.timeouts import get_provider_request_timeout, resolve_agent_provider_timeout
 from utils import base_url_host_matches, env_float
 
 logger = logging.getLogger("run_agent")  # origin module's logger name: log records / caplog filters unchanged
@@ -189,7 +189,44 @@ class ClientLifecycleMixin:
         from agent.process_bootstrap import build_keepalive_http_client
         return build_keepalive_http_client(base_url, verify=verify)
 
-    _create_openai_client = _forward("agent.agent_runtime_helpers", "create_openai_client")
+    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+        """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
+        from agent.agent_runtime_helpers import create_openai_client
+        client_kwargs = self._model_gateway_client_kwargs(client_kwargs)
+        return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
+
+    def _model_gateway_client_kwargs(self, client_kwargs: dict) -> dict:
+        """Client keyword arguments for the SynthPulse model gateway (R2).
+
+        Under ``model_gateway.enforce`` a client for any other endpoint is
+        refused (MoA's in-process facade excepted: its slots call the gateway
+        through the auxiliary client). A client for the gateway carries the
+        session header by default; each request adds the pseudonymous
+        ``user`` field (``agent.chat_completion_helpers.build_api_kwargs``).
+        """
+        from agent import model_gateway
+
+        base_url = str((client_kwargs or {}).get("base_url") or "")
+        if (
+            model_gateway.enforced()
+            and (getattr(self, "provider", "") or "").strip().lower() != "moa"
+            and not model_gateway.is_gateway_url(base_url)
+        ):
+            raise model_gateway.ModelGatewayRefused(
+                "model",
+                getattr(self, "provider", "") or "unknown",
+                "the client endpoint is not the model gateway",
+            )
+        if not model_gateway.is_gateway_url(base_url):
+            return client_kwargs
+        headers = model_gateway.identity_headers(getattr(self, "session_id", None))
+        if not headers:
+            return client_kwargs
+        kwargs = dict(client_kwargs)
+        merged = dict(kwargs.get("default_headers") or {})
+        merged.update(headers)
+        kwargs["default_headers"] = merged
+        return kwargs
     _force_close_tcp_sockets = _forward_static("agent.agent_runtime_helpers", "force_close_tcp_sockets")
     _cleanup_dead_connections = _forward("agent.agent_runtime_helpers_dead_connections", "cleanup_dead_connections")
     _run_codex_stream = _forward("agent.codex_runtime", "run_codex_stream")
@@ -489,13 +526,16 @@ class ClientLifecycleMixin:
             return ("bedrock", getattr(self, "_bedrock_region", "us-east-1") or "us-east-1")
         return (
             "direct", self._anthropic_api_key, getattr(self, "_anthropic_base_url", None),
-            get_provider_request_timeout(self.provider, self.model), bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+            # SYNTHWAVE fork: a named router (custom:omniroute) keeps its own timeout entry.
+            resolve_agent_provider_timeout(self, get_provider_request_timeout),
+            bool(getattr(self, "_oauth_1m_beta_disabled", False)),
         )
 
     def _build_direct_anthropic_client(self, token: str, base_url: Any) -> Any:
         """Native Anthropic client for ``token``/``base_url`` with the provider/model request timeout."""
         from agent.anthropic_adapter import build_anthropic_client
-        return build_anthropic_client(token, base_url, timeout=get_provider_request_timeout(self.provider, self.model))
+        return build_anthropic_client(
+            token, base_url, timeout=resolve_agent_provider_timeout(self, get_provider_request_timeout))
 
     def _anthropic_oauth_flag(self, token: str) -> bool:
         """OAuth flag only on native Anthropic routes; third-party Anthropic-protocol endpoints must not trip OAuth paths."""

@@ -960,3 +960,11 @@ def test_a_gone_target_retires_its_marker_only_over_a_clean_pre_tree(tmp_path, t
     assert marker.exists() is torn
     if torn:
         assert (root / "module.py").read_text(encoding="utf-8") == "def broken(:\n"  # never guessed back
+
+
+def test_test_checkout_refuses_recovery_before_reading_git_metadata(monkeypatch):
+    """A worktree gitdir can belong to the real installation protected by the I/O guard."""
+    root = Path(er.__file__).resolve().parent.parent
+    monkeypatch.setattr(er, "interrupted_pull_marker", lambda root: pytest.fail(
+        "The suite must not inspect its live checkout's recovery marker"))
+    assert er.restore_interrupted_pull(root) is False

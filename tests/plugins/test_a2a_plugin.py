@@ -128,8 +128,9 @@ class TestBindSafety:
 
     def test_v6_wildcard_serves_both_stacks_and_keeps_ipv4_identity(self, monkeypatch):
         """``A2A_HOST=::`` is one dual-stack socket: IPv6 and IPv4 peers both reach it, and an IPv4
-        peer keeps its plain ``ip:a.b.c.d`` identity (not ``ip:::ffff:a.b.c.d``), so an allow-list
-        written in IPv4 still admits it."""
+        peer keeps its plain ``ip:a.b.c.d`` identity (not ``ip:::ffff:a.b.c.d``).
+        SynthPulse still requires a paired identity for RPCs; widening the bind
+        must not turn a shared token into delegation authority."""
         try:
             with socket.socket(socket.AF_INET6) as probe:
                 probe.bind(("::", 0))
@@ -148,8 +149,10 @@ class TestBindSafety:
                 for host in ("[::1]", "127.0.0.1"):
                     card = await asyncio.to_thread(_get_json, f"http://{host}:{adapter.port}/.well-known/agent-card.json")
                     assert "capabilities" in card
-                resp = await asyncio.to_thread(_post_json, f"http://127.0.0.1:{adapter.port}/", tasks_list, auth)
-                assert "error" not in resp, resp
+                with pytest.raises(urllib.error.HTTPError) as refused:
+                    await asyncio.to_thread(_post_json, f"http://127.0.0.1:{adapter.port}/", tasks_list, auth)
+                assert refused.value.code == 403
+                assert adapter._security_context.authenticate("Bearer topsecret", "127.0.0.1") == "ip:127.0.0.1"
             finally:
                 await adapter.disconnect()
 
@@ -1596,6 +1599,8 @@ class TestV1SpecRegressionFixes:
     def test_rpc_send_message_v1_returns_send_message_response_wrapper(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        monkeypatch.setenv("A2A_ALLOW_UNAUTHENTICATED_LOCAL", "1")
+        monkeypatch.setenv("A2A_PUBLIC_URL", "http://127.0.0.1/")
         adapter, base = _make_live_adapter(monkeypatch)
 
         async def run():
@@ -1691,6 +1696,8 @@ class TestV1SpecRegressionFixes:
     def test_malformed_params_returns_jsonrpc_error_not_500(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        monkeypatch.setenv("A2A_ALLOW_UNAUTHENTICATED_LOCAL", "1")
+        monkeypatch.setenv("A2A_PUBLIC_URL", "http://127.0.0.1/")
         adapter, base = _make_live_adapter(monkeypatch)
 
         async def run():
@@ -1713,7 +1720,8 @@ class TestV1SpecRegressionFixes:
             assert payload["status"] == "ok"
             assert "served_agents" not in payload
             payload2 = await asyncio.to_thread(_get_json, base + "/health", {"Authorization": "Bearer secret"})
-            assert "served_agents" in payload2
+            # A shared bearer is not an admitted installation pair.
+            assert "served_agents" not in payload2
             await adapter.disconnect()
 
         asyncio.run(run())

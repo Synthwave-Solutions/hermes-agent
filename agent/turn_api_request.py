@@ -40,6 +40,23 @@ def _set_extra_header(api_kwargs: Any, key: str, value: str) -> None:
     api_kwargs["extra_headers"] = _xh
 
 
+def _apply_action_stall_tool_choice(agent: Any, api_kwargs: dict, messages: Any) -> None:
+    """Require an actual call on an internally marked action-stall retry only.
+
+    Do not change schemas, permissions, explicit tool restrictions or native
+    provider semantics. Normal dispatch and approval gates still execute.
+    """
+    if (
+        agent.api_mode == "chat_completions"
+        and messages
+        and messages[-1].get("role") == "user"
+        and messages[-1].get("_action_stall_retry") is True
+        and api_kwargs.get("tools")
+        and api_kwargs.get("tool_choice") in (None, "auto")
+    ):
+        api_kwargs["tool_choice"] = "required"
+
+
 def _fire_pre_api_request_hook(
     agent: Any, api_kwargs: Any, api_messages: Any, _llm_middleware_trace: Any, *, messages: Any,
     original_user_message: Any, approx_tokens: Any, total_chars: Any, retry_count: Any,
@@ -118,10 +135,13 @@ def build_api_request(
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
     observe_request_tools(agent, tools_for_api)
-    if tools_for_api == agent.tools:
-        api_kwargs = agent._build_api_kwargs(api_messages)
-    else:
-        api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    from agent.model_tiering import tiering_request_user
+    with tiering_request_user(agent, messages, original_user_message):
+        if tools_for_api == agent.tools:
+            api_kwargs = agent._build_api_kwargs(api_messages)
+        else:
+            api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    _apply_action_stall_tool_choice(agent, api_kwargs, messages)
     # Messages were scrubbed above; this walk covers the rest of the payload (tool descriptions,
     # extra_body, kwargs strings) — see sanitize_outbound_kwargs for the #50959 rationale.
     sanitize_outbound_kwargs(agent, api_kwargs)

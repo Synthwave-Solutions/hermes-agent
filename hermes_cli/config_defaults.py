@@ -186,6 +186,11 @@ DEFAULT_CONFIG = {
         # read-only commands) into one batched turn; the runtime already runs them concurrently. ~70
         # cached tokens. False disables.
         "parallel_tool_call_guidance": True,
+        # SYNTHWAVE fork. Retry tool calls whose JSON arguments were cut off even when the router
+        # reported finish_reason=tool_calls (hiding an output-cap truncation): up to 4 re-issues of
+        # the same request with a doubled output budget before refusing to execute incomplete
+        # arguments. False restores upstream's immediate refusal (#91717).
+        "truncated_tool_args_retry": True,
         # Toolchain probe: surfaces Python/pip/uv/PEP-668 state in the system prompt only when
         # something non-default is detected (no pip module, pip/python mismatch, PEP 668 without
         # uv); zero tokens when clean. Skipped for docker/modal/ssh backends (own probe).
@@ -703,6 +708,11 @@ DEFAULT_CONFIG = {
         # scope it to one route ({"openai-codex:astra": 0.85} leaves Astra on OpenRouter/Nous at the
         # global value). The <512K floor (0.75) still applies raise-only on top.
         "model_thresholds": {},
+        # SYNTHWAVE fork. Context window of the router's fallback targets (e.g. 272000 when Codex
+        # models back a 1M Opus route). When a routed primary fails for a transient reason on a
+        # request larger than that window, the router has already filtered the fallbacks out;
+        # compact to this window once and retry. None = off (upstream behavior).
+        "failover_context_length": None,
         # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts
         # up front, before the first reply. Time-based complement to `threshold`; skipped when
         # already at/below threshold × target_ratio; honors the same cooldown/ anti-thrash/lock
@@ -1812,6 +1822,7 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        "system_principal": "",  # Operator-owned jobs use this explicitly configured identity.
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
@@ -2525,6 +2536,8 @@ DEFAULT_CONFIG = {
     # Bot Desktop: a headless Xfce screen per profile on the gateway host (Linux), streamed to Hermes
     # Desktop where a human can watch, take over (logins, 2FA, CAPTCHAs) and hand back. `hermes computer-use screen`.
     "bot_desktop": {
+        # SynthPulse owns viewer permissions, privacy and audit. Engine viewer requires explicit opt-in.
+        "dashboard_viewer": False,
         "geometry": "1440x900",
         # Opt-in: start the screen automatically the first time computer_use needs a display on a headless
         # host. Off by default so installing TigerVNC for other reasons never yields a screen nobody asked
@@ -2728,6 +2741,35 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
+
+    # SynthPulse model gateway contract. On a managed installation every
+    # model call goes through the installation's own gateway, and the
+    # installation renders this block (base_url, enforce, organisation,
+    # installation and module). These defaults are inert: with enforce
+    # false and no gateway URL every provider path works as before. Fields:
+    #   base_url         the gateway's OpenAI-compatible base URL ("" = none)
+    #   enforce          refuse any model route that is not the gateway
+    #   org_id           organisation id stamped on traces
+    #   installation_id  installation id stamped on traces
+    #   module           the calling module's name in the key registry
+    #   user_field       how the OpenAI "user" field is filled ("pseudonym")
+    #   session_header   request header that carries the session id
+    #   realtime         true only when the gateway carries a realtime route
+    #   tool_exceptions  tool backends still allowed under enforce; rendered
+    #                    only at the operator's own installation from its
+    #                    exceptions file, never on a managed installation
+    "model_gateway": {
+        "base_url": "",
+        "enforce": False,
+        "org_id": "",
+        "installation_id": "",
+        "module": "engine",
+        "user_field": "pseudonym",
+        "session_header": "X-SP-Session",
+        "realtime": False,
+        "tool_exceptions": [],
+    },
+
     "_config_version": 51,  # Config schema version - bump this when adding new required fields
 }
 

@@ -298,9 +298,18 @@ def terminal_backend_install_hint(backend: str) -> str:
     return f". {_install_sentence(feature)}" if feature else ""
 
 
+def _retained_bundled_plugin(name: str) -> bool:
+    """A fork-retained plugin must not be replaced by its former upstream alias."""
+    if not name or name not in {f.plugin_key for f in LEFT_CORE if f.plugin_key}:
+        return False
+    return (Path(__file__).resolve().parent.parent / "plugins" / name / "plugin.yaml").is_file()
+
+
 def legacy_plugin_alias(name: str) -> str:
     """The catalog plugin a bundled key that left core now names (``observability/langfuse`` ->
     ``langfuse``), else ``""``."""
+    if _retained_bundled_plugin(name):
+        return ""
     return next((f.plugin for f in LEFT_CORE if f.plugin_key and f.plugin_key == name), "")
 
 
@@ -348,6 +357,8 @@ def moved_plugin_hint(name: str) -> str:
     plugin that left core (``observability/langfuse``) or its catalog name, the line naming the install
     command for the active home, else ``""``. Appended to "No plugin named ..." errors."""
     feature = next((f for f in LEFT_CORE if f.plugin_key and name in (f.plugin_key, f.plugin)), None)
+    if feature and _retained_bundled_plugin(feature.plugin_key):
+        return ""
     return f"{_install_sentence(feature)}." if feature else ""
 
 
@@ -442,6 +453,8 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
     from hermes_cli.memory_provider_migration import catalog_source
     out = []
     for feature in LEFT_CORE:
+        if _retained_bundled_plugin(feature.plugin_key):
+            continue
         if _marked(_read_config(home), _INSTALLED_KEY, feature):
             continue
         if not feature.in_use(home, process_env=process_env):

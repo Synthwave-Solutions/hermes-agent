@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from tests.agent.raw_response_mock import wire_raw_response
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,7 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        wire_raw_response(a.client)
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         a.compression_enabled = True

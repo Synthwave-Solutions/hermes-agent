@@ -1,0 +1,23 @@
+--- a/verify_security_controls.sh
++++ b/verify_security_controls.sh
+@@ -114,6 +114,20 @@
+   fi
+ fi
+ 
++# Check g (15-10-2026, opencode_task): the opencode on PATH must be the
++# guarded wrapper, not the raw npm symlink an `npm i -g opencode-ai` puts back.
++# Deliberately a WARNING, not a failure: this gate is ExecStartPre of the
++# gateway, and an OpenCode update must not take the whole platform down. The
++# governed opencode_task path does not depend on the wrapper (the runner sets
++# the guard, slots and confinement itself); the wrapper covers direct CLI use.
++OC_WRAPPER="$HOME_DIR/.npm-global/bin/opencode"
++if [ -e "$OC_WRAPPER" ]; then
++  if [ -L "$OC_WRAPPER" ] || ! grep -q "OPENCODE_RECURSION_GUARD" "$OC_WRAPPER" 2>/dev/null \
++      || ! grep -q "OPENCODE_MAX_SLOTS" "$OC_WRAPPER" 2>/dev/null; then
++    echo "SECURITY_GATE_WARN: check_g: $OC_WRAPPER is not the guarded opencode wrapper (reinstall with hermes-agent deploy/opencode/deploy.sh --wrapper-only)"
++  fi
++fi
++
+ if [ "$FAILS" -gt 0 ]; then
+   echo "SECURITY_GATE_FAILED: $FAILS check(s) failed in $HERMES_AGENT_DIR"
+   exit 1

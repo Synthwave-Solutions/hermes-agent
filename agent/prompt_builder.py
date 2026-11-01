@@ -412,13 +412,88 @@ TASK_COMPLETION_GUIDANCE = (
 # cline/cline#11514 ("encourage parallel tool calls"), adapted from Cline's TypeScript tool-surface guidance
 # to hermes-agent's Python prompt-assembly architecture.
 PARALLEL_TOOL_CALL_GUIDANCE = (
-    "# Parallel tool calls\n"
-    "When you need several pieces of information that don't depend on each other, request them together in a "
-    "single response instead of one tool call per turn. Independent reads, searches, web fetches, and "
-    "read-only commands should be batched into the same assistant turn — the runtime executes independent "
-    "calls concurrently, and batching avoids resending the whole conversation on every extra round-trip.\n"
-    "Only serialize calls when a later call genuinely depends on an earlier call's result (e.g. you must "
-    "read a file before you can patch it). When in doubt and the calls are independent, batch them."
+    "# Parallel tool calls: the default, not the exception\n"
+    "Work in parallel wherever calls do not depend on each other. Before "
+    "every tool call ask what else you already know you will need, and "
+    "request all of it in the same assistant turn. The runtime executes "
+    "independent calls concurrently and a batch costs one round-trip; a turn "
+    "with one tool call where three were possible is the slow path, and every "
+    "extra round-trip resends the whole conversation.\n"
+    "Batch together: several file reads, searches, web fetches and read-only "
+    "shell commands; several background starts "
+    "(terminal(background=true, notify_on_complete=true)) and afterwards the "
+    "polls or waits on them via the process tool; MCP calls to different "
+    "services; browser_exec calls as long as each passes its own `session` "
+    "name; a delegate_task batch instead of one child at a time; writes to "
+    "different files.\n"
+    "Plan for it: when a task has several independent parts, start all of "
+    "them in the first turn and combine the results afterwards, instead of "
+    "finishing one part before beginning the next. When a result only partly "
+    "determines the next step, send the calls that are already certain "
+    "together with the call that needs the result.\n"
+    "Serialize only when a later call genuinely needs an earlier result (read "
+    "a file before you patch it, create before you use), or when the calls "
+    "drive one shared surface: the browser tools, the desktop, the code "
+    "interpreter and the task/memory store act on state the next call reads "
+    "back. Never serialize for tidiness, and never send a single call per "
+    "turn to see what happens when the next calls are already known."
+)
+
+# Where work goes when it is delegated.  Without this the model reaches for a
+# separate CLI worker (OpenCode, dsh) for anything that smells like a task,
+# because the shared OmniRoute prefix names those tools by command.  A separate
+# CLI worker boots a whole second agent with its own context and its own model
+# calls: it is the slowest option available and it drops this session's tools,
+# governance binding and conversation context on the floor.  A subagent keeps
+# all three and returns straight into this conversation, and a background task
+# costs nothing at all while it runs.  Only injected when the tools it names
+# are actually loaded, so it can never point at something this agent lacks.
+DELEGATION_POLICY_GUIDANCE = (
+    "# Coordinate independent work\n"
+    "For a substantial task, name the two or three bounded work packages that "
+    "can run while you keep making progress, and start them in the same "
+    "assistant turn: independent starts are dispatched in parallel, so "
+    "batching them costs one round-trip instead of three.\n"
+    "- Subagents, via delegate_task with a tasks batch, for work that needs "
+    "your tools, your access and your context. Give each a concrete "
+    "deliverable, its scope and how it will be validated. Carry on with your "
+    "own work after the batch starts, then read and check every result before "
+    "combining them. Steer or stop a running child rather than spawning a "
+    "second one for the same thing.\n"
+    "- Background commands for anything that takes time: "
+    "terminal(background=true, notify_on_complete=true) for builds, test runs, "
+    "deploys and long scripts. Start several at once and poll or wait on them "
+    "together with the process tool, which also runs in parallel. Never sit "
+    "blocked on a command that could have run in the background.\n"
+    "- OpenCode, via the opencode_task tool, is the default for a bounded "
+    "repository job: a feature, a bug fix, a refactor, a test suite, a script, "
+    "a review. Prefer it over a subagent for code work that does not need your "
+    "session context. It works directly in the workdir you pass (no copy, "
+    "nothing committed) and notifies you with the changed files, the diff and "
+    "the test output; pass test_command so the check runs with it. Start "
+    "several in one turn for independent jobs, each on its own files or "
+    "folder; for parallel jobs in one repository, or when the live tree has "
+    "work in progress, pass worktree=true so each job gets its own git "
+    "worktree and branch. Do not "
+    "start `opencode run` through terminal when opencode_task is available. "
+    "Review, commit and merge the result yourself: read the diff and test "
+    "output, fix it or start a follow-up job when something is wrong, commit "
+    "it, and for a worktree job merge the branch into the local working "
+    "branch, rerun the tests and remove the worktree and branch. You may push "
+    "only to the QA branch or QA environment, never to main, production or a "
+    "release branch. Run the end-to-end QA through the bots after the QA "
+    "push; the work counts as done only when that is green. Report then, "
+    "with the QA result: the result stays yours.\n"
+    "Keep small or dependent steps inline, and respect the configured "
+    "concurrency and iteration budgets. The authenticated actor, the workspace "
+    "restrictions and the approval rules follow you into every worker: never "
+    "use another CLI to get around a denied operation.\n"
+    "# Explain visible activity\n"
+    "Before substantial work, state briefly what you will do and why. When "
+    "delegating, name the separate assignments and what you will do meanwhile. "
+    "Report meaningful findings, waits or a change of direction in concise plain "
+    "language; never expose private chain-of-thought or narrate every trivial "
+    "read. Report completion only after observing and checking actual results."
 )
 
 # Execution-discipline guidance for models that abandon partial results, skip prerequisite lookups, answer

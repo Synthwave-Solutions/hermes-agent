@@ -1,0 +1,36 @@
+name: SynPulse actor and bot scope QA
+
+on:
+  pull_request:
+    branches: [dev, staging, main]
+  push:
+    branches: [dev, staging, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actor-and-bot-scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Install locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Verify actor isolation and approval capability ceilings
+        run: >-
+          scripts/run_tests.sh
+          tests/tools/test_personal_memory_scope.py
+          tests/tools/test_memory_tool.py
+          tests/tools/test_file_tools.py
+          tests/hermes_cli/test_bot_access_ceiling.py
+          tests/hermes_cli/test_grant_operation_provenance.py
+          -q
+        env:
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''

@@ -1,0 +1,7 @@
+name: synthwave-policy
+version: 0.2.0
+description: "Synthwave autonomy policy: classifies every tool call as AUTO, ASK or BLOCK from policy/autonomy.yaml. Observe mode only logs would-be ASK and BLOCK decisions to policy/decisions.jsonl; enforce mode routes ASK to the human approval gate and refuses BLOCK."
+author: Synthwave Solutions
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call

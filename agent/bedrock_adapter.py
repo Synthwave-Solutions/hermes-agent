@@ -347,7 +347,7 @@ _AWS_AUTH_ENV_CHAIN: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _boto3_chain_has_credentials(*, instance_metadata: bool = True) -> bool:
+def _boto3_chain_has_credentials(*, instance_metadata: bool = True, metadata_timeout: Optional[float] = None) -> bool:
     """True if boto3's default chain resolves credentials (IMDS, task role, ...). *instance_metadata*
     False skips the EC2 metadata lookup (169.254.169.254), which off EC2 only costs its timeout."""
     with suppress(Exception):
@@ -355,6 +355,10 @@ def _boto3_chain_has_credentials(*, instance_metadata: bool = True) -> bool:
         session = botocore.session.get_session()
         if not instance_metadata:
             session.set_config_variable("ec2_metadata_disabled", "true")  # this session only, not os.environ
+        if metadata_timeout is not None:
+            # Discovery must not wait on unreachable EC2 metadata endpoints.
+            session.set_config_variable("metadata_service_timeout", metadata_timeout)
+            session.set_config_variable("metadata_service_num_attempts", 1)
         credentials = session.get_credentials()
         resolved = credentials.get_frozen_credentials() if credentials is not None else None
         return bool(resolved and resolved.access_key)
@@ -362,24 +366,26 @@ def _boto3_chain_has_credentials(*, instance_metadata: bool = True) -> bool:
 
 
 def resolve_aws_auth_env_var(
-    env: Optional[dict[str, str]] = None, *, instance_metadata: bool = True,
+    env: Optional[dict[str, str]] = None, *, instance_metadata: bool = True, metadata_timeout: Optional[float] = None,
 ) -> Optional[str]:
     """Name of the active AWS auth source: env vars first (no I/O), then ``"iam-role"`` via boto3's chain, else None."""
     env = env if env is not None else os.environ
     for group in _AWS_AUTH_ENV_CHAIN:
         if all(env.get(var, "").strip() for var in group):
             return group[0]
-    return "iam-role" if _boto3_chain_has_credentials(instance_metadata=instance_metadata) else None
+    return "iam-role" if _boto3_chain_has_credentials(instance_metadata=instance_metadata, metadata_timeout=metadata_timeout) else None
 
 
-def has_aws_credentials(env: Optional[dict[str, str]] = None, *, instance_metadata: bool = True) -> bool:
+def has_aws_credentials(env: Optional[dict[str, str]] = None, *, instance_metadata: bool = True, metadata_timeout: Optional[float] = None) -> bool:
     """True if any AWS credential source (env vars or boto3 chain) is detected.
 
     This two-tier approach mirrors the pattern from OpenClaw PR #62673: cloud environments (EC2, ECS,
     Lambda) provide credentials via instance metadata, not environment variables. The env-var check is a
-    fast path for local development; the boto3 fallback covers all cloud deployments.
+    fast path for local development; the boto3 fallback covers all cloud deployments. Interactive
+    discovery can bound the instance-metadata probe via *metadata_timeout*; runtime authentication
+    keeps the SDK's configured timeout/retries.
     """
-    return resolve_aws_auth_env_var(env, instance_metadata=instance_metadata) is not None
+    return resolve_aws_auth_env_var(env, instance_metadata=instance_metadata, metadata_timeout=metadata_timeout) is not None
 
 
 def resolve_bedrock_region(env: Optional[dict[str, str]] = None) -> str:

@@ -117,7 +117,18 @@ _MCP_SDK_LAZY_SYMBOLS = frozenset(
     | {n for _mod, names, _msg in _OPTIONAL_TYPE_FAMILIES for n in names})
 
 
+# SynthPulse WebUI compatibility: entry points that moved into split modules, resolved lazily
+# because those modules import this one.
+_SPLIT_MODULE_EXPORTS = {
+    "discover_mcp_tools": "tools.mcp_tool_discovery",
+    "get_mcp_status": "tools.mcp_tool_discovery",
+    "shutdown_mcp_servers": "tools.mcp_tool_lifecycle",
+}
+
+
 def __getattr__(name: str):
+    if name in _SPLIT_MODULE_EXPORTS:
+        return getattr(importlib.import_module(_SPLIT_MODULE_EXPORTS[name]), name)
     if name in _MCP_SDK_LAZY_SYMBOLS:
         _ensure_mcp_sdk()
         try:
@@ -293,6 +304,12 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
                 result = await list_method(cursor=cursor)
         if cache_meta_out is not None and not items:
             for key, snake, camel in (("ttl_ms", "ttl_ms", "ttlMs"), ("cache_scope", "cache_scope", "cacheScope")):
+                # SDK 2 supplies ttl_ms=0 even for legacy responses that omit
+                # cache hints. Only wire-provided fields may override the
+                # existing no-hint cache behavior; explicit zero still expires.
+                fields_set = getattr(result, "model_fields_set", None)
+                if isinstance(fields_set, (set, frozenset)) and not ({snake, camel} & fields_set):
+                    continue
                 hint = mcp_field(result, snake, camel)
                 if hint is not None:
                     cache_meta_out[key] = hint
@@ -558,6 +575,11 @@ def _reset_server_error(server_name: str) -> None:
 # Servers opted into parallel tool calls, keyed by the consuming profile's own key (``foo-bar``/
 # ``foo_bar`` sanitize alike but must not share policy; neither do two profiles' same-named servers).
 _parallel_safe_servers: set = set()
+# Servers whose config sets ``supports_parallel_tool_calls: false`` EXPLICITLY, same keying as
+# ``_parallel_safe_servers``. MCP batch admission is opt-in (agent.tool_dispatch_helpers), so this
+# explicit pin is a belt-and-braces barrier for a stateful server (the next call depends on the
+# state the previous one left behind). Populated where ``_parallel_safe_servers`` is.
+_parallel_blocked_servers: set = set()
 # registry tool name -> raw server name (the generated name is lossy; never re-parse it).
 _mcp_tool_server_names: dict[str, str] = {}
 
@@ -566,6 +588,20 @@ _mcp_tool_server_names: dict[str, str] = {}
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 _lock = threading.Lock()
+
+
+def is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
+    """True only when the tool's server config carries an explicit
+    ``supports_parallel_tool_calls: false`` (provenance captured at registration, never the
+    ambiguous ``mcp__{server}__{tool}`` shape). MCP batch admission is opt-in, so the flag is an
+    explicit, belt-and-braces serial pin for a stateful server (a browser, a build session)."""
+    from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
+    from tools.mcp_tool_scope import _server_key
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+        return bool(server_name and _server_key(server_name) in _parallel_blocked_servers)
 
 
 # ---- Shared parent-death supervisor (state lives HERE: tests rebind ``_death_supervisor``) ----

@@ -30,10 +30,12 @@ def finish_interrupted_run(job, execution_id, delivery_error):
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None, notification_suppressed: bool = False,
+    delivery_queued=None, notification_suppressed: bool = False, notification_muted: bool = False,
 ) -> str:
     if delivery_error:
         return "failed"
+    if notification_muted:
+        return "suppressed_muted"
     if should_deliver and delivery_queued:
         return "queued"
     if notification_suppressed:
@@ -60,7 +62,24 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
-    mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    delivery_outcome = _classify_delivery_outcome(
+        delivery_error=d.delivery_error,
+        delivery_queued=job.get("last_delivery_queued"),
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        notification_muted=bool(job.get("_notification_policy_muted")),
+        should_deliver=d.should_deliver,
+        unresolved_origin=d.unresolved_origin,
+        # Read the lane the notice was actually routed through (failure_deliver on failure).
+        normalized_deliver=scheduler._normalize_deliver_value(
+            scheduler._delivery_lane_value(job, for_failure=not d.success)),
+        incident_acked=d.incident_acked,
+        success=d.success,
+    )
+    from cron.delivery_outcome import settle_quietly, settled_outcome
+    if delivery_outcome == "queued":
+        # A drain that already finished this send (cron/delivery_outcome.py) is the real outcome.
+        delivery_outcome = settled_outcome(execution_id) or "queued"
+    mark_kwargs: dict = {"delivery_error": d.delivery_error, "delivery_outcome": delivery_outcome}
     from cron.scheduler_authority import journal_path
     journal = journal_path(job['id'], execution_id)
     if not job.get('no_agent'):
@@ -92,22 +111,6 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
-    delivery_outcome = _classify_delivery_outcome(
-        delivery_error=d.delivery_error,
-        delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
-        should_deliver=d.should_deliver,
-        unresolved_origin=d.unresolved_origin,
-        # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=scheduler._normalize_deliver_value(
-            scheduler._delivery_lane_value(job, for_failure=not d.success)),
-        incident_acked=d.incident_acked,
-        success=d.success,
-    )
-    from cron.delivery_outcome import settle_quietly, settled_outcome
-    if delivery_outcome == "queued":
-        # A drain that already finished this send (cron/delivery_outcome.py) is the real outcome.
-        delivery_outcome = settled_outcome(execution_id) or "queued"
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         scheduler._mark_incident_alerted(d.failure_incident_id)

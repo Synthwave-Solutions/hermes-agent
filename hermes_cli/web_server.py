@@ -198,7 +198,12 @@ def _get_chat_argv_lock(app: FastAPI) -> asyncio.Lock:
     return _app_state_default(app, "chat_argv_lock", asyncio.Lock)
 
 
-def _get_pty_active_session_files(app: FastAPI) -> dict[str, Path]:
+def _get_governance_policy_lock(app: "FastAPI") -> asyncio.Lock:
+    """SynthPulse governance-policy mutation lock (see the lifespan comment)."""
+    return _app_state_default(app, "governance_policy_lock", asyncio.Lock)
+
+
+def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
     return _app_state_default(app, "pty_active_session_files", dict)
 
 
@@ -428,6 +433,19 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 # The same gate for WebSocket upgrades: ``@app.middleware("http")`` passes those through untouched.
 app.add_middleware(PluginApiWebSocketGate)
+
+
+@app.middleware("http")
+async def _dashboard_governance_gate(request: Request, call_next):
+    """SynthPulse whitelist-first dashboard governance gate.
+
+    Registered after the plugin runtime gate and before the OAuth/token gates (Starlette runs
+    later-registered middleware first), so it sees the authenticated ``request.state``
+    principal before handlers run while public auth-bootstrap routes stay reachable.
+    """
+    from hermes_cli.dashboard_governance.enforcement import governance_middleware
+
+    return await governance_middleware(request, call_next)
 
 
 @app.middleware("http")
@@ -783,6 +801,7 @@ from hermes_cli.web_routers import (
     dashboard_ui as _dashboard_ui_routes,
     shared_metrics as _shared_metrics_routes,
     delegation as _delegation_routes,
+    governance as _governance_routes,
 )
 
 app.include_router(_files_routes.router)
@@ -791,7 +810,7 @@ app.include_router(_local_models_routes.router)
 app.include_router(_status_routes.router)
 app.include_router(_actions_routes.router)
 app.include_router(_audio_routes.router)
-app.include_router(_display_routes.router)
+_display_routes.register(app)
 app.include_router(_actions_routes.status_router)
 app.include_router(_sessions_routes.list_router)
 app.include_router(_profiles_routes.sessions_router)
@@ -817,6 +836,8 @@ app.include_router(_chat_workspaces_routes.router)
 app.include_router(_dashboard_ui_routes.router)
 app.include_router(_shared_metrics_routes.router)
 app.include_router(_delegation_routes.router)
+# SynthPulse dashboard governance admin API (/api/governance/*).
+app.include_router(_governance_routes.router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth
@@ -1408,7 +1429,7 @@ def start_server(
     # uvicorn's capture_signals() so uvicorn re-raises into them as the
     # "original" handlers — kills outside the serve window are covered too.
     try:
-        from tui_gateway.server import install_exit_flush_signal_handlers
+        from tui_gateway.session_reaper import install_exit_flush_signal_handlers
 
         install_exit_flush_signal_handlers()
     except Exception as exc:

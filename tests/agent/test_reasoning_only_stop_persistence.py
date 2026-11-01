@@ -24,6 +24,10 @@ def loop_agent():
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
         patch("agent.process_bootstrap.OpenAI"),
+        # This loop test has no inference server. Context validation now runs
+        # during construction, so keep its metadata lookup offline too.
+        patch("agent.context_compressor.get_model_context_length", return_value=131_072),
+        patch("agent.model_metadata_http.stream", side_effect=AssertionError("loop test must not probe a live endpoint")),
     ):
         agent = AIAgent(
             api_key="test-key-1234567890",
@@ -39,7 +43,7 @@ def loop_agent():
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
-        return agent
+        yield agent
 
 
 def _run(agent, responses, user_message="hello", conversation_history=None):
@@ -139,8 +143,8 @@ def test_planning_tail_reasoning_only_stop_with_tools_runs_continuation_not_comp
 
 
 def test_planning_tail_stall_is_bounded_by_the_continuation_cap(loop_agent):
-    """A model that never acts is nudged at most twice; the third planning-only stop is promoted
-    so the turn still ends instead of looping."""
+    """A model that never acts is nudged at most twice; the third planning-only stop
+    fails explicitly instead of looping or reporting success."""
     from tests.agent.test_run_agent import _mock_response
 
     loop_agent.valid_tool_names = {"terminal"}
@@ -155,7 +159,8 @@ def test_planning_tail_stall_is_bounded_by_the_continuation_cap(loop_agent):
     ])
 
     assert result["api_calls"] == 3
-    assert result["final_response"] == tail
+    assert result["failure_reason"] == "invalid_response"
+    assert result["final_response"] != tail
 
 
 def test_genuine_reasoning_only_answer_with_tools_still_promotes_on_first_call(loop_agent):

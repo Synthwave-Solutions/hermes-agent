@@ -41,6 +41,17 @@ _FORBIDDEN_MODULES = (
 )
 
 
+def _product_name(env: dict) -> str:
+    """The product name ``--version`` is branded with, read from the same skin-owned branding
+    source as ``format_banner_version_label`` in a child with the same env (SynthPulse fork: the
+    brand is the active skin's ``agent_name``, so the parity checks never hard-code it)."""
+    probe = "from hermes_cli.banner import _skin_branding; print(_skin_branding('agent_name', 'Hermes Agent'))"
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                            timeout=60, cwd=REPO_ROOT, env=env)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip().splitlines()[-1]
+
+
 @pytest.mark.platforms("linux")
 def test_cli_starts_from_a_deleted_cwd(tmp_path):
     """A child spawned into a directory that was removed since (a cron delivery from a reaped
@@ -66,7 +77,7 @@ def test_cli_starts_from_a_deleted_cwd(tmp_path):
     finally:
         os.close(fd)
     assert result.returncode == 0, result.stderr
-    assert "Hermes Agent v" in result.stdout
+    assert f"{_product_name(env)} v" in result.stdout
     assert "FileNotFoundError" not in result.stderr
 
 
@@ -100,18 +111,22 @@ _OFFLINE = {"HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1
             "NO_PROXY": "", "no_proxy": ""}
 
 
-def _run_version(env_overrides: dict) -> subprocess.CompletedProcess:
+def _version_env(env_overrides: dict) -> dict:
     # --version's update check is not under test; offline it answers at once instead of
     # waiting out GitHub's 30 s API and 60 s ls-remote timeouts (the test's own budget).
     env = {**os.environ, **_OFFLINE, **env_overrides}
     env.pop("HERMES_DEV", None)
+    return env
+
+
+def _run_version(env_overrides: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "--version"],
         capture_output=True,
         text=True,
         timeout=60,
         cwd=REPO_ROOT,
-        env=env,
+        env=_version_env(env_overrides),
         check=False,
     )
 
@@ -122,11 +137,10 @@ def test_fast_version_parity_on_termux(tmp_path):
     """The historical Termux path — the one eb4040242 broke."""
     home = tmp_path / ".hermes"
     home.mkdir()
-    result = _run_version(
-        {"HERMES_HOME": str(home), "TERMUX_VERSION": "0.118"}
-    )
+    overrides = {"HERMES_HOME": str(home), "TERMUX_VERSION": "0.118"}
+    result = _run_version(overrides)
     assert result.returncode == 0, result.stderr
-    assert "Hermes Agent v" in result.stdout
+    assert f"{_product_name(_version_env(overrides))} v" in result.stdout
     assert "Traceback" not in result.stderr
 
 
@@ -222,10 +236,12 @@ def test_bootstrap_preserves_live_cwd_and_recovers_deleted_cwd(tmp_path, remove_
 def test_fast_version_parity(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
-    result = _run_version({"HERMES_HOME": str(home)})
+    overrides = {"HERMES_HOME": str(home)}
+    result = _run_version(overrides)
     assert result.returncode == 0, result.stderr
     out = result.stdout
-    for field in ("Hermes Agent v", "Install directory:", "Python:", "OpenAI SDK:"):
+    product = _product_name(_version_env(overrides))
+    for field in (f"{product} v", "Install directory:", "Python:", "OpenAI SDK:"):
         assert field in out, f"fast --version output missing {field!r}:\n{out}"
     assert "Traceback" not in result.stderr
 

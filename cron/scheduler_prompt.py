@@ -131,7 +131,7 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
     context_from = job.get("context_from")
     if not context_from:
         return prompt, False
-    from cron.jobs import get_cron_output_dir
+    from cron.jobs import get_cron_output_dir, caller_may_act_on_job_id
     output_dir = get_cron_output_dir()
     if isinstance(context_from, str):
         context_from = [context_from]
@@ -148,6 +148,9 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
                 source_job_id, job.get("id"), job.get("name"),
                 _delivery._cron_job_origin_log_suffix(job),
             )
+            continue
+        if not is_self and not caller_may_act_on_job_id(source_job_id):
+            logger.warning("context_from: refusing foreign job output %r", source_job_id)
             continue
         try:
             output_files = sorted(
@@ -307,11 +310,13 @@ def _build_job_prompt(
 
     script_path = job.get("script")
     if script_path:
+        from cron.run_context import script_environment
         success, script_output = (
             prerun_script if prerun_script is not None
             else _script._run_job_script(
                 script_path, workdir=_sched._resolve_job_workdir(job, str(job.get("id") or "")),
-                interpreter=job.get("interpreter")))
+                interpreter=job.get("interpreter"),
+                cron_env=script_environment(job)))
         if success and not script_output:
             return None  # no output → nothing to report, skip the AI call
         heading, intro = (
