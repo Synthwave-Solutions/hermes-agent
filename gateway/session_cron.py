@@ -61,6 +61,30 @@ def _actor(authority, actor):
     return Principal(CRON_PRINCIPAL_ID, authority.profile_id, actor.capabilities, actor.transport_id)
 
 
+def _request_context(params):
+    """Validated per-fire metadata; never a job, principal or permission override."""
+    if 'run_context' not in params:
+        return None  # legacy clients and ordinary scheduled fires retain their wire shape
+    from cron.run_context import normalize_context
+    context = params['run_context']
+    if not isinstance(context, dict) or set(context) != {'trigger', 'trigger_actor', 'run_prompt'}:
+        raise RuntimeStoreError('invalid_params')
+    try:
+        normalized = normalize_context(**context)
+    except (ValueError, TypeError):
+        raise RuntimeStoreError('invalid_params') from None
+    if context != normalized or context['run_prompt'] != (params['extra_prompt'] or ''):
+        raise RuntimeStoreError('invalid_params')
+    return normalized
+
+
+def _payload(extra, context=None):
+    payload = {'text': extra or ''}
+    if context is not None:
+        payload['run_context'] = context
+    return payload
+
+
 def _create(authority, actor, params):
     from cron.jobs import get_job
     from gateway.session_local_recovery import local_identity, restore_local_session
@@ -71,8 +95,10 @@ def _create(authority, actor, params):
     from gateway.session import SessionSource, SessionEntry
     from gateway.session_lifecycle import _now
 
-    if set(params) != {'job_id', 'request_id', 'extra_prompt'}:
+    if set(params) not in ({'job_id', 'request_id', 'extra_prompt'},
+                          {'job_id', 'request_id', 'extra_prompt', 'run_context'}):
         raise RuntimeStoreError('invalid_params')
+    context = _request_context(params)
     jid, request_id, extra = params['job_id'], params['request_id'], params['extra_prompt']
     if (not isinstance(jid, str) or not jid or not isinstance(request_id, str)
             or not request_id or len(request_id) > 256 or (extra is not None and not isinstance(extra, str))):
@@ -89,6 +115,8 @@ def _create(authority, actor, params):
     job = get_job(jid)
     if job is None or job.get('no_agent'):
         raise RuntimeStoreError('not_found')
+    if context is not None:
+        job = dict(job, _cron_run_context=context)
     config = _load_gateway_config()
     private = {}
     launch = {'source': 'cli', 'request_id': request_id, 'toolsets': []}
@@ -127,10 +155,12 @@ async def operation(authority, name, params, actor=None):
     # (CronExecutionUnknown pauses the job) on every restart that overlaps a cron run.
     if name == 'recover':
         from gateway.session_local_recovery import local_identity
-        if (set(params) != {'job_id', 'request_id', 'extra_prompt'}
+        if (set(params) not in ({'job_id', 'request_id', 'extra_prompt'},
+                               {'job_id', 'request_id', 'extra_prompt', 'run_context'})
                 or any(not isinstance(params[k], str) or not params[k] for k in ('job_id', 'request_id'))
                 or (params['extra_prompt'] is not None and not isinstance(params['extra_prompt'], str))):
             raise RuntimeStoreError('invalid_params')
+        context = _request_context(params)
         request_id = cron_request_id(params['job_id'], params['request_id'])
         sid = local_identity(authority.profile_id, actor.subject, request_id)
         from hermes_state_runtime import list_session_admissions
@@ -138,6 +168,8 @@ async def operation(authority, name, params, actor=None):
         row = next((r for r in rows if r['request_id'] == request_id and r['principal_id'] == actor.subject), None)
         if row is None:
             return {'status': 'missing', 'result': None}
+        if row['payload'] != _payload(params['extra_prompt'], context):
+            raise RuntimeStoreError('admission_conflict')
         state = await operation(authority, 'status', {'session_id': sid, 'admission_id': row['admission_id']}, actor)
         from gateway.session_local_recovery import restore_local_session
         restore_local_session(authority, sid)
@@ -167,7 +199,8 @@ async def operation(authority, name, params, actor=None):
             ref = restore_local_session(authority, ref['session_id'])
         receipt = await tracked_write(authority, partial(
             admit_session_input, authority.db, epoch=authority.epoch, principal_id=actor.subject,
-            session_id=ref.session_id, request_id=request_id, payload={'text': params['extra_prompt'] or ''},
+            session_id=ref.session_id, request_id=request_id,
+            payload=_payload(params['extra_prompt'], _request_context(params)),
             _authorize_write=authority._admission_gate()), then=partial(authority._admitted, ref, None), ordered=True,
             after=partial(authority._schedule_admitted, ref))
         return {'session_id': ref.session_id, 'admission_id': receipt.admission_id}
@@ -235,7 +268,7 @@ async def execute(authority, ref, row, policy):
     from cron.scheduler import run_job
     from gateway.run import _profile_runtime_scope
     data = json.loads(policy.request_json)
-    if (row['payload'] != {'text': data['extra_prompt'] or ''}
+    if (row['payload'] != _payload(data['extra_prompt'], data['cron_job'].get('_cron_run_context'))
             or row['request_id'] != data['request_id']
             or row['principal_id'] != authority.sessions[ref.session_id].source.user_id):
         # A cron session only runs its own frozen fire; anything else typed into it fails with a

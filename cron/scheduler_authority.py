@@ -63,6 +63,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         request_id = job['execution_id'] = uuid.uuid4().hex
     params = {'job_id': job['id'], 'request_id': request_id,
               'extra_prompt': extra_prompt}
+    from cron.run_context import context_for_job, normalize_context
+    context = context_for_job(job)
+    if context != normalize_context():
+        params['run_context'] = context
     root = get_hermes_home() / 'cron' / 'admissions'
     journal = journal_path(params['job_id'], params['request_id'])
     record = {'params': params, 'receipt': None}
