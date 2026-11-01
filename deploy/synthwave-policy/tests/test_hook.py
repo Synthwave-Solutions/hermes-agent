@@ -147,7 +147,9 @@ def test_profile_mode_enforce_while_global_observe(plugin, home):
 
 
 def test_profile_extra_rules_disable_and_default(home):
-    pol = pe.compile_policy(__import__("yaml").safe_load(SMALL_POLICY.format(mode="enforce")))
+    path = home / "policy" / "autonomy.yaml"
+    path.write_text(SMALL_POLICY.format(mode="enforce"), encoding="utf-8")
+    pol = pe.load_policy_file(path)
     assert pe.evaluate(pol, "terminal", {"command": "git status"}, "strict").decision == "BLOCK"
     assert pe.evaluate(pol, "mcp__lovable__deploy_project", {}, "strict").decision == "ASK"  # default ASK
     assert pe.evaluate(pol, "terminal", {"command": "git status"}, "default").decision == "AUTO"
