@@ -32,6 +32,11 @@ manage tasks. The existing `kanban.orchestrator_profile` setting selects the
 coordinator; configure it for the target deployment rather than copying an
 operator's personal configuration.
 
+Scouts can use the bot's available tools, skills, MCPs and CLIs under the
+ordinary bot/user autonomy policy. Scout metadata adds no separate tool
+restriction or approval grant. Existing ASK/BLOCK decisions, profile rules,
+profile-file tightening and fail-closed policy handling apply to every run.
+
 Personal profiles can be explicitly marked `kind: person` in the WebUI bot
 metadata so they remain separate in the organigram and cannot enable Scout.
 

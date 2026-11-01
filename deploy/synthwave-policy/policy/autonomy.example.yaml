@@ -18,8 +18,8 @@
 # Once enforce was active, the plugin writes $HERMES_HOME/policy/.enforced. From then on a missing
 # or broken policy file blocks every call. Only a human removes that marker.
 # Commands and code longer than 64 KB are not evaluated: they are ASK ("command too long to evaluate").
-# Scout jobs (cron jobs that run the Scout collector) may only use kanban and web tools: everything
-# else is BLOCK in enforce and logged in observe (built in, not configurable here).
+# Scout jobs use the same bot/user policy as other runs. Their tools, skills, MCPs and CLIs remain
+# subject to these ordinary ASK/BLOCK rules, profile restrictions and fail-closed handling.
 #
 # How rules match
 #   tool          tool name globs (case-insensitive), e.g. terminal, write_file, mcp_*
