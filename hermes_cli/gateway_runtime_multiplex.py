@@ -15,6 +15,33 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def live_owner_root_for(home: Path) -> Path | None:
+    """Find a linked profile's host from its verified live lock holder.
+
+    A custom multiplexer may link profiles from another root. Canonicalizing the
+    profile then loses that host location. Process metadata supplies a candidate,
+    never authority: both homes must have the same live owner, the host must link
+    this exact profile, and discovery still validates its private control socket
+    and live served-profile descriptor before attaching.
+    """
+    from hermes_cli.dashboard_procs import _hermes_home_for_pid
+    from hermes_cli.gateway_runtime import _owner_pid
+
+    pid = _owner_pid(home)
+    if pid is None:
+        return None
+    try:
+        candidate = _hermes_home_for_pid(pid)
+        if not candidate or not Path(candidate).is_absolute():
+            return None
+        root = Path(candidate).resolve(strict=True)
+        if root == home or (root / "profiles" / home.name).resolve(strict=True) != home:
+            return None
+        return root if _owner_pid(root) == pid else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def multiplexer_root_for(home: Path) -> Path | None:
     """Default root that may multiplex *home*, when *home* is a named profile under it."""
     from hermes_constants import named_profile_home
