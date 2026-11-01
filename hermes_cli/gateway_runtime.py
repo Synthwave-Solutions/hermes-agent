@@ -207,12 +207,12 @@ def _refused_owner_verdict(exc: PermissionError) -> GatewayDiscovery | None:
 
 
 def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | None:
-    """A served secondary has no socket of its own: the default multiplexer's control socket
+    """A served secondary has no socket of its own: its multiplexer's control socket
     answers for it, and its ``identify`` lists the home under ``served_profiles``. Only the
     multiplexer's live descriptor proves service; a held ``gateway.lock`` alone does not."""
     from hermes_cli.gateway_runtime_discovery import DiscoveryError, query_identify
-    from hermes_cli.gateway_runtime_multiplex import multiplexer_root_for
-    root = multiplexer_root_for(home)
+    from hermes_cli.gateway_runtime_multiplex import live_owner_root_for, multiplexer_root_for
+    root = live_owner_root_for(home) or multiplexer_root_for(home)
     if root is None:
         return None
     try:
