@@ -1278,24 +1278,6 @@ TOO_LONG_RULE = _builtin_rule(
     f"{MAX_EVAL_CHARS // 1024} KB, so a human has to look at this one")
 
 
-# Scout jobs (a bot's daily read-only digest) only get the kanban and web toolsets. Defense in depth:
-# anything that runs code, writes files, sends, or drives a browser or screen is refused outright.
-SCOUT_RULE = _builtin_rule(
-    "scout-read-only", "BLOCK",
-    "a Scout run is read-only: only kanban and web tools are allowed, this tool is not", tags=["scout"])
-SCOUT_BLOCKED_TOOLS = (
-    "terminal", "process*", "close_terminal", "execute_code", *WRITE_TOOLS, "send_message", "react_to_message",
-    "browser_*", "computer_use", "mcp_*", "connectors__*", "cronjob*", "delegate_task", "skill_manage",
-)
-
-
-def scout_decision(tool_name: str, mode: str, profile: str) -> Optional[Decision]:
-    name = (tool_name or "").lower()
-    if any(fnmatch.fnmatchcase(name, g) for g in SCOUT_BLOCKED_TOOLS):
-        return Decision("BLOCK", SCOUT_RULE, [(SCOUT_RULE, "BLOCK")], mode, profile)
-    return None
-
-
 def evaluate(policy: Policy, tool_name: str, args: Any, profile: str = "default", *, page_url: str = "",
              skip_tags: Iterable[str] = ()) -> Decision:
     """Decide one call. ``page_url`` is the browser page the call acts on when the caller knows it;

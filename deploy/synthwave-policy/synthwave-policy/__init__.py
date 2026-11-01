@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -130,57 +129,6 @@ def _lease_held_by_human(home: Path) -> bool:
     return not isinstance(data, dict) or data.get("holder") != "agent"
 
 
-# --- Scout job detection ----------------------------------------------------------------------------
-
-_JOBS_CACHE: dict[str, tuple[tuple[float, int], dict[str, dict[str, Any]]]] = {}
-
-
-def _cron_job_id(kw: dict[str, Any]) -> str:
-    task = str(kw.get("task_id") or "")
-    if task.startswith("cron:"):
-        return task.split(":")[1] if task.count(":") >= 1 else ""
-    sid = str(kw.get("session_id") or "")
-    if sid.startswith("cron_"):
-        parts = sid[5:].rsplit("_", 2)
-        return parts[0] if len(parts) == 3 else ""
-    return ""
-
-
-def _jobs_by_id(home: Path) -> dict[str, dict[str, Any]]:
-    path = home / "cron" / "jobs.json"
-    try:
-        st = path.stat()
-    except OSError:
-        return {}
-    key = (st.st_mtime, st.st_size)
-    hit = _JOBS_CACHE.get(str(path))
-    if hit and hit[0] == key:
-        return hit[1]
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        jobs = data.get("jobs", []) if isinstance(data, dict) else data
-        table = {str(j.get("id")): j for j in jobs if isinstance(j, dict) and j.get("id")}
-    except (OSError, ValueError, TypeError):
-        table = {}
-    _JOBS_CACHE[str(path)] = (key, table)
-    return table
-
-
-def is_scout_run(home: Path, kw: dict[str, Any]) -> bool:
-    """True for a Scout cron run: the scheduler's HERMES_CRON_MANAGED_BY says scout, or the cron job
-    behind this task is marked managed_by scout or runs the Scout collector script."""
-    if os.environ.get("HERMES_CRON_MANAGED_BY", "").strip().lower() == "scout":  # health: allow HX002 -- server-owned cron execution metadata from script_environment(), not a configurable policy setting
-        return True
-    job_id = _cron_job_id(kw)
-    if not job_id:
-        return False
-    job = _jobs_by_id(home).get(job_id)
-    if not job:
-        return False
-    return (str(job.get("managed_by") or "").lower() == "scout"
-            or "scout_collect.py" in str(job.get("script") or ""))
-
-
 # --- the hook ---------------------------------------------------------------------------------------
 
 def _log_errors_once(home: Path, profile: str, tool_name: str, args: Any, kw: dict[str, Any],
@@ -224,11 +172,6 @@ def check(tool_name: str, args: Any, home: Optional[Path] = None, profile: Optio
     skip_tags = ["bot-screen"] if screen_tool and _lease_held_by_human(home) else []
     page_url = _current_page(kw) if screen_tool else ""
     decision = eff.evaluate(name, args, profile, page_url=page_url, skip_tags=skip_tags)
-    if is_scout_run(home, kw):
-        sd = pe.scout_decision(name, eff.mode, profile)
-        if sd is not None:
-            decision = pe.combine([decision, sd])
-            decision.mode = eff.mode
     if name == "browser_navigate" and decision.decision != "BLOCK" and isinstance(args, dict):
         _remember_page(kw, args.get("url"))
     if decision.decision == "AUTO":
