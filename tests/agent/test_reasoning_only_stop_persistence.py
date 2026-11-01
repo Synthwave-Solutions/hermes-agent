@@ -28,6 +28,7 @@ def loop_agent():
         # during construction, so keep its metadata lookup offline too.
         patch("agent.context_compressor.get_model_context_length", return_value=131_072),
         patch("agent.model_metadata_http.stream", side_effect=AssertionError("loop test must not probe a live endpoint")),
+        patch("agent.agent_init_ollama.query_ollama_num_ctx", return_value=None),
     ):
         agent = AIAgent(
             api_key="test-key-1234567890",
