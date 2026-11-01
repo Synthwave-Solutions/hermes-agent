@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize('run_context', [None, {'trigger': 'manual', 'trigger_actor': 'owner@example.com',
+                                             'run_prompt': 'extra'}])
+def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch, run_context):
     from cron import jobs
     from gateway import run, session_cron
     from gateway.session import SessionStore
@@ -29,6 +31,8 @@ def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch):
 
     async def probe():
         params = {'job_id': 'job', 'request_id': 'fire', 'extra_prompt': 'extra'}
+        if run_context:
+            params['run_context'] = run_context
         receipt = await session_cron.operation(authority, 'submit', params, actor)
         assert await session_cron.operation(authority, 'submit', params, actor) == receipt
         assert await session_cron.operation(authority, 'submit', params) == receipt
@@ -37,6 +41,24 @@ def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch):
         policy = runner.adapters[next(iter(runner.adapters))].policies[receipt['session_id']]
         assert policy.model == 'per-job-model'
         assert policy.source == 'cron'
+        if run_context:
+            import json
+            from cron.run_context import script_environment
+            frozen = json.loads(policy.request_json)['cron_job']
+            env = script_environment(frozen)
+            assert env['HERMES_CRON_TRIGGER'] == 'manual'
+            assert env['HERMES_CRON_TRIGGER_ACTOR'] == 'owner@example.com'
+            assert env['HERMES_CRON_RUN_PROMPT'] == 'extra'
+            recovered = await session_cron.operation(authority, 'recover', params, actor)
+            assert recovered['session_id'] == receipt['session_id']
+            changed = dict(params, run_context=dict(run_context, trigger_actor='another@example.com'))
+            for operation in ('submit', 'recover'):
+                with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+                    await session_cron.operation(authority, operation, changed, actor)
+            for invalid in (None, {'trigger': 'unknown'}, dict(run_context, env={'HOME': '/other'})):
+                with pytest.raises(RuntimeStoreError, match='invalid_params'):
+                    await session_cron.operation(authority, 'submit',
+                        dict(params, request_id='new', run_context=invalid), actor)
 
     try:
         asyncio.run(probe())

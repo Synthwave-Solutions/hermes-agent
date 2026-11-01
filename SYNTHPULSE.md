@@ -43,6 +43,14 @@ turn against a local model stub. These checks do not prove live-provider perform
 The integration PRs record exact results and remaining lint or inherited test failures;
 the existence of these branches does not mean they have been deployed.
 
+Canonical cron admissions preserve validated per-fire trigger metadata from the
+firing process through the owning gateway. Manual Scout runs therefore remain
+manual when their pre-run script executes. The context is part of the immutable
+admission payload: retries and recovery with different metadata are refused.
+It is operational metadata, not a principal or permission override; the owner
+still loads the job and its policy from the owning profile's store. Ordinary
+scheduled fires and legacy callers retain the existing three-field request.
+
 SynthPulse-specific settings now resolve from the current profile's `config.yaml` through
 `hermes_cli.synthpulse_settings`. Explicit values, including `false`, `0` and an empty string,
 take precedence. Missing/null values retain the existing launcher's environment fallback:

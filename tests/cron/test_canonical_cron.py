@@ -23,6 +23,31 @@ def test_agent_cron_is_transport_only_and_refuses_without_owner(monkeypatch):
     assert result[0] is False and 'owner_unavailable' in result[3]
 
 
+def test_manual_fire_context_crosses_the_canonical_transport(monkeypatch):
+    from hermes_cli import gateway_client
+    seen = []
+
+    class Peer:
+        async def rpc(self, method, **params):
+            seen.append((method, params))
+            if method == 'cron.submit':
+                return {'session_id': 'session', 'admission_id': 'admission'}
+            return {'status': 'terminal', 'result': [True, 'doc', 'answer', None]}
+
+    @asynccontextmanager
+    async def connected():
+        yield Peer()
+
+    monkeypatch.setattr(gateway_client, 'connect_gateway', connected)
+    assert scheduler.run_job({'id': 'job'}, execution_id='manual-fire', trigger='manual',
+                             trigger_actor='owner@example.com', run_prompt='Prepare now') == (
+                                 True, 'doc', 'answer', None)
+    params = seen[0][1]
+    assert params['extra_prompt'] == 'Prepare now'
+    assert params['run_context'] == {'trigger': 'manual', 'trigger_actor': 'owner@example.com',
+                                     'run_prompt': 'Prepare now'}
+
+
 def test_owner_ticker_uses_direct_admission_without_loopback(monkeypatch):
     from gateway import session_cron
     from types import SimpleNamespace
