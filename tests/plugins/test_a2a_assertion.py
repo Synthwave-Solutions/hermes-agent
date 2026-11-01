@@ -327,7 +327,7 @@ def test_verify_missing_header(header):
 
 def _malformed_headers():
     good = sign_actor(TOKEN, _claims())
-    version, payload, mac = good.split(".")
+    _version, payload, mac = good.split(".")
     padded = payload + "=" * (-len(payload) % 4 or 4)
     return [
         f"v2.{payload}.{mac}",

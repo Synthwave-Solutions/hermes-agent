@@ -59,7 +59,7 @@ def run_engine(tmp_path, mode, enabled=True):
     py = ENGINE / "venv" / "bin" / "python"
     proc = subprocess.run([str(py if py.exists() else sys.executable), str(driver), str(ENGINE),
                            json.dumps(CALLS)], cwd=str(tmp_path), env=env, capture_output=True,
-                          text=True, timeout=240)
+                          text=True, timeout=240, check=False)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT:")), None)
     assert line, f"engine driver failed:\nSTDOUT {proc.stdout[-2000:]}\nSTDERR {proc.stderr[-4000:]}"
     return json.loads(line[len("RESULT:"):]), home

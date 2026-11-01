@@ -13,6 +13,8 @@ socket guard records every outbound connection attempt.
 
 from __future__ import annotations
 
+import agent.auxiliary_client_gateway as _auxiliary_client_gateway
+
 import json
 import socket
 import threading
@@ -20,8 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 SALT = "sp-test-salt-v1"
 PERSON = "Alice.Example@Acme.Example "
 PSEUDONYM = "u_00ce9e9f4c1f"  # STACK modules/omniroute/key_registry.py test vector
@@ -37,7 +38,7 @@ PROVIDER_KEY = "sk-or-provider-must-not-leak"
 class _GatewayHandler(BaseHTTPRequestHandler):
     server_version = "FakeGateway/1"
 
-    def log_message(self, *args, **kwargs):  # noqa: D401 - silence
+    def log_message(self, *args, **kwargs):
         pass
 
     def _record(self, body):
@@ -58,14 +59,14 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         self._record(None)
         if self.path.rstrip("/").endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": "gw-model", "object": "model"}]})
             return
         self._send_json(404, {"error": {"message": "not found"}})
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         try:
@@ -529,7 +530,7 @@ def test_provider_chain_is_the_gateway_alone(enforced):
         (aux._try_openrouter, ()),
         (aux._try_nous, ()),
         (aux._try_custom_endpoint, ()),
-        (aux._resolve_api_key_provider, ()),
+        (_auxiliary_client_gateway._resolve_api_key_provider, ()),
         (aux._try_anthropic, ()),
         (aux._build_codex_client, ("gpt-5.4",)),
         (aux._build_xai_oauth_aux_client, ("grok-4",)),

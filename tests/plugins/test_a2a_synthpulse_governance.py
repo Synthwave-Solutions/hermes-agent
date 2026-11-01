@@ -19,8 +19,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from gateway import synthpulse_identity
 from plugins.platforms.a2a import protocol, security, synthpulse_governance as gov
 from plugins.platforms.a2a.synthpulse_assertion import ACTOR_HEADER, sign_actor
@@ -317,7 +316,7 @@ class TestTokensRequired:
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
 
         def check_unconfigured(base, adapter, seen):
-            status, card = _get(base + "/.well-known/agent-card.json")
+            _status, card = _get(base + "/.well-known/agent-card.json")
             assert card["security"] == [{"bearer": []}]
 
         _run_live(monkeypatch, check_unconfigured)

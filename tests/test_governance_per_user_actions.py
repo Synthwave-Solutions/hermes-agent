@@ -5,8 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.dashboard_governance import action_approval as review
 from hermes_cli.dashboard_governance.context import (
     DashboardGovernanceContext, governance_context, serialize_context_for_env, context_from_env_payload,

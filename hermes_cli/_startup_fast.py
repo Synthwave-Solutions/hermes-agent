@@ -24,21 +24,24 @@ toward the slow path, which then does the authoritative parse).
 
 from __future__ import annotations
 
+import logging
+
 import os
 import sys
 
 __all__ = [
-    "project_root_str", "normalize_hermes_home_env",
-    "ensure_project_root_on_path",
-    "is_global_fast_version_argv",
-    "is_container_startup_environment",
     "active_profile_may_override_home",
     "container_mode_may_be_active",
-    "read_openai_version",
-    "read_install_method",
-    "print_fast_version_info",
-    "try_fast_version",
+    "ensure_project_root_on_path",
+    "is_container_startup_environment",
     "is_desktop_ssh_backend_argv",
+    "is_global_fast_version_argv",
+    "normalize_hermes_home_env",
+    "print_fast_version_info",
+    "project_root_str",
+    "read_install_method",
+    "read_openai_version",
+    "try_fast_version",
 ]
 
 
@@ -205,7 +208,9 @@ def print_fast_version_info(*, check_updates: bool = True) -> None:
             from hermes_cli.skin_engine import get_active_skin
 
             agent_name = get_active_skin().get_branding("agent_name", "Hermes Agent") or "Hermes Agent"
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("print_fast_version_info: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             agent_name = "Hermes Agent"
         print(f"{agent_name} v{get_version_info().derived_version} ({__release_date__})")
     print(f"Install directory: {project_root_str()}")
@@ -232,8 +237,12 @@ def print_fast_version_info(*, check_updates: bool = True) -> None:
         from hermes_cli.source_check import UPDATE_AVAILABLE_NO_COUNT, check_for_updates
         from hermes_cli.config import recommended_update_command
 
-        behind = check_for_updates(passive=True).get("behind")
-        if behind == UPDATE_AVAILABLE_NO_COUNT:
+        status = check_for_updates(passive=True)
+        behind = status.get("behind")
+        if status.get("rollback"):
+            print(f"Newer than stable release v{status.get('sourceVersion')} — "
+                  f"'{recommended_update_command()}' moves back to it")
+        elif behind == UPDATE_AVAILABLE_NO_COUNT:
             print(f"Update available — run '{recommended_update_command()}'")
         elif behind and behind > 0:
             commits_word = "commit" if behind == 1 else "commits"

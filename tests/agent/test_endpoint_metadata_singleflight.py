@@ -1,4 +1,6 @@
 """Endpoint metadata isolation and coalescing through real local HTTP clients."""
+
+import agent.model_metadata_endpoint as _model_metadata_endpoint
 import json
 import threading
 import time
@@ -25,7 +27,7 @@ def isolated_caches(monkeypatch):
 
 
 @contextmanager
-def local_catalog(*, serialized_delay=0):
+def local_catalog():
     state = {"requests": [], "contexts": {"key-A": 65536, "key-B": 131072},
              "status": 200, "entered": threading.Event(), "release": threading.Event(),
              "block": False}
@@ -49,7 +51,6 @@ def local_catalog(*, serialized_delay=0):
                     state["release"].wait()  # every caller releases in finally
                 # A serialized metadata backend makes duplicate requests measurable.
                 with service_lock:
-                    time.sleep(serialized_delay)
                     status = state["status"]
                     payload = {"data": [{"id": MODEL,
                                          "context_length": state["contexts"].get(key, 32768),
@@ -90,7 +91,8 @@ def fetch_in_profile(home, url, key="key-A", **kwargs):
 
 
 def test_concurrent_same_scope_uses_one_real_http_request(tmp_path, record_property):
-    with local_catalog(serialized_delay=0.15) as (url, state):
+    with local_catalog() as (url, state):
+        state["block"] = True
         barrier = threading.Barrier(6)
 
         def fetch():
@@ -99,7 +101,12 @@ def test_concurrent_same_scope_uses_one_real_http_request(tmp_path, record_prope
 
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=6) as executor:
-            results = list(executor.map(lambda _: fetch(), range(6)))
+            futures = [executor.submit(fetch) for _ in range(6)]
+            try:
+                assert state["entered"].wait(5), "leader did not enter metadata request"
+            finally:
+                state["release"].set()
+            results = [future.result(timeout=10) for future in futures]
         elapsed = time.monotonic() - started
         count = sum(path == "/v1/models" for path, _ in state["requests"])
         print(json.dumps({"case": "six_parallel_native_fetches", "models_requests": count,
@@ -236,14 +243,14 @@ def test_concurrent_forced_refresh_shares_fresh_probe(monkeypatch, tmp_path):
 def test_aborted_leader_releases_followers_and_allows_later_retry(monkeypatch, tmp_path, failure):
     joined = observe_follower(monkeypatch)
     entered, release = threading.Event(), threading.Event()
-    original = metadata._fetch_endpoint_model_metadata_uncached
+    original = _model_metadata_endpoint._fetch_endpoint_model_metadata_uncached
 
     def abort(*_args):
         entered.set()
         release.wait()  # released by the test's finally, including assertion failure
         raise failure("synthetic interruption")
 
-    monkeypatch.setattr(metadata, "_fetch_endpoint_model_metadata_uncached", abort)
+    monkeypatch.setattr(_model_metadata_endpoint, "_fetch_endpoint_model_metadata_uncached", abort)
     with local_catalog() as (url, _), ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(fetch_in_profile, tmp_path, url)
         try:
@@ -256,7 +263,7 @@ def test_aborted_leader_releases_followers_and_allows_later_retry(monkeypatch, t
             first.result(timeout=3)
         assert second.result(timeout=3) == {}
         assert fetch_in_profile(tmp_path, url, cached_only=True) == {}
-        monkeypatch.setattr(metadata, "_fetch_endpoint_model_metadata_uncached", original)
+        monkeypatch.setattr(_model_metadata_endpoint, "_fetch_endpoint_model_metadata_uncached", original)
         assert fetch_in_profile(tmp_path, url)[MODEL]["context_length"] == 65536
         assert not metadata._endpoint_model_metadata_inflight
 
@@ -310,7 +317,7 @@ def test_real_agent_context_and_usage_accounting_share_scoped_snapshot(monkeypat
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock())
         monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
-        monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
         agent = run_agent.AIAgent(model=MODEL, provider="custom", requested_provider="custom:fixture",
                                  base_url=url, api_key="key-A", quiet_mode=True,
                                  skip_context_files=True, skip_memory=True, skip_background_review=True)

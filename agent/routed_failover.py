@@ -59,7 +59,7 @@ def failover_threshold_tokens(compressor: Any, failover_context_length: int) -> 
         return int(compressor._compute_threshold_tokens(
             failover_context_length, percent, max_tokens,
         ))
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         # Plugin context engines need not expose the built-in helpers.
         reserve = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else 0
         return int((failover_context_length - reserve) * _FALLBACK_THRESHOLD_PERCENT)

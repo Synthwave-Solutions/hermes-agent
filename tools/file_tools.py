@@ -35,7 +35,8 @@ from tools.file_tools_write_guards import (
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
     _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
-    _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
+    _bump_consecutive, _cap_read_tracker_data, _carry_full_write_baselines, _check_file_staleness,
+    _check_not_found_cache, _known_full_content_sha256,
     _file_metadata, _file_version,
     _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _patch_failure_lock,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
@@ -269,7 +270,9 @@ def _is_scoped_profile_home() -> bool:
     try:
         from tools import profile_scope_bridge
         return profile_scope_bridge.is_scoped_home()
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_is_scoped_profile_home: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 
@@ -317,7 +320,9 @@ def _check_profile_scope_path(filepath: str, mode: str = "read",
             return None
         return (f"Blocked by profile scope ({profile}): {reason}. This profile "
                 f"may only access its assigned project folders.")
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_check_profile_scope_path: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         if _is_scoped_profile_home():
             return "Blocked: profile-scope guard error (fail-closed)."
         return None
@@ -405,14 +410,17 @@ def _filter_profile_scope_search_results(result, task_id: str = "default") -> in
         try:
             from tools.memory_tool import personal_memory_scope_active
             governed = governed or personal_memory_scope_active()
-        except Exception:
-            pass
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_filter_profile_scope_search_results: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         mod = _profile_scope_mod()
         if not governed and mod is not None and not mod.is_scoped(mod.resolve_profile()):
             return 0
         if not governed and mod is None and not _is_scoped_profile_home():
             return 0
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_filter_profile_scope_search_results: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         if not locals().get("governed") and not _is_scoped_profile_home():
             return 0
 
@@ -498,7 +506,6 @@ def _create_terminal_env_for_file_ops(raw_task_id: str, task_id: str):
         config, env_type, image=_select_image(env_type, overrides, config), cwd=cwd,
         timeout=config["timeout"], task_id=task_id,
         host_cwd=host_cwd,
-        local_config={"persistent": config.get("local_persistent", False)} if env_type == "local" else None,
     )
     return env_type, terminal_env
 
@@ -568,7 +575,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     return file_ops
 
 
-def clear_file_ops_cache(task_id: str = None):
+def clear_file_ops_cache(task_id: str | None = None):
     """Clear file-operation state for a finished task, or all tasks."""
     with _file_ops_lock:
         if task_id:
@@ -768,6 +775,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
                 complete = complete and not redacted
             if complete:
                 baselines[resolved_str] = version
+                task_data.setdefault("blind_patches", {}).pop(resolved_str, None)
         if not complete:
             baselines.pop(resolved_str, None)
         if not stable or count >= 4:
@@ -793,6 +801,23 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
         except Exception:
             logger.debug("background-review read-mark failed", exc_info=True)
     return count
+
+
+def _special_read_refusal(path, resolved, task_id):
+    """Refuse host FIFOs/sockets before document extraction or regular reads."""
+    # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
+    if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        kind = _special_file_kind(resolved)
+        if kind is not None:
+            return json.dumps({
+                "success": False,
+                "note": (
+                    f"'{path}' is {kind}, not a regular file — reading "
+                    "it would block indefinitely, so no read was "
+                    "attempted. Use terminal utilities if you need to "
+                    "interact with it.")})
+
+    return None
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
@@ -828,17 +853,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
-        # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
-            kind = _special_file_kind(_resolved)
-            if kind is not None:
-                return json.dumps({
-                    "success": False,
-                    "note": (
-                        f"'{path}' is {kind}, not a regular file — reading "
-                        "it would block indefinitely, so no read was "
-                        "attempted. Use terminal utilities if you need to "
-                        "interact with it.")})
+        special_result = _special_read_refusal(path, _resolved, task_id)
+        if special_result is not None:
+            return special_result
 
         # Hermes internal denylist (prompt injection via catalog metadata,
         # credential stores). Runs BEFORE document extraction so a
@@ -887,6 +904,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         # Failed reads cannot establish whole-file knowledge.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
+            from tools.tool_result_storage import expired_archive_fields
+            result_dict.update(expired_archive_fields(path))
             _record_not_found("read", resolved_str, task_id, json.dumps(result_dict, ensure_ascii=False))
         if _err or result_dict.get("is_binary"):
             return json.dumps(result_dict, ensure_ascii=False)
@@ -1113,7 +1132,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 if _resolved:
                     result_dict["files_modified"] = [_resolved]
                     # Own write = current whole-file content: consecutive
-                    # same-task writes stay unblocked. patch never does this.
+                    # same-task writes stay unblocked (patch_tool carries it).
                     _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
                 _note_edited(task_id, [path], path_to_resolved, session_id)
         return json.dumps(result_dict, ensure_ascii=False)
@@ -1154,8 +1173,8 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str], list[st
     return paths, content_paths, entry_paths
 
 
-def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
-               new_string: str = None, replace_all: bool = False, patch: str = None,
+def patch_tool(mode: str = "replace", path: str | None = None, old_string: str | None = None,
+               new_string: str | None = None, replace_all: bool = False, patch: str | None = None,
                task_id: str = "default", cross_profile: bool = False,
                session_id: str | None = None) -> str:
     """Patch a file using replace mode or V4A patch format.
@@ -1193,6 +1212,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _locks.enter_context(file_state.lock_path(_r))
             stale_warnings = _edit_warnings(_paths_to_check, _path_to_resolved, task_id)
             file_ops = _get_file_ops(task_id)
+            # Whole-file knowledge held BEFORE the patch reads, under the same locks. Like
+            # every baseline check it stats the host path, so a sandbox path carries nothing.
+            _known = _known_full_content_sha256(_path_to_resolved.values(), task_id)
 
             # Hand the shell layer the RESOLVED targets so both layers agree on
             # which file is edited even when the shell's cwd differs.
@@ -1223,6 +1245,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
                 _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
+                _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
                 # Clear failure counters so a future miss starts a fresh count.
                 _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
         # old_string-not-found hint. Failure escalation is tracked for replace
@@ -1238,9 +1261,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     "Stop retrying with variations of the same old_string. "
                     "Either: (1) re-read the file fresh to verify current "
                     "content, (2) use a longer / more unique old_string with "
-                    "surrounding context lines, or (3) use write_file to "
-                    "replace the entire file if the targeted region is hard "
-                    "to anchor.")
+                    "surrounding context lines, or (3) re-read the file in "
+                    "full, then use write_file to replace it if the targeted "
+                    "region is hard to anchor.")
             elif "Did you mean one of these sections?" not in str(result_dict["error"]):
                 result_dict["_hint"] = (
                     "old_string not found. Use read_file to verify the current "
@@ -1251,7 +1274,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",
-                file_glob: str = None, limit: int = 50, offset: int = 0,
+                file_glob: str | None = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
                 order: str = "discovery",
                 task_id: str = "default") -> str:
@@ -1482,7 +1505,7 @@ def _is_openai_family_main() -> bool:
 
         provider = (_read_main_provider() or "").strip().lower()
         model = (_read_main_model() or "").strip().lower()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
     if provider in {"openai", "openai-chat", "openai-codex", "azure-openai", "codex"}:
         return True
@@ -1541,11 +1564,19 @@ def _handle_write_file(args, **kw):
         )
     from hermes_cli.observability.shared_metrics_harness import record_file_edit
 
-    return record_file_edit("write_file", "whole_file", lambda: write_file_tool(
+    return record_file_edit("write_file", "whole_file", lambda: _owned(kw.get("session_id") or tid, write_file_tool,
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
     ))
+
+
+def _owned(owner: str, fn, **call_kwargs):
+    """Run an edit tool with its late LSP verdicts attributed to ``owner``, the calling session
+    (``agent.lsp.deferred``): they ride that session's next tool result."""
+    from agent.lsp.deferred import bind_owner
+    with bind_owner(owner):
+        return fn(**call_kwargs)
 
 
 def _handle_patch(args, **kw):
@@ -1553,7 +1584,7 @@ def _handle_patch(args, **kw):
 
     tid = kw.get("task_id") or "default"
     mode = args.get("mode", "replace")
-    return record_file_edit("patch", mode, lambda: patch_tool(
+    return record_file_edit("patch", mode, lambda: _owned(kw.get("session_id") or tid, patch_tool,
         mode=mode, path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
@@ -1595,7 +1626,7 @@ def _read_file_schema_overrides():
                     "PDF (text layer)", "PDF (scanned or text)"
                 )
             }
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return {}
 
@@ -1620,7 +1651,7 @@ def _patch_schema_overrides():
             "required": ["mode"],
         }
         return {"description": _PATCH_V4A_DESCRIPTION, "parameters": params}
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
 
 

@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
 
-_SECRET_KEY_RE = re.compile(r"(api[_-]?key|secret|password|passwd|token|authorization|credential|refresh)", re.I)
-_BEARER_RE = re.compile(r"bearer\s+[A-Za-z0-9._~+/=-]+", re.I)
+_SECRET_KEY_RE = re.compile(r"(api[_-]?key|secret|password|passwd|token|authorization|credential|refresh)", re.IGNORECASE)
+_BEARER_RE = re.compile(r"bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 
 
 def _audit_file() -> Path:
@@ -51,7 +51,7 @@ def append_audit_event(
     extra: dict[str, Any] | None = None,
 ) -> None:
     row = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
         "event": str(event),
         "subject_email_hash": _hash_identity(subject_email),
         "subject_user_id_hash": _hash_identity(subject_user_id),
@@ -71,14 +71,14 @@ def append_audit_event(
 def read_audit_events(*, limit: int = 100) -> list[dict[str, Any]]:
     path_obj = _audit_file()
     try:
-        lines = path_obj.read_text(encoding="utf-8").splitlines()
+        lines = path_obj.read_text(encoding="utf-8-sig").splitlines()
     except FileNotFoundError:
         return []
     rows: list[dict[str, Any]] = []
     for line in reversed(lines[-max(1, int(limit)) :]):
         try:
             row = json.loads(line)
-        except Exception:
+        except json.JSONDecodeError:
             continue
         if isinstance(row, dict):
             rows.append(row)

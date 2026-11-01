@@ -9,8 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
 from hermes_cli.dashboard_governance.loader import load_governance_policy
 from hermes_cli.dashboard_governance.models import GovernanceSubject
@@ -143,7 +142,7 @@ def test_owner_sees_keys_and_only_the_secret_mount_is_masked(tmp_path, workroot)
 
 
 def test_caller_denied_paths_are_masked(tmp_path, workroot):
-    creds = os.path.join(str(opencode_tool._HOME), ".config/synthwave/clients")
+    creds = os.path.join(str(opencode_tool._host_home()), ".config/synthwave/clients")
     access, _, _ = _blacklist(tmp_path, workroot,
                               grants={"files": {"denied_globs": [creds, creds + "/**"]}})
     dirs, _, patterns = opencode_tool.mask_plan(access)
@@ -229,7 +228,8 @@ def test_tool_blocks_non_granted_caller(tmp_path, workroot):
 def _wrapper_copy(tmp_path, slots=1):
     fake = tmp_path / "fake-opencode"
     fake.write_text("#!/usr/bin/env bash\necho \"ARGS:$*\"\necho \"KEY:${OMNIROUTE_API_KEY:-}\"\n"
-                    "[ -n \"${SLEEP:-}\" ] && sleep \"$SLEEP\"\nexit 0\n")
+                    'if [ -n "${READY:-}" ]; then touch "$READY"; fi\n'
+                    'if [ -n "${RELEASE:-}" ]; then while [ ! -f "$RELEASE" ]; do sleep 0.01; done; fi\nexit 0\n')
     fake.chmod(0o755)
     keyfile = tmp_path / "omniroute.key"
     keyfile.write_text("secret-key\n")
@@ -247,26 +247,29 @@ def _wrapper_copy(tmp_path, slots=1):
 def test_wrapper_guard_default_model_key_and_slots(tmp_path):
     wrapper = _wrapper_copy(tmp_path, slots=1)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
-    done = subprocess.run([str(wrapper), "run", "hello"], env=env, capture_output=True, text=True, timeout=20)
+    done = subprocess.run([str(wrapper), "run", "hello"], env=env, capture_output=True, text=True, timeout=20, check=False)
     assert done.returncode == 0, done.stderr
     assert "-m omniroute/auto/best-coding" in done.stdout
     assert "KEY:secret-key" in done.stdout
     explicit = subprocess.run([str(wrapper), "run", "-m", "omniroute/auto/coding", "hi"], env=env,
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20, check=False)
     assert "auto/best-coding" not in explicit.stdout
     nested = subprocess.run([str(wrapper), "run", "x"], env={**env, "OPENCODE_RECURSION_GUARD": "1"},
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=20, check=False)
     assert nested.returncode == 1 and "recursion guard" in nested.stderr
-    busy = subprocess.Popen([str(wrapper), "run", "long"], env={**env, "SLEEP": "4"},
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    busy = subprocess.Popen([str(wrapper), "run", "long"],
+                            env={**env, "READY": str(ready), "RELEASE": str(release)},
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        import time
-        time.sleep(1)
+        from tests.waiting import wait_until
+        wait_until(ready.exists, timeout=10, what="first OpenCode process holds the slot")
         second = subprocess.run([str(wrapper), "run", "x"], env={**env, "OPENCODE_SLOT_WAIT": "0"},
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, timeout=20, check=False)
         assert second.returncode == 75 and "slots" in second.stderr
     finally:
-        busy.wait(timeout=20)
+        release.touch()
+        busy.communicate(timeout=20)
 
 
 def test_whitelist_gets_allowlist_home(tmp_path, workroot):
@@ -292,7 +295,7 @@ def test_sandbox_hides_unlisted_home_and_blocks_outside_writes(tmp_path):
            "mask_dirs": [], "mask_files": []}
     argv = runner.bwrap_argv(job, tmp_path / "run", worktree, {"git": False})
     def sh(cmd):
-        return subprocess.run(argv + ["bash", "-c", cmd], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return subprocess.run(argv + ["bash", "-c", cmd], capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False)
     assert sh(f"cat {allowed}/f.txt").stdout == "x"
     assert sh(f"cat {hidden}/f.txt").returncode != 0
     assert sh(f"touch {allowed}/new.txt").returncode != 0

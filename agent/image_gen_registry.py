@@ -61,7 +61,7 @@ class _GatewayRefusedProvider(ImageGenProvider):
     def is_available(self) -> bool:
         return False
 
-    def generate(self, prompt: str, aspect_ratio: str = "landscape", **kwargs: Any) -> Dict[str, Any]:
+    def generate(self, prompt: str, aspect_ratio: str = "landscape", **kwargs: Any) -> dict[str, Any]:
         from agent.image_gen_provider import error_response
 
         return error_response(

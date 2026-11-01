@@ -28,7 +28,7 @@ from tools.threat_patterns import scan_for_threats
 logger = logging.getLogger(__name__)
 
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_catalog"})
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_catalog", "setup_beat", "set_theme"})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
@@ -145,6 +145,23 @@ def _is_destructive_command(cmd: str) -> bool:
     return bool(cmd) and bool(_DESTRUCTIVE_PATTERNS.search(cmd) or _REDIRECT_OVERWRITE.search(cmd))
 
 
+def _extend_tool_timeout(tool_name: str, default: float | None) -> float | None:
+    """A registered transport budget must not be cut short by the generic executor."""
+    from tools.registry import registry
+
+    entry = registry.get_entry(tool_name)
+    if default is None or entry is None or entry.execution_timeout is None:
+        return default
+    return max(default, entry.execution_timeout)
+
+
+def _requires_extended_tool_deadline(tool_name: str) -> bool:
+    from agent.tool_executor import _resolve_concurrent_tool_timeout
+
+    default = _resolve_concurrent_tool_timeout()
+    return _extend_tool_timeout(tool_name, default) != default
+
+
 def _is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
     """Check if an MCP tool's server is pinned to serial execution.
 
@@ -156,7 +173,9 @@ def _is_mcp_tool_parallel_blocked(tool_name: str) -> bool:
     try:
         from tools.mcp_tool import is_mcp_tool_parallel_blocked
         return is_mcp_tool_parallel_blocked(tool_name)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_is_mcp_tool_parallel_blocked: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 
@@ -312,7 +331,7 @@ def _is_read_only_command(cmd: str) -> bool:
     return True
 
 
-def _terminal_is_parallel_safe(function_args: Dict[str, Any]) -> bool:
+def _terminal_is_parallel_safe(function_args: dict[str, Any]) -> bool:
     """Return True when a ``terminal`` call may join a parallel run.
 
     Two admissions, both narrow:
@@ -343,7 +362,7 @@ _READ_ONLY_PROCESS_ACTIONS = frozenset({"list", "log", "poll", "wait"})
 # action (process kill/write/submit/close/handoff, project create/switch, preview open/close)
 # is a sequential barrier. ``process_manage`` / ``desktop_project`` / ``desktop_preview`` are the
 # upstream names of the fork's ``process`` / ``project_*`` / ``*_preview`` tools.
-_ACTION_GATED_TOOLS: Dict[str, frozenset] = {
+_ACTION_GATED_TOOLS: dict[str, frozenset] = {
     "process": _READ_ONLY_PROCESS_ACTIONS,
     "process_manage": _READ_ONLY_PROCESS_ACTIONS,
     "desktop_project": frozenset({"list"}),
@@ -351,7 +370,7 @@ _ACTION_GATED_TOOLS: Dict[str, frozenset] = {
 }
 
 
-def _process_is_parallel_safe(function_args: Dict[str, Any], tool_name: str = "process") -> bool:
+def _process_is_parallel_safe(function_args: dict[str, Any], tool_name: str = "process") -> bool:
     """Return True when a ``process``-style call only observes (see ``_ACTION_GATED_TOOLS``)."""
     action = function_args.get("action")
     allowed = _ACTION_GATED_TOOLS.get(tool_name, _READ_ONLY_PROCESS_ACTIONS)
@@ -362,7 +381,7 @@ def _process_is_parallel_safe(function_args: Dict[str, Any], tool_name: str = "p
 _DEFAULT_BROWSER_SESSION = "\x00default"
 
 
-def _browser_session_key(function_args: Dict[str, Any]) -> str:
+def _browser_session_key(function_args: dict[str, Any]) -> str:
     """Return the isolation key for a ``browser_exec`` call.
 
     Each named session gets its own harness daemon and its own browser, so
@@ -375,7 +394,7 @@ def _browser_session_key(function_args: Dict[str, Any]) -> str:
     return _DEFAULT_BROWSER_SESSION
 
 
-def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, List[Path], bool, dict] | None:
+def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, list[Path], bool, dict] | None:
     """Classify one call for the planner: ``None`` = sequential barrier, else
     ``(effective_name, scoped_paths, is_writer, effective_args)`` (empty paths = unscoped).
 
@@ -408,7 +427,7 @@ def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, Lis
         return None
 
     name, args = _peel_bridge_call(tool_name, function_args)
-    if name in _NEVER_PARALLEL_TOOLS:
+    if name in _NEVER_PARALLEL_TOOLS or _requires_extended_tool_deadline(name):
         return None
     if name == _BRIDGE_WRAPPER_NAME:
         # The bridge wrapper did not peel (unparseable, or a connector batch carrying a
@@ -433,7 +452,7 @@ def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, Lis
     return name, [], False, args
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> list[tuple]:
     """Split a tool-call batch into ordered ``("parallel"|"sequential", calls)`` segments.
 
     Call order is preserved exactly (a later call never crosses an earlier barrier), so
@@ -446,7 +465,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     the call starts a NEW run after the conflicting one lands. Runs shorter than two calls
     demote to sequential (it owns the richer inline dispatch); adjacent sequential merge.
     """
-    segments: List[tuple] = []
+    segments: list[tuple] = []
     current: list = []
     reserved_paths: list[tuple[Path, bool]] = []  # (canonical_path, is_writer) for the current run
     # Browser sessions already claimed by this run: one browser_exec call per session.
@@ -524,7 +543,7 @@ def _extract_parallel_scope_paths(
     tool_name: str,
     function_args: dict,
     execution_cwd: Optional[Path] = None,
-) -> List[Path]:
+) -> list[Path]:
     """Every canonical path this call reserves for overlap checks. *execution_cwd* is the cwd
     the tool will actually use (may differ from the process cwd on WSL / sandboxed backends);
     V4A ``patch`` scope comes from patch-body headers. Empty = unknown scope = barrier."""
@@ -585,7 +604,7 @@ def _multimodal_text_summary(value: Any) -> str:
         return str(value)
 
 
-def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
+def _append_subdir_hint_to_multimodal(value: dict[str, Any], hint: str) -> None:
     """Append a subdir hint to the envelope's first text part (and ``text_summary``) in place."""
     if not _is_multimodal_tool_result(value):
         return
@@ -607,7 +626,7 @@ _V4A_FILE_HEADER = re.compile(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$'
 _V4A_MOVE_HEADER = re.compile(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
 
-def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
+def _extract_file_mutation_targets(tool_name: str, args: dict[str, Any]) -> list[str]:
     """File paths a ``write_file`` / ``patch`` call targets: ``args["path"]`` in replace mode,
     every ``*** Update/Add/Delete/Move File:`` header in V4A patch mode."""
     if tool_name not in _FILE_MUTATING_TOOLS:
@@ -629,9 +648,9 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
 
 def _extract_landed_file_mutation_paths(
     tool_name: str,
-    args: Dict[str, Any],
+    args: dict[str, Any],
     result: Any,
-) -> List[str]:
+) -> list[str]:
     """Concrete file paths a successful mutation reports (``files_modified`` /
     ``resolved_path`` in the JSON result), falling back to the declared targets."""
     targets = _extract_file_mutation_targets(tool_name, args)
@@ -667,7 +686,7 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     return text
 
 
-def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _trajectory_normalize_msg(msg: dict[str, Any]) -> dict[str, Any]:
     """Shallow copy for trajectory saving: multimodal results become their text summary,
     image parts become ``[screenshot]``."""
     if not isinstance(msg, dict):
@@ -771,13 +790,22 @@ def _detect_upstream_elision(content: Any) -> bool:
 
 
 def _maybe_append_elision_notice(name: str, content: Any) -> Any:
-    """Append the incompleteness notice to untrusted string results with elision markers."""
-    if _is_untrusted_tool(name) and _detect_upstream_elision(content):
+    """Append the incompleteness notice to untrusted results with elision markers. A multimodal part list (an MCP
+    result that also carries images) is judged by its first text part, which is where the notice goes."""
+    if not _is_untrusted_tool(name):
+        return content
+    if isinstance(content, list):
+        idx = next((i for i, item in enumerate(content) if _is_text_item(item)), None)
+        if idx is not None and _detect_upstream_elision(content[idx]["text"]):
+            return [*content[:idx], {**content[idx], "text": content[idx]["text"] + _UPSTREAM_ELISION_NOTICE},
+                    *content[idx + 1:]]
+        return content
+    if _detect_upstream_elision(content):
         return content + _UPSTREAM_ELISION_NOTICE
     return content
 
 
-def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, Any]]:
+def _tool_output_risk_metadata(name: str, content: Any) -> Optional[dict[str, Any]]:
     """Internal-only advisory classification of attacker-controlled output: deterministic
     finding ids, never blocks or redacts, omits the scanned text."""
     if not _is_untrusted_tool(name):
@@ -791,7 +819,7 @@ def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, An
     if not text_parts:
         return None
 
-    findings: List[str] = []
+    findings: list[str] = []
     for text in text_parts:
         for finding in scan_for_threats(text, scope="context"):
             if finding not in findings:
@@ -835,15 +863,37 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
 
 
 __all__ = [
-    "_NEVER_PARALLEL_TOOLS", "_PARALLEL_SAFE_TOOLS", "_SEQUENTIAL_TOOLS", "_PATH_SCOPED_TOOLS", "_PATH_SCOPED_READERS",
-    "_PATH_SCOPED_WRITERS", "_DESTRUCTIVE_PATTERNS", "_REDIRECT_OVERWRITE", "_context_pruned_argument_paths",
-    "_is_destructive_command", "_is_mcp_tool_parallel_blocked", "_is_read_only_command",
-    "_terminal_is_parallel_safe", "_browser_session_key", "_process_is_parallel_safe",
-    "_READ_ONLY_COMMAND_HEADS", "_READ_ONLY_GIT_SUBCOMMANDS",
-    "_plan_tool_batch_segments", "_should_parallelize_tool_batch", "_canonical_path",
-    "_extract_parallel_scope_path", "_extract_parallel_scope_paths", "_paths_overlap",
-    "_is_multimodal_tool_result", "_multimodal_text_summary", "_append_subdir_hint_to_multimodal",
-    "_extract_file_mutation_targets", "_extract_landed_file_mutation_paths", "_extract_error_preview",
-    "_trajectory_normalize_msg", "_detect_upstream_elision", "_maybe_append_elision_notice",
+    "_DESTRUCTIVE_PATTERNS",
+    "_NEVER_PARALLEL_TOOLS",
+    "_PARALLEL_SAFE_TOOLS",
+    "_PATH_SCOPED_READERS",
+    "_PATH_SCOPED_TOOLS",
+    "_PATH_SCOPED_WRITERS",
+    "_READ_ONLY_COMMAND_HEADS",
+    "_READ_ONLY_GIT_SUBCOMMANDS",
+    "_REDIRECT_OVERWRITE",
+    "_SEQUENTIAL_TOOLS",
+    "_append_subdir_hint_to_multimodal",
+    "_browser_session_key",
+    "_canonical_path",
+    "_context_pruned_argument_paths",
+    "_detect_upstream_elision",
+    "_extract_error_preview",
+    "_extract_file_mutation_targets",
+    "_extract_landed_file_mutation_paths",
+    "_extract_parallel_scope_path",
+    "_extract_parallel_scope_paths",
+    "_is_destructive_command",
+    "_is_mcp_tool_parallel_blocked",
+    "_is_multimodal_tool_result",
+    "_is_read_only_command",
+    "_maybe_append_elision_notice",
+    "_multimodal_text_summary",
+    "_paths_overlap",
+    "_plan_tool_batch_segments",
+    "_process_is_parallel_safe",
+    "_should_parallelize_tool_batch",
+    "_terminal_is_parallel_safe",
+    "_trajectory_normalize_msg",
     "make_tool_result_message",
 ]

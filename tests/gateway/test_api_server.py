@@ -26,18 +26,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.api_server import (
-    APIServerAdapter,
-    ResponseStore,
-    _api_request_profile,
-    _IdempotencyCache,
-    _derive_chat_session_id,
-    _redact_api_error_text,
-    _request_agent_overrides,
-    _request_relay_metadata,
-    cors_middleware,
-    security_headers_middleware,
-)
+from gateway.platforms.api_server import APIServerAdapter, ResponseStore, _api_request_profile, _IdempotencyCache, _derive_chat_session_id, _redact_api_error_text, cors_middleware, security_headers_middleware
+from gateway.platforms.api_server_runtime_options import _request_agent_overrides, _request_relay_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -742,7 +732,7 @@ class TestDisconnectedAgentReap:
 
         deadline = time.time() + 1.0
         while not calls and time.time() < deadline:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
         agent.interrupt.assert_called_once()
 
@@ -985,7 +975,7 @@ class TestSkillsEndpoint:
             {"name": "ascii-art", "description": "ASCII art generation", "category": "creative"},
         ]
         with patch(
-            "tools.skills_tool._find_all_skills",
+            "tools.skills_tool.find_all_skills",
             return_value=list(fake_skills),
         ):
             app = _create_app(adapter)
@@ -2579,7 +2569,7 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
         },
     )
     monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "global/model")
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda model="": {})
     )

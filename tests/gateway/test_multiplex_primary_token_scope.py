@@ -14,6 +14,8 @@ this suite locks the complementary primary-path fixes:
 """
 from __future__ import annotations
 
+import gateway.run_profile_config as _run_profile_config
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -46,7 +48,7 @@ class TestLoadGatewayConfigForRunner:
         # Without multiplex, dotenv is still loaded into os.environ by the
         # normal env loader in real gateways; here we only assert the helper
         # returns a non-multiplex config without requiring a scope.
-        cfg = run_mod.load_gateway_config_for_runner()
+        cfg = _run_profile_config.load_gateway_config_for_runner()
         assert cfg.multiplex_profiles is False
 
     def test_scoped_reload_still_sees_container_api_server_env(self, tmp_path, monkeypatch):
@@ -87,7 +89,7 @@ class TestLoadGatewayConfigForRunner:
         # before the runner reload, making any installed scope authoritative.
         ss.set_multiplex_active(True)
 
-        cfg = run_mod.load_gateway_config_for_runner()
+        cfg = _run_profile_config.load_gateway_config_for_runner()
 
         assert cfg.multiplex_profiles is True
         # Telegram token from the profile scope (.env)

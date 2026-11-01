@@ -648,7 +648,14 @@ class TestSecretsAreOutOfShellReach:
     read_file refused them. Every path in a command line is now checked, and
     the per-person allow_globs exception still opens one named file."""
 
-    KEY = "/home/synthwavehq/.hermes/gmail-dwd-sa.json"
+    @pytest.fixture(autouse=True)
+    def private_home(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        self.KEY = str(tmp_path / ".hermes/gmail-dwd-sa.json")
+        self.notify_script = str(tmp_path / ".hermes/skills/x/notify.py")
 
     def _access(self, *, allow=(), cli=("cat", "cp", "grep", "ls", "python3", "git")):
         return EffectiveAccess(
@@ -688,8 +695,8 @@ class TestSecretsAreOutOfShellReach:
         assert self._decide(self._access(), "grep -rn TODO /home/synthwavehq/clients/360kas/src").allowed
 
     def test_a_granted_exception_opens_exactly_that_file(self):
-        access = self._access(allow={"/home/synthwavehq/.hermes/skills/x/notify.py"})
-        assert self._decide(access, "cat /home/synthwavehq/.hermes/skills/x/notify.py").allowed
+        access = self._access(allow={self.notify_script})
+        assert self._decide(access, f"cat {self.notify_script}").allowed
         assert not self._decide(access, f"cat {self.KEY}").allowed
 
     def test_a_caller_without_denied_globs_is_unchanged(self):
@@ -772,7 +779,6 @@ class TestGrantedEnvVarsReachTheShell:
         return bind_governance_context(ctx), reset_governance_context
 
     def _child_env(self, dotenv, grants, **kw):
-        from unittest.mock import patch
         from tools.environments import local
         token, reset = self._bind(grants, **kw)
         try:
@@ -801,7 +807,6 @@ class TestGrantedEnvVarsReachTheShell:
         assert "OMNIROUTE_API_KEY" not in env
 
     def test_an_inherited_value_is_not_overwritten(self):
-        from unittest.mock import patch
         from tools.environments import local
         token, reset = self._bind(GrantSet(env_vars=frozenset({"OMNIROUTE_API_KEY"})))
         try:
@@ -839,7 +844,6 @@ class TestCronJobsCarryTheirOwner:
         return DashboardGovernanceContext(subject=access.subject, access=access)
 
     def _creating_owner(self, ctx):
-        from unittest.mock import patch
         from hermes_cli.dashboard_governance import context as gov_context
         from cron.jobs import _creating_owner_email
         with patch.object(gov_context, "current_governance_context", lambda: ctx):
@@ -882,7 +886,6 @@ class TestCronJobsCarryTheirOwner:
     def test_the_fire_cannot_act_as_someone_else(self):
         """The whole point of the owner: the job may only drive the account of
         the person who scheduled it, exactly like their own session."""
-        from unittest.mock import patch
         from cron.scheduler import _governed_as_job_owner
         from hermes_cli.dashboard_governance import loader, resolver
         from hermes_cli.dashboard_governance.context import current_governance_context
@@ -1206,7 +1209,7 @@ class TestOwnSessionAttachmentsAreReadable:
         from hermes_cli.dashboard_governance.context import DashboardGovernanceContext
         from hermes_cli.dashboard_governance.tool_policy import tool_arguments_allowed_for_context
         workspace = str(tmp_path / "clients" / "_synthwave")
-        members_only = lambda path: path == workspace  # noqa: E731
+        members_only = lambda path: path == workspace
         mine = replace(DashboardGovernanceContext(subject=GovernanceSubject(email=self.ME), access=self._access(), session_id=self.SID),
                        workspace_path=workspace, workspace_access_check=members_only)
         assert tool_arguments_allowed_for_context(mine, "read_file", {"path": str(self.paste)}).allowed

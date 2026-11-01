@@ -6,8 +6,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.dashboard_governance import action_approval as review
 from hermes_cli.dashboard_governance.context import (
     DashboardGovernanceContext, governance_context, serialize_context_for_env,
@@ -46,7 +45,7 @@ def runtime(tmp_path, monkeypatch):
         assert name == "terminal"
         dispatched.append(args["command"])
         completed = subprocess.run(args["command"], shell=True, cwd=tmp_path,
-            env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5)
+            env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5, check=False)
         return json.dumps({"exit_code": completed.returncode, "output": completed.stdout})
     monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
     monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)

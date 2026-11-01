@@ -16,15 +16,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      - name: Install locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
         with:
-          version: '0.9.28'
-          enable-cache: true
-      - name: Install locked test environment
-        run: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+          test-environment: 'true'
+          prune-python-cache: true
       - name: Verify actor isolation and approval capability ceilings
         run: >-
-          uv run --no-sync python -m pytest
+          scripts/run_tests.sh
           tests/tools/test_personal_memory_scope.py
           tests/tools/test_memory_tool.py
           tests/tools/test_file_tools.py

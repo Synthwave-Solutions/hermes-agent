@@ -15,6 +15,8 @@ __all__ = [
     "MAX_CALLS_PER_DISPATCH",
     "ConnectorConfig",
     "connectors_available",
+    "ensure_guest_identity",
+    "guest_identity_pending",
     "load_config",
 ]
 
@@ -30,7 +32,7 @@ class ConnectorConfig:
     enabled: bool = True
 
     @classmethod
-    def from_raw(cls, raw: Any) -> "ConnectorConfig":
+    def from_raw(cls, raw: Any) -> ConnectorConfig:
         """Malformed configuration falls back to the enabled default."""
         if isinstance(raw, bool):
             return cls(enabled=raw)
@@ -87,18 +89,22 @@ def connectors_available(
 
     The one gate for the connectors surface, and the tool's ``check_fn``: outside it the tool is
     not in the schema at all, so the model never narrates a gateway 404 to a user the portal has
-    not enabled. Free-tier identities are always in; accounts are in only when the portal says so
-    via the token claim."""
+    not enabled. Free-tier identities are always in, and so is a user with no identity who may get
+    one; accounts are in only when the portal says so via the token claim."""
     try:
         resolved_loader = config_loader or load_config
         if not resolved_loader().enabled:
             return False
+        from tools.connectors.identity import personal_connector_bound
+        if personal_connector_bound():
+            # The credential read belongs to execution, never schema discovery.
+            return True
         if entitlement_check is None:
             from hermes_cli.anon_auth import is_guest_state
             from tools.managed_tool_gateway import _read_nous_provider_state
 
             # Availability must not mint or refresh an identity.
-            if is_guest_state(_read_nous_provider_state()):
+            if is_guest_state(_read_nous_provider_state()) or guest_identity_pending():
                 return True
 
             entitlement_check = managed_tools_rolled_out
@@ -106,6 +112,55 @@ def connectors_available(
     except Exception as e:
         logger.debug("Connector availability check failed: %s", e)
         return False
+
+
+def guest_identity_pending() -> bool:
+    """No Nous identity or bearer yet, and a guest one may be created (``nous.guest`` is not false
+    and no earlier mint was refused for good). No network: this feeds the ``check_fn``."""
+    from tools.connectors.identity import personal_connector_bound
+    if personal_connector_bound():
+        return False
+    from hermes_cli.anon_auth import guest_allowed, last_mint_failure
+    from tools.managed_tool_gateway import _read_nous_provider_state, peek_nous_access_token
+
+    if not guest_allowed() or _read_nous_provider_state() is not None or peek_nous_access_token():
+        return False
+    failure = last_mint_failure()
+    return not failure or bool(failure["retryable"])
+
+
+_SETUP_FAILED = "Hosted connectors could not be set up. "
+
+
+def guest_setup_failure() -> Optional[str]:
+    """The last failed guest creation for this profile, worded with the wait still left, or None."""
+    from hermes_cli.anon_auth import anon_failure_copy, last_mint_failure
+
+    if not (failure := last_mint_failure()):
+        return None
+    return _SETUP_FAILED + anon_failure_copy(failure["error_code"], retry_after=failure["retry_after"])
+
+
+def ensure_guest_identity() -> Optional[str]:
+    """Create the guest identity on the first hosted connector action, synchronously.
+
+    Returns None when an identity exists or was just created, else the failure copy for the model:
+    a refusal, a rate limit or an unreachable portal, with the wait when there is one."""
+    from tools.connectors.identity import personal_connector_token
+    bound, token = personal_connector_token()
+    if bound:
+        return None if token else "Connect your personal account in the app's integrations settings."
+    if not guest_identity_pending():
+        return None
+    from hermes_cli.anon_auth import ensure_portal_identity
+    from hermes_cli.auth_constants import AuthError
+
+    try:
+        if ensure_portal_identity(explicit=True) is not None:
+            return None
+    except AuthError as exc:
+        return _SETUP_FAILED + str(exc)
+    return guest_setup_failure() or _SETUP_FAILED + "Try again shortly."
 
 
 def operation_session_key(session_id: Optional[str]) -> str:

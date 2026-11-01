@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +56,7 @@ class _UsageFileLock:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _today() -> str:
@@ -73,11 +75,11 @@ def _subject_key(ctx: DashboardGovernanceContext) -> str:
 
 def _load_state(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}
-    except Exception:
+    except (OSError, ValueError):
         return {}
 
 
@@ -159,7 +161,9 @@ def check_usage_caps(ctx: DashboardGovernanceContext | None, tool_name: str, arg
     from .context import policy_contexts
     try:
         cap_sets = [dict(bound.access.grants.usage_caps or {}) for bound in policy_contexts(ctx) if bound.access.mode == "enforce"]
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("check_usage_caps: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return AccessDecision(False, "continuation_policy_unavailable")
     if not any(cap_sets):
         return AccessDecision(True, "usage_caps_inactive")

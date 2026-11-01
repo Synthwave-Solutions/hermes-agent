@@ -1,4 +1,6 @@
 """Real initializer/context resolution with synthetic metadata HTTP only."""
+
+import agent.model_metadata_protocol as _model_metadata_protocol
 import json
 import time
 import threading
@@ -70,7 +72,7 @@ def build(monkeypatch, tmp_path):
     Path(tmp_path, "config.yaml").write_text(json.dumps(cfg))
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock())
     monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
-    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
+    monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
     return run_agent.AIAgent(model=MODEL, provider="custom", requested_provider="custom:fixture",
                             base_url=BASE, api_key="fixture-key", quiet_mode=True,
                             skip_context_files=True, skip_memory=True, skip_background_review=True)
@@ -173,10 +175,10 @@ def test_targeted_negative_cache_is_bounded_and_expires(monkeypatch, gateway):
     monkeypatch.setattr(metadata.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(metadata, "_LMSTUDIO_PROBE_MISS_MAX_SIZE", 2)
     for key in ("one", "two", "three"):
-        metadata._lmstudio_probe_miss_seen(key, record=True)
+        _model_metadata_protocol._lmstudio_probe_miss_seen(key, record=True)
     assert set(metadata._lmstudio_probe_misses) == {"two", "three"}
     clock[0] += metadata._ENDPOINT_PROBE_FAILURE_TTL_SECONDS + 1
-    assert not metadata._lmstudio_probe_miss_seen("three")
+    assert not _model_metadata_protocol._lmstudio_probe_miss_seen("three")
     assert not metadata._lmstudio_probe_misses
 
 

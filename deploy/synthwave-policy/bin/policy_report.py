@@ -23,10 +23,10 @@ for candidate in (HERE.parent / "synthwave-policy", HERE):
         sys.path.insert(0, str(candidate))
         break
 
-import policy_engine as pe  # noqa: E402
+import policy_engine as pe
 
 
-def default_files(all_profiles: bool) -> List[Path]:
+def default_files(all_profiles: bool) -> list[Path]:
     home_env = os.environ.get("HERMES_HOME", "").strip()
     home = Path(home_env).expanduser() if home_env else pe.root_home()
     files = [home / "policy" / "decisions.jsonl"]
@@ -39,8 +39,8 @@ def default_files(all_profiles: bool) -> List[Path]:
     return files
 
 
-def read_records(files: Iterable[Path]) -> List[Dict]:
-    records: List[Dict] = []
+def read_records(files: Iterable[Path]) -> list[dict]:
+    records: list[dict] = []
     for f in files:
         for part in (f.with_name(f.name + ".1"), f):
             if not part.exists():
@@ -60,7 +60,7 @@ def read_records(files: Iterable[Path]) -> List[Dict]:
     return records
 
 
-def short_args(rec: Dict) -> str:
+def short_args(rec: dict) -> str:
     a = rec.get("args") or {}
     for k in ("command", "path", "file_path", "target", "project_id", "to"):
         if a.get(k):
@@ -69,7 +69,7 @@ def short_args(rec: Dict) -> str:
     return ",".join(a.get("keys", [])[:6])
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Summarize synthwave-policy decisions.")
     ap.add_argument("files", nargs="*", help="decisions.jsonl files")
     ap.add_argument("--all", action="store_true", help="root plus every profile")

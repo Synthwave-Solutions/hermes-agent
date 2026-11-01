@@ -19,6 +19,8 @@ Raw SSE comments are outside this layer.
 
 from __future__ import annotations
 
+import agent.chat_completion_watchdogs as _chat_completion_watchdogs
+
 import sys
 import time
 import types
@@ -71,12 +73,12 @@ def _make_codex_agent(
     return agent
 
 
-def _shorten_implicit_idle_watchdog(monkeypatch, helpers, timeout=2.0, **overrides):
+def _shorten_implicit_idle_watchdog(monkeypatch, timeout=2.0, **overrides):
     """Keep the resolver on its implicit branch while scaling time for tests.
 
     ``timeout`` shortens ``idle_timeout``; ``overrides`` set any other resolved field."""
     monkeypatch.delenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", raising=False)
-    original = helpers._resolve_nonstream_watchdogs
+    original = _chat_completion_watchdogs._resolve_nonstream_watchdogs
 
     def resolve(agent, api_kwargs):
         watchdogs = original(agent, api_kwargs)
@@ -85,7 +87,7 @@ def _shorten_implicit_idle_watchdog(monkeypatch, helpers, timeout=2.0, **overrid
             setattr(watchdogs, field, value)
         return watchdogs
 
-    monkeypatch.setattr(helpers, "_resolve_nonstream_watchdogs", resolve)
+    monkeypatch.setattr(_chat_completion_watchdogs, "_resolve_nonstream_watchdogs", resolve)
 
 
 def _install_codex_event_stream(agent, monkeypatch, event_factory, closes):
@@ -118,8 +120,8 @@ def test_local_endpoint_ttfb_default_uses_local_stale_ceiling(tmp_path, monkeypa
     hosted = _make_codex_agent(tmp_path, monkeypatch, provider="custom", base_url="https://api.example.com/v1")
     kwargs = {"model": "qwen3-27b", "input": "hi"}
 
-    assert h._resolve_nonstream_watchdogs(local, kwargs).ttfb_timeout == 600.0
-    assert h._resolve_nonstream_watchdogs(hosted, kwargs).ttfb_timeout == 120.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(local, kwargs).ttfb_timeout == 600.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(hosted, kwargs).ttfb_timeout == 120.0
 
 
 def test_local_endpoint_ttfb_explicit_env_still_wins(tmp_path, monkeypatch):
@@ -130,7 +132,7 @@ def test_local_endpoint_ttfb_explicit_env_still_wins(tmp_path, monkeypatch):
     local = _make_codex_agent(tmp_path, monkeypatch, provider="custom", base_url="http://127.0.0.1:11434/v1")
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "45")
 
-    assert h._resolve_nonstream_watchdogs(local, {"model": "qwen3-27b", "input": "hi"}).ttfb_timeout == 45.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(local, {"model": "qwen3-27b", "input": "hi"}).ttfb_timeout == 45.0
 
 
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
@@ -318,7 +320,7 @@ def test_idle_phase_policy_is_narrow_and_preserves_operator_overrides(
     else:
         monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_env)
 
-    watchdogs = h._resolve_nonstream_watchdogs(
+    watchdogs = _chat_completion_watchdogs._resolve_nonstream_watchdogs(
         agent, {"model": "gpt-5.6-sol", "input": "x" * input_chars}
     )
 
@@ -347,7 +349,7 @@ def test_large_codex_lifecycle_only_stream_hits_attempt_progress_budget(tmp_path
     from agent import chat_completion_helpers as h
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
-    _shorten_implicit_idle_watchdog(monkeypatch, h, ttfb_timeout=0.9, progress_timeout=0.9)
+    _shorten_implicit_idle_watchdog(monkeypatch, ttfb_timeout=0.9, progress_timeout=0.9)
     closes = []
 
     def stream_attempt():
@@ -376,7 +378,7 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
     from agent import chat_completion_helpers as h
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
-    _shorten_implicit_idle_watchdog(monkeypatch, h)
+    _shorten_implicit_idle_watchdog(monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "2")
     monkeypatch.setenv("HERMES_CODEX_TTFB_STRICT", "1")
     monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "5")
@@ -659,7 +661,7 @@ def test_large_request_keeps_scaled_ttfb_instead_of_recapping(tmp_path, monkeypa
     agent.reasoning_config = {"enabled": False}  # no effort floor: isolate the cap interaction
 
     huge_input = "x" * 440_000  # ~110k estimated tokens → largest idle bucket
-    wd = h._resolve_nonstream_watchdogs(agent, {"model": "gpt-5.5", "input": huge_input})
+    wd = _chat_completion_watchdogs._resolve_nonstream_watchdogs(agent, {"model": "gpt-5.5", "input": huge_input})
 
     assert wd.est_tokens > 100_000, f"fixture too small: ~{wd.est_tokens} tokens"
     assert wd.ttfb_enabled
@@ -676,6 +678,6 @@ def test_explicit_ttfb_max_seconds_still_caps(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_CODEX_TTFB_MAX_SECONDS", "90")
 
     huge_input = "x" * 440_000
-    wd = h._resolve_nonstream_watchdogs(agent, {"model": "gpt-5.5", "input": huge_input})
+    wd = _chat_completion_watchdogs._resolve_nonstream_watchdogs(agent, {"model": "gpt-5.5", "input": huge_input})
 
     assert wd.ttfb_timeout == 90.0, f"explicit cap ignored: {wd.ttfb_timeout}"

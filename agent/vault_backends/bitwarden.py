@@ -35,8 +35,10 @@ class BitwardenLoginBackend(LoginBackend):
     prefix = "bw:"
     needs_unlock = True
 
-    def __init__(self, cfg: Optional[Dict] = None):
-        self.cfg = cfg or {}
+    def __init__(self, cfg: Optional[dict] = None):
+        self.cfg = dict(cfg or {})
+        from agent.vault_scope import personal_source_snapshot
+        self._personal_source = personal_source_snapshot(self.cfg)
 
     def _bw(self) -> Path:
         explicit = str(self.cfg.get("binary_path") or "")
@@ -45,23 +47,37 @@ class BitwardenLoginBackend(LoginBackend):
             raise RuntimeError("Bitwarden CLI (bw) not found — install it or set vault.bitwarden.binary_path")
         return Path(found)
 
-    def _env(self, session_token: Optional[str]) -> Dict[str, str]:
-        env = {k: os.environ[k] for k in _ENV_KEEP if k in os.environ}
+    def _env(self, session_token: Optional[str]) -> dict[str, str]:
+        from agent.vault_scope import manager_environment
+        env = manager_environment()
+        if env is None:
+            env = {k: os.environ[k] for k in _ENV_KEEP if k in os.environ}
         env["NO_COLOR"] = "1"
         if session_token:
             env["BW_SESSION"] = session_token
         return env
 
     def is_unlocked(self) -> bool:
+        try:
+            self._check_personal_source()
+        except PermissionError:
+            return False
         return _unlock.is_unlocked(self.name)
+
+    def _check_personal_source(self) -> None:
+        from agent.vault_scope import require_personal_source
+        require_personal_source(self.name, self._personal_source)
 
     def unlock(self, master_password: str) -> None:
         # bw refuses a piped password ("Master password is required"); its non-interactive contract is
         # --passwordenv: the variable exists only in the child's environment, never in argv or ours.
         generation = _unlock.begin_unlock(self.name)
-        proc = run_with_secret_env([str(self._bw()), "unlock", "--raw", "--nointeraction", "--passwordenv", "HERMES_BW_MASTER"],
-                                   env=self._env(None), secret_env="HERMES_BW_MASTER", secret=master_password,
+        argv = [str(self._bw()), "unlock", "--raw", "--nointeraction", "--passwordenv", "HERMES_BW_MASTER"]
+        env = self._env(None)
+        self._check_personal_source()
+        proc = run_with_secret_env(argv, env=env, secret_env="HERMES_BW_MASTER", secret=master_password,
                                    timeout=_TIMEOUT, label="bw")
+        self._check_personal_source()
         token = (proc.stdout or "").strip()
         if proc.returncode != 0 or not token:
             err = scrub_ansi(proc.stderr or "").strip()[:200]
@@ -72,11 +88,20 @@ class BitwardenLoginBackend(LoginBackend):
             raise RuntimeError("Bitwarden was locked while unlocking; try again")
 
     def _run(self, *args: str) -> str:
+        self._check_personal_source()
+        generation = _unlock.begin_unlock(self.name)
         token = _unlock.get_session_token(self.name)
         if not token:
             raise UnlockRequired(self)
-        proc = run_cli([str(self._bw()), *args, "--nointeraction"], env=self._env(token), timeout=_TIMEOUT,
+        argv, env = [str(self._bw()), *args, "--nointeraction"], self._env(token)
+        self._check_personal_source()
+        if generation != _unlock.begin_unlock(self.name):
+            raise UnlockRequired(self)
+        proc = run_cli(argv, env=env, timeout=_TIMEOUT,
                        label="bw", timeout_message="bw timed out", stdin=subprocess.DEVNULL)
+        self._check_personal_source()
+        if generation != _unlock.begin_unlock(self.name):
+            raise UnlockRequired(self)
         if proc.returncode != 0:
             err = scrub_ansi(proc.stderr or "")
             if "locked" in err.lower() or "session" in err.lower():
@@ -85,16 +110,16 @@ class BitwardenLoginBackend(LoginBackend):
             raise RuntimeError(f"bw failed: {err[:200]}")
         return proc.stdout or ""
 
-    def list_items(self) -> List[VaultItemMeta]:
+    def list_items(self) -> list[VaultItemMeta]:
         if not self.is_unlocked():
             return []
         raw = json.loads(self._run("list", "items") or "[]")
-        out: List[VaultItemMeta] = []
+        out: list[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
             if item.get("type") != 1 or not isinstance(item.get("login"), dict):
                 continue
             login = item["login"]
-            origins: List[str] = []
+            origins: list[str] = []
             for uri in login.get("uris") or []:
                 if uri.get("match") == 5:  # Bitwarden URI match "Never": not a fill target
                     continue

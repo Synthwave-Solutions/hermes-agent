@@ -503,7 +503,7 @@ rules:
     tags: [destructive]
     tool: terminal
     rm_recursive_outside:
-      - /tmp/*
+      - /tmp/*  # no-tmp: ok - policy matches user commands; it does not allocate scratch files.
       - /var/tmp/*
       - "*/scratchpad/*"
       - "$TMPDIR/*"

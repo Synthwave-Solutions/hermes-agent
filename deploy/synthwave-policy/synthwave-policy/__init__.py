@@ -41,23 +41,23 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "synthwave-policy"
 _CACHE = pe.PolicyCache()
-_ERROR_LOGGED: Dict[str, Any] = {}
+_ERROR_LOGGED: dict[str, Any] = {}
 
 
 def _decision_log_path(home: Path) -> Path:
     return home / "policy" / "decisions.jsonl"
 
 
-def _safe_log(home: Path, record: Dict[str, Any], policy: Optional[pe.Policy] = None) -> None:
+def _safe_log(home: Path, record: dict[str, Any], policy: Optional[pe.Policy] = None) -> None:
     try:
         max_bytes = policy.max_bytes if policy else pe.DEFAULT_MAX_BYTES
         keep = policy.keep if policy else pe.DEFAULT_KEEP
         pe.append_jsonl(_decision_log_path(home), record, max_bytes=max_bytes, keep=keep)
-    except Exception as exc:  # logging must never break a tool call
+    except (OSError, TypeError, ValueError) as exc:  # logging must never break a tool call
         logger.debug("synthwave-policy: decision log write failed: %s", exc)
 
 
-def _base_record(home: Path, profile: str, tool_name: str, args: Any, kw: Dict[str, Any]) -> Dict[str, Any]:
+def _base_record(home: Path, profile: str, tool_name: str, args: Any, kw: dict[str, Any]) -> dict[str, Any]:
     return {
         "ts": pe.now_iso(),
         "profile": profile,
@@ -91,16 +91,16 @@ def _fail_closed_message(reason: str) -> str:
 # --- browser page tracking (send-surface rules) ----------------------------------------------------
 
 _PAGE_LOCK = threading.Lock()
-_PAGE_URLS: "OrderedDict[str, str]" = OrderedDict()
+_PAGE_URLS: OrderedDict[str, str] = OrderedDict()
 _PAGE_MAX = 256
 _SCREEN_TOOLS = ("browser_", "computer_use")
 
 
-def _page_key(kw: Dict[str, Any]) -> str:
+def _page_key(kw: dict[str, Any]) -> str:
     return str(kw.get("task_id") or kw.get("session_id") or "")
 
 
-def _remember_page(kw: Dict[str, Any], url: Any) -> None:
+def _remember_page(kw: dict[str, Any], url: Any) -> None:
     key = _page_key(kw)
     if not key or not isinstance(url, str) or not url:
         return
@@ -111,7 +111,7 @@ def _remember_page(kw: Dict[str, Any], url: Any) -> None:
             _PAGE_URLS.popitem(last=False)
 
 
-def _current_page(kw: Dict[str, Any]) -> str:
+def _current_page(kw: dict[str, Any]) -> str:
     key = _page_key(kw)
     with _PAGE_LOCK:
         return _PAGE_URLS.get(key, "") if key else ""
@@ -125,17 +125,17 @@ def _lease_held_by_human(home: Path) -> bool:
         if not path.exists():
             return False
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
         return True
     return not isinstance(data, dict) or data.get("holder") != "agent"
 
 
 # --- Scout job detection ----------------------------------------------------------------------------
 
-_JOBS_CACHE: Dict[str, Tuple[Tuple[float, int], Dict[str, Dict[str, Any]]]] = {}
+_JOBS_CACHE: dict[str, tuple[tuple[float, int], dict[str, dict[str, Any]]]] = {}
 
 
-def _cron_job_id(kw: Dict[str, Any]) -> str:
+def _cron_job_id(kw: dict[str, Any]) -> str:
     task = str(kw.get("task_id") or "")
     if task.startswith("cron:"):
         return task.split(":")[1] if task.count(":") >= 1 else ""
@@ -146,7 +146,7 @@ def _cron_job_id(kw: Dict[str, Any]) -> str:
     return ""
 
 
-def _jobs_by_id(home: Path) -> Dict[str, Dict[str, Any]]:
+def _jobs_by_id(home: Path) -> dict[str, dict[str, Any]]:
     path = home / "cron" / "jobs.json"
     try:
         st = path.stat()
@@ -160,16 +160,16 @@ def _jobs_by_id(home: Path) -> Dict[str, Dict[str, Any]]:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         jobs = data.get("jobs", []) if isinstance(data, dict) else data
         table = {str(j.get("id")): j for j in jobs if isinstance(j, dict) and j.get("id")}
-    except Exception:
+    except (OSError, ValueError, TypeError):
         table = {}
     _JOBS_CACHE[str(path)] = (key, table)
     return table
 
 
-def is_scout_run(home: Path, kw: Dict[str, Any]) -> bool:
+def is_scout_run(home: Path, kw: dict[str, Any]) -> bool:
     """True for a Scout cron run: the scheduler's HERMES_CRON_MANAGED_BY says scout, or the cron job
     behind this task is marked managed_by scout or runs the Scout collector script."""
-    if os.environ.get("HERMES_CRON_MANAGED_BY", "").strip().lower() == "scout":
+    if os.environ.get("HERMES_CRON_MANAGED_BY", "").strip().lower() == "scout":  # health: allow HX002 -- server-owned cron execution metadata from script_environment(), not a configurable policy setting
         return True
     job_id = _cron_job_id(kw)
     if not job_id:
@@ -183,8 +183,8 @@ def is_scout_run(home: Path, kw: Dict[str, Any]) -> bool:
 
 # --- the hook ---------------------------------------------------------------------------------------
 
-def _log_errors_once(home: Path, profile: str, tool_name: str, args: Any, kw: Dict[str, Any],
-                     eff: "pe.Effective") -> None:
+def _log_errors_once(home: Path, profile: str, tool_name: str, args: Any, kw: dict[str, Any],
+                     eff: pe.Effective) -> None:
     key = "|".join(f"{p}:{e}" for p, e in eff.errors) + f"|{eff.fail_closed or ''}"
     if _ERROR_LOGGED.get(str(home)) == key:
         return
@@ -199,7 +199,7 @@ def _log_errors_once(home: Path, profile: str, tool_name: str, args: Any, kw: Di
 
 
 def check(tool_name: str, args: Any, home: Optional[Path] = None, profile: Optional[str] = None,
-          **kw: Any) -> Optional[Dict[str, Any]]:
+          **kw: Any) -> Optional[dict[str, Any]]:
     """Core hook logic, separated from the engine signature for tests."""
     home = home or pe.current_home()
     profile = profile or pe.profile_for_home(home)
@@ -216,7 +216,7 @@ def check(tool_name: str, args: Any, home: Optional[Path] = None, profile: Optio
     if sources:
         try:
             pe.write_enforced_marker(home, profile, sources)
-        except Exception as exc:
+        except OSError as exc:
             logger.debug("synthwave-policy: cannot write enforce marker: %s", exc)
 
     name = str(tool_name or "")
@@ -257,11 +257,11 @@ def check(tool_name: str, args: Any, home: Optional[Path] = None, profile: Optio
             "rule_key": pe.approval_rule_key(decision.rule_id or "rule", tool_name, args)}
 
 
-def _hook_ids(kw: Dict[str, Any]) -> Dict[str, Any]:
+def _hook_ids(kw: dict[str, Any]) -> dict[str, Any]:
     return {k: kw.get(k) for k in ("session_id", "task_id", "tool_call_id")}
 
 
-def _on_pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any) -> Optional[Dict[str, Any]]:
+def _on_pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any) -> Optional[dict[str, Any]]:
     try:
         return check(tool_name, args, **_hook_ids(kw))
     except Exception as exc:  # never let an internal bug decide silently
@@ -276,7 +276,9 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **kw: Any) -> Optio
                 if path is not None and (pe.raw_mode_hint(path) == "enforce"
                                          or _CACHE.last_good_mode_for(path, profile) == "enforce"):
                     mode = "enforce"
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_on_pre_tool_call: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             mode = "enforce" if _CACHE.last_good else "observe"
         if mode == "enforce":
             return {"action": "block",
@@ -293,7 +295,7 @@ def _on_post_tool_call(tool_name: str = "", args: Any = None, result: Any = None
         data = json.loads(result) if isinstance(result, str) else result
         if isinstance(data, dict) and isinstance(data.get("url"), str):
             _remember_page(_hook_ids(kw), data["url"])
-    except Exception:
+    except (TypeError, ValueError):
         return
 
 

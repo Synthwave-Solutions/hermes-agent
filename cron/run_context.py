@@ -37,7 +37,7 @@ def governed_trigger_actor():
     if ctx is not None:
         return str(getattr(getattr(getattr(ctx, "access", None), "subject", None), "email", "") or "")
     import os
-    return os.environ.get("HERMES_DWD_IDENTITY", "")
+    return os.environ.get("HERMES_DWD_IDENTITY", "")  # health: allow HX002 -- inherited caller identity ABI from the governed shell, not a behavioral setting; never accepted from tool arguments
 
 
 def script_environment(job):

@@ -30,7 +30,7 @@ STREAM_DIAG_HEADERS = (
 )
 
 
-def stream_diag_init() -> Dict[str, Any]:
+def stream_diag_init() -> dict[str, Any]:
     """Fresh per-attempt diagnostic dict; mutated in place by the streaming functions and read by the retry block."""
     return {
         "started_at": time.time(), "first_chunk_at": None, "chunks": 0, "bytes": 0,
@@ -56,8 +56,9 @@ def stream_diag_start_timing(agent: Any, diag: dict) -> None:
             "_timing_request": identity(getattr(agent, "_current_api_request_id", None)),
             "_timing_call_count": getattr(agent, "_api_call_count", None),
         })
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("stream_diag_start_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
 def stream_diag_mark_timing(diag: dict, mark: str) -> None:
@@ -70,8 +71,9 @@ def stream_diag_mark_timing(diag: dict, mark: str) -> None:
         diag["_timing_offsets"].setdefault(
             mark, max(0.0, (_timing_clock() - diag["_timing_started"]) * 1000)
         )
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("stream_diag_mark_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
 def log_stream_attempt_timing(diag: dict, *, attempt: int, outcome: str) -> None:
@@ -107,11 +109,12 @@ def log_stream_attempt_timing(diag: dict, *, attempt: int, outcome: str) -> None
         }
         diag["_timing_logged"] = True
         logger.info("stream_attempt_timing %s", json.dumps(row, separators=(",", ":")))
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("log_stream_attempt_timing: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
 
-def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response: Any) -> None:
+def stream_diag_capture_response(agent: Any, diag: dict[str, Any], http_response: Any) -> None:
     """Snapshot headers + HTTP status at stream open (so they survive a drop before the first chunk). Best-effort."""
     if http_response is None or not isinstance(diag, dict):
         return
@@ -121,7 +124,7 @@ def stream_diag_capture_response(agent: Any, diag: Dict[str, Any], http_response
         pass
     try:
         headers = getattr(http_response, "headers", None) or {}
-        captured: Dict[str, str] = {}
+        captured: dict[str, str] = {}
         for name in STREAM_DIAG_HEADERS:
             try:
                 if val := headers.get(name):
@@ -137,7 +140,7 @@ def flatten_exception_chain(error: BaseException) -> str:
     """Compact ``Outer(msg) <- Inner(msg) <- ...`` rendering, walking ``__cause__`` then ``__context__``
     (deduped, max 4 deep): the OpenAI SDK wraps httpx errors so only the wrapper class is visible at
     the catch site; the inner RemoteProtocolError/ConnectError/ReadError says WHY the stream died."""
-    seen: List[BaseException] = []
+    seen: list[BaseException] = []
     link: Optional[BaseException] = error
     while link is not None and len(seen) < 4 and link not in seen:
         seen.append(link)
@@ -154,7 +157,7 @@ def flatten_exception_chain(error: BaseException) -> str:
     return " <- ".join(render(e) for e in seen) if seen else type(error).__name__
 
 
-def _diag_fields(diag: Optional[Dict[str, Any]]) -> tuple:
+def _diag_fields(diag: Optional[dict[str, Any]]) -> tuple:
     """(http_status, bytes, chunks, elapsed, ttfb, serving_provider, finish_reason_seen, upstream)
     for the retry log line; ``-`` when unknown."""
     _bytes = _chunks = 0
@@ -186,7 +189,7 @@ def _diag_fields(diag: Optional[Dict[str, Any]]) -> tuple:
 
 def log_stream_retry(
     agent: Any, *, kind: str, error: BaseException, attempt: int, max_attempts: int,
-    mid_tool_call: bool, diag: Optional[Dict[str, Any]] = None,
+    mid_tool_call: bool, diag: Optional[dict[str, Any]] = None,
 ) -> None:
     """Structured WARNING to ``agent.log`` for a transient stream drop + retry, always logged regardless of
     UI verbosity. With *diag*, also records upstream headers, HTTP status, bytes/chunks, elapsed and TTFB on
@@ -223,7 +226,7 @@ def log_stream_retry(
 
 def emit_stream_drop(
     agent: Any, *, error: BaseException, attempt: int, max_attempts: int,
-    mid_tool_call: bool, diag: Optional[Dict[str, Any]] = None,
+    mid_tool_call: bool, diag: Optional[dict[str, Any]] = None,
 ) -> None:
     """One compact user-visible status line for a stream drop+retry, plus the full WARNING via log_stream_retry.
     ``after Xs`` distinguishes "couldn't connect" (0s) from "died mid-stream" (idle-kill / proxy timeout)."""
@@ -308,11 +311,11 @@ def buffer_connect_exhausted_notice(agent: Any, error: BaseException, *, attempt
 
 __all__ = [
     "STREAM_DIAG_HEADERS",
-    "connect_exhausted_notice",
     "buffer_connect_exhausted_notice",
-    "stream_diag_init",
-    "stream_diag_capture_response",
+    "connect_exhausted_notice",
+    "emit_stream_drop",
     "flatten_exception_chain",
     "log_stream_retry",
-    "emit_stream_drop",
+    "stream_diag_capture_response",
+    "stream_diag_init",
 ]

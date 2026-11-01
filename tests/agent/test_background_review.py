@@ -18,8 +18,8 @@ class _TurnBoundaryReached(Exception):
 class CapturingThread:
     targets = []
 
-    def __init__(self, *, target, daemon=None, name=None):
-        self.targets.append(target)
+    def __init__(self, *, target, daemon=None, name=None, args=(), kwargs=None):
+        self.targets.append(lambda: target(*args, **(kwargs or {})))
 
     def start(self):
         pass
@@ -92,8 +92,8 @@ def _bare_agent() -> AIAgent:
 
 
 class ImmediateThread:
-    def __init__(self, *, target, daemon=None, name=None):
-        self._target = target
+    def __init__(self, *, target, daemon=None, name=None, args=(), kwargs=None):
+        self._target = lambda: target(*args, **(kwargs or {}))
 
     def start(self):
         self._target()

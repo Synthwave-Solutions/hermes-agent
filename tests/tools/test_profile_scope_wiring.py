@@ -39,11 +39,10 @@ from tools.file_tools import (
 # path checks with private homes; never inspect the workstation's scope map.
 PROFILE_SCOPE_PATH = str(Path(__file__).parents[1] / "fixtures" / "profile_scope_runtime.py")
 SCOPED_NAME = "release-scope-test"
-NO_SCOPED_PROFILE = False
 
 
 @pytest.fixture(autouse=True)
-def _reset_bridge_cache(monkeypatch):
+def scope_paths(monkeypatch):
     import pwd
     import tempfile
     # This layer intentionally permits /tmp and /var/tmp. Put the private home
@@ -75,8 +74,6 @@ def _reset_bridge_cache(monkeypatch):
             "MUX_ROOT": str(mux), "MUX_HOME": str(mux / "home"),
             "MUX_SCOPED_HOME": str(mux / "profiles" / SCOPED_NAME),
         }
-        for key, value in values.items():
-            monkeypatch.setitem(globals(), key, value)
         account = list(pwd.getpwuid(os.getuid()))
         account[5] = str(home)
         monkeypatch.setattr(pwd, "getpwuid", lambda uid: pwd.struct_passwd(account))
@@ -84,16 +81,13 @@ def _reset_bridge_cache(monkeypatch):
         monkeypatch.setenv("HERMES_PROFILE_SCOPES_FILE", str(config))
         monkeypatch.setenv("HOME", str(home))
         bridge._reset_for_tests()
-        yield
+        yield SimpleNamespace(**values)
         bridge._reset_for_tests()
 
 
 @pytest.fixture
-def scoped_home(monkeypatch):
-    if NO_SCOPED_PROFILE:
-        pytest.fail("the live scope map has no armed profile with a marker "
-                    "and without a ~/clients grant to test the guard against")
-    monkeypatch.setenv("HERMES_HOME", SCOPED_HOME)
+def scoped_home(scope_paths, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", scope_paths.SCOPED_HOME)
 
 
 @pytest.fixture
@@ -105,26 +99,26 @@ def broken_module(monkeypatch):
 # ── Fail-open: default + non-scoped profiles stay byte-identical ────────────
 
 class TestFailOpen:
-    def test_default_home_command_guard_none_even_for_secrets(self, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", DEFAULT_HOME)
-        assert _check_profile_scope_guard(f"cat {SECRET_PATH}") is None
+    def test_default_home_command_guard_none_even_for_secrets(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.DEFAULT_HOME)
+        assert _check_profile_scope_guard(f"cat {scope_paths.SECRET_PATH}") is None
 
-    def test_default_home_path_guard_none_even_for_secrets(self, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", DEFAULT_HOME)
-        assert _check_profile_scope_path(SECRET_PATH, "read") is None
+    def test_default_home_path_guard_none_even_for_secrets(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.DEFAULT_HOME)
+        assert _check_profile_scope_path(scope_paths.SECRET_PATH, "read") is None
 
-    def test_unset_home_guards_none(self, monkeypatch):
+    def test_unset_home_guards_none(self, scope_paths, monkeypatch):
         monkeypatch.delenv("HERMES_HOME", raising=False)
-        assert _check_profile_scope_guard(f"cat {SECRET_PATH}") is None
-        assert _check_profile_scope_path(SECRET_PATH, "read") is None
+        assert _check_profile_scope_guard(f"cat {scope_paths.SECRET_PATH}") is None
+        assert _check_profile_scope_path(scope_paths.SECRET_PATH, "read") is None
 
-    def test_non_scoped_profile_guards_none(self, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", NON_SCOPED_HOME)
-        assert _check_profile_scope_guard(f"cat {OUT_OF_SCOPE}") is None
-        assert _check_profile_scope_path(OUT_OF_SCOPE, "write") is None
+    def test_non_scoped_profile_guards_none(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.NON_SCOPED_HOME)
+        assert _check_profile_scope_guard(f"cat {scope_paths.OUT_OF_SCOPE}") is None
+        assert _check_profile_scope_path(scope_paths.OUT_OF_SCOPE, "write") is None
 
-    def test_non_scoped_execute_code_not_scope_blocked(self, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", NON_SCOPED_HOME)
+    def test_non_scoped_execute_code_not_scope_blocked(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.NON_SCOPED_HOME)
         result = check_execute_code_guard("print('hi')", "local")
         assert "profile scope" not in (result.get("message") or "")
 
@@ -132,34 +126,34 @@ class TestFailOpen:
 # ── Scoped profile: blocked outside scope ───────────────────────────────────
 
 class TestScopedBlocked:
-    def test_command_guard_blocks_out_of_scope(self, scoped_home):
-        result = _check_profile_scope_guard(f"cat {OUT_OF_SCOPE}")
+    def test_command_guard_blocks_out_of_scope(self, scope_paths, scoped_home):
+        result = _check_profile_scope_guard(f"cat {scope_paths.OUT_OF_SCOPE}")
         assert result is not None
         assert result["approved"] is False
         assert "profile scope" in result["message"]
 
-    def test_read_file_blocked(self, scoped_home):
-        out = json.loads(read_file_tool(OUT_OF_SCOPE))
+    def test_read_file_blocked(self, scope_paths, scoped_home):
+        out = json.loads(read_file_tool(scope_paths.OUT_OF_SCOPE))
         assert "Blocked by profile scope" in out["error"]
 
-    def test_write_file_blocked(self, scoped_home):
-        out = json.loads(write_file_tool(OUT_OF_SCOPE, "nope"))
+    def test_write_file_blocked(self, scope_paths, scoped_home):
+        out = json.loads(write_file_tool(scope_paths.OUT_OF_SCOPE, "nope"))
         assert "Blocked by profile scope" in out["error"]
 
-    def test_patch_replace_blocked(self, scoped_home):
-        out = json.loads(patch_tool(mode="replace", path=OUT_OF_SCOPE,
+    def test_patch_replace_blocked(self, scope_paths, scoped_home):
+        out = json.loads(patch_tool(mode="replace", path=scope_paths.OUT_OF_SCOPE,
                                     old_string="a", new_string="b"))
         assert "Blocked by profile scope" in out["error"]
 
-    def test_search_tool_blocked_out_of_scope_root(self, scoped_home):
+    def test_search_tool_blocked_out_of_scope_root(self, scope_paths, scoped_home):
         out = json.loads(search_tool(pattern="x",
-                                     path=os.path.dirname(OUT_OF_SCOPE)))
+                                     path=os.path.dirname(scope_paths.OUT_OF_SCOPE)))
         assert "Blocked by profile scope" in out["error"]
 
-    def test_search_result_filter_drops_out_of_scope_matches(self, scoped_home):
+    def test_search_result_filter_drops_out_of_scope_matches(self, scope_paths, scoped_home):
         result = SimpleNamespace(matches=[
             SimpleNamespace(path="/tmp/in-scope.txt"),
-            SimpleNamespace(path=OUT_OF_SCOPE),
+            SimpleNamespace(path=scope_paths.OUT_OF_SCOPE),
         ])
         omitted = _filter_profile_scope_search_results(result)
         assert omitted == 1
@@ -176,8 +170,8 @@ class TestScopedBlocked:
         result = check_execute_code_guard("print('hi')", "modal")
         assert result["approved"] is False
 
-    def test_scope_fires_before_container_skip(self, scoped_home):
-        result = check_all_command_guards(f"cat {OUT_OF_SCOPE}", "modal")
+    def test_scope_fires_before_container_skip(self, scope_paths, scoped_home):
+        result = check_all_command_guards(f"cat {scope_paths.OUT_OF_SCOPE}", "modal")
         assert result["approved"] is False
         assert "profile scope" in result["message"]
 
@@ -185,8 +179,8 @@ class TestScopedBlocked:
 # ── Scoped profile: allowed inside assigned roots ───────────────────────────
 
 class TestScopedAllowed:
-    def test_command_guard_allows_project_root(self, scoped_home):
-        assert _check_profile_scope_guard(f"ls {IN_SCOPE_DIR}") is None
+    def test_command_guard_allows_project_root(self, scope_paths, scoped_home):
+        assert _check_profile_scope_guard(f"ls {scope_paths.IN_SCOPE_DIR}") is None
 
     def test_path_guard_allows_tmp_scratch(self, scoped_home, tmp_path):
         target = str(tmp_path / "scratch.txt")
@@ -194,8 +188,8 @@ class TestScopedAllowed:
             pytest.skip("tmp_path not under a scoped scratch root")
         assert _check_profile_scope_path(target, "write") is None
 
-    def test_path_guard_allows_own_profile_home(self, scoped_home):
-        target = os.path.join(SCOPED_HOME, "workspace", "notes.md")
+    def test_path_guard_allows_own_profile_home(self, scope_paths, scoped_home):
+        target = os.path.join(scope_paths.SCOPED_HOME, "workspace", "notes.md")
         assert _check_profile_scope_path(target, "write") is None
 
 
@@ -210,24 +204,24 @@ class TestFailClosedOnLoadFailure:
         assert "fail-closed" in _check_profile_scope_path("/tmp/x", "read")
         assert check_execute_code_guard("print(1)", "local")["approved"] is False
 
-    def test_default_home_fails_open(self, monkeypatch, broken_module):
-        monkeypatch.setenv("HERMES_HOME", DEFAULT_HOME)
+    def test_default_home_fails_open(self, scope_paths, monkeypatch, broken_module):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.DEFAULT_HOME)
         assert _check_profile_scope_guard("echo hi") is None
         assert _check_profile_scope_path("/tmp/x", "read") is None
 
-    def test_sibling_name_fails_open_without_marker(self, monkeypatch,
+    def test_sibling_name_fails_open_without_marker(self, scope_paths, monkeypatch,
                                                     broken_module):
         # Segment equality: a longer name must not substring-match the scoped
         # one, and without its own marker file it stays fail-open.
         assert not os.path.exists(
-            os.path.join(SIBLING_HOME, bridge.SCOPED_PROFILE_MARKER))
-        monkeypatch.setenv("HERMES_HOME", SIBLING_HOME)
+            os.path.join(scope_paths.SIBLING_HOME, bridge.SCOPED_PROFILE_MARKER))
+        monkeypatch.setenv("HERMES_HOME", scope_paths.SIBLING_HOME)
         monkeypatch.delenv("HERMES_PROFILE_SCOPED", raising=False)
         assert bridge.is_scoped_home() is False
         assert _check_profile_scope_guard("echo hi") is None
 
-    def test_sibling_env_override_fails_closed(self, monkeypatch, broken_module):
-        monkeypatch.setenv("HERMES_HOME", SIBLING_HOME)
+    def test_sibling_env_override_fails_closed(self, scope_paths, monkeypatch, broken_module):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.SIBLING_HOME)
         monkeypatch.setenv("HERMES_PROFILE_SCOPED", "1")
         assert bridge.is_scoped_home() is True
         result = _check_profile_scope_guard("echo hi")
@@ -238,18 +232,18 @@ class TestFailClosedOnLoadFailure:
         # fail-closed even when the module cannot load.
         assert bridge.is_scoped_home() is True
 
-    def test_sibling_not_scoped_when_module_loaded(self, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", SIBLING_HOME)
+    def test_sibling_not_scoped_when_module_loaded(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.SIBLING_HOME)
         assert bridge.is_scoped_home() is False
 
 
 # ── Yolo ordering: scope fires before the yolo bypass ───────────────────────
 
 class TestYoloOrdering:
-    def test_yolo_cannot_bypass_scope(self, scoped_home, monkeypatch):
+    def test_yolo_cannot_bypass_scope(self, scope_paths, scoped_home, monkeypatch):
         monkeypatch.setattr(approval_module,
                             "is_current_session_yolo_enabled", lambda: True)
-        result = check_all_command_guards(f"cat {OUT_OF_SCOPE}", "local")
+        result = check_all_command_guards(f"cat {scope_paths.OUT_OF_SCOPE}", "local")
         assert result["approved"] is False
         assert "profile scope" in result["message"]
 
@@ -263,19 +257,19 @@ class TestYoloOrdering:
 # ── Patch Move File endpoints ───────────────────────────────────────────────
 
 class TestPatchMoveFile:
-    def test_move_blocked_on_out_of_scope_source(self, scoped_home):
+    def test_move_blocked_on_out_of_scope_source(self, scope_paths, scoped_home):
         patch = (
             "*** Begin Patch\n"
-            f"*** Move File: {OUT_OF_SCOPE} -> /tmp/moved.txt\n"
+            f"*** Move File: {scope_paths.OUT_OF_SCOPE} -> /tmp/moved.txt\n"
             "*** End Patch"
         )
         out = json.loads(patch_tool(mode="patch", patch=patch))
         assert "Blocked by profile scope" in out["error"]
 
-    def test_move_blocked_on_out_of_scope_destination(self, scoped_home):
+    def test_move_blocked_on_out_of_scope_destination(self, scope_paths, scoped_home):
         patch = (
             "*** Begin Patch\n"
-            f"*** Move File: /tmp/src.txt -> {OUT_OF_SCOPE}\n"
+            f"*** Move File: /tmp/src.txt -> {scope_paths.OUT_OF_SCOPE}\n"
             "*** End Patch"
         )
         out = json.loads(patch_tool(mode="patch", patch=patch))
@@ -285,8 +279,8 @@ class TestPatchMoveFile:
 # ── Deny roots + prefix confusion ───────────────────────────────────────────
 
 class TestDenyAndPrefixConfusion:
-    def test_secrets_path_denied(self, scoped_home):
-        err = _check_profile_scope_path(SECRET_PATH, "read")
+    def test_secrets_path_denied(self, scope_paths, scoped_home):
+        err = _check_profile_scope_path(scope_paths.SECRET_PATH, "read")
         assert err is not None and "Blocked by profile scope" in err
 
     def test_secrets_command_denied(self, scoped_home):
@@ -297,11 +291,11 @@ class TestDenyAndPrefixConfusion:
         result = _check_profile_scope_guard("cat ~/.hermes/google_token.json")
         assert result is not None and result["approved"] is False
 
-    def test_prefix_confusion_sibling_denied(self, scoped_home):
+    def test_prefix_confusion_sibling_denied(self, scope_paths, scoped_home):
         # The granted root is in scope; "<root>-evil" must NOT prefix-match it.
         assert _check_profile_scope_path(
-            os.path.join(IN_SCOPE_DIR, "x.txt"), "read") is None
-        err = _check_profile_scope_path(EVIL_SIBLING, "read")
+            os.path.join(scope_paths.IN_SCOPE_DIR, "x.txt"), "read") is None
+        err = _check_profile_scope_path(scope_paths.EVIL_SIBLING, "read")
         assert err is not None and "Blocked by profile scope" in err
 
 
@@ -312,25 +306,25 @@ class TestTokenResolution:
         result = _check_profile_scope_guard("cat $HOME/clients/heijmans/x")
         assert result is not None and result["approved"] is False
 
-    def test_home_var_token_allowed_in_scope(self, scoped_home):
-        assert _check_profile_scope_guard(f"ls {IN_SCOPE_VAR}") is None
+    def test_home_var_token_allowed_in_scope(self, scope_paths, scoped_home):
+        assert _check_profile_scope_guard(f"ls {scope_paths.IN_SCOPE_VAR}") is None
 
-    def test_dotdot_traversal_denied_with_cwd(self, scoped_home):
+    def test_dotdot_traversal_denied_with_cwd(self, scope_paths, scoped_home):
         escape = os.path.relpath(
-            os.path.join(HOME, "clients", "catapult", "x.txt"), IN_SCOPE_DIR)
-        result = _check_profile_scope_guard(f"cat {escape}", cwd=IN_SCOPE_DIR)
+            os.path.join(scope_paths.HOME, "clients", "catapult", "x.txt"), scope_paths.IN_SCOPE_DIR)
+        result = _check_profile_scope_guard(f"cat {escape}", cwd=scope_paths.IN_SCOPE_DIR)
         assert result is not None and result["approved"] is False
 
-    def test_dotdot_within_scope_allowed_with_cwd(self, scoped_home):
+    def test_dotdot_within_scope_allowed_with_cwd(self, scope_paths, scoped_home):
         result = _check_profile_scope_guard(
-            "cat ../README.md", cwd=os.path.join(IN_SCOPE_DIR, "sub"))
+            "cat ../README.md", cwd=os.path.join(scope_paths.IN_SCOPE_DIR, "sub"))
         assert result is None
 
-    def test_non_scoped_tokens_unaffected(self, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", DEFAULT_HOME)
+    def test_non_scoped_tokens_unaffected(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", scope_paths.DEFAULT_HOME)
         assert _check_profile_scope_guard("cat $HOME/clients/heijmans/x") is None
         assert _check_profile_scope_guard("cat ../catapult/x.txt",
-                                          cwd=IN_SCOPE_DIR) is None
+                                          cwd=scope_paths.IN_SCOPE_DIR) is None
 
 
 # ── The multiplexer: overridden HOME and a per-turn contextvar home ─────────
@@ -346,15 +340,15 @@ class TestTokenResolution:
 
 
 class TestMultiplexerHome:
-    def test_module_loads_when_home_is_overridden(self, monkeypatch):
+    def test_module_loads_when_home_is_overridden(self, scope_paths, monkeypatch):
         """expanduser must not decide where the scoping layer lives."""
-        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
         bridge._reset_for_tests()
         assert bridge.load_profile_scope() is not None
 
-    def test_profile_resolves_from_contextvar_override(self, monkeypatch):
-        monkeypatch.setenv("HOME", MUX_HOME)
-        monkeypatch.setenv("HERMES_HOME", MUX_ROOT)
+    def test_profile_resolves_from_contextvar_override(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", scope_paths.MUX_ROOT)
         bridge._reset_for_tests()
         mod = bridge.load_profile_scope()
         assert mod is not None
@@ -362,7 +356,7 @@ class TestMultiplexerHome:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        token = set_hermes_home_override(SCOPED_HOME)
+        token = set_hermes_home_override(scope_paths.SCOPED_HOME)
         try:
             assert mod.resolve_profile() == SCOPED_NAME
             assert mod.is_scoped(SCOPED_NAME) is True
@@ -370,53 +364,53 @@ class TestMultiplexerHome:
         finally:
             reset_hermes_home_override(token)
 
-    def test_guard_blocks_through_the_multiplexer(self, monkeypatch):
-        monkeypatch.setenv("HOME", MUX_HOME)
-        monkeypatch.setenv("HERMES_HOME", MUX_ROOT)
+    def test_guard_blocks_through_the_multiplexer(self, scope_paths, monkeypatch):
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", scope_paths.MUX_ROOT)
         bridge._reset_for_tests()
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        token = set_hermes_home_override(SCOPED_HOME)
+        token = set_hermes_home_override(scope_paths.SCOPED_HOME)
         try:
-            blocked = _check_profile_scope_guard(f"cat {SECRET_PATH}")
+            blocked = _check_profile_scope_guard(f"cat {scope_paths.SECRET_PATH}")
             assert blocked is not None and blocked["approved"] is False
-            assert _check_profile_scope_guard(f"ls {IN_SCOPE_DIR}") is None
+            assert _check_profile_scope_guard(f"ls {scope_paths.IN_SCOPE_DIR}") is None
         finally:
             reset_hermes_home_override(token)
 
-    def test_symlinked_profile_tree_resolves(self, monkeypatch):
+    def test_symlinked_profile_tree_resolves(self, scope_paths, monkeypatch):
         """The mux reaches profiles through ~/.hermes-mux/profiles/<name>."""
-        if not os.path.islink(MUX_SCOPED_HOME):
+        if not os.path.islink(scope_paths.MUX_SCOPED_HOME):
             pytest.skip("no symlinked mux profile tree on this machine")
-        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
         bridge._reset_for_tests()
         mod = bridge.load_profile_scope()
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        token = set_hermes_home_override(MUX_SCOPED_HOME)
+        token = set_hermes_home_override(scope_paths.MUX_SCOPED_HOME)
         try:
             assert mod.resolve_profile() == SCOPED_NAME
             assert bridge.is_scoped_home() is True
         finally:
             reset_hermes_home_override(token)
 
-    def test_multiplexer_does_not_scope_a_parked_profile(self, monkeypatch):
+    def test_multiplexer_does_not_scope_a_parked_profile(self, scope_paths, monkeypatch):
         """Fail-open must survive the fix: parked profiles stay unbounded."""
-        monkeypatch.setenv("HOME", MUX_HOME)
-        monkeypatch.setenv("HERMES_HOME", MUX_ROOT)
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", scope_paths.MUX_ROOT)
         bridge._reset_for_tests()
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        token = set_hermes_home_override(NON_SCOPED_HOME)
+        token = set_hermes_home_override(scope_paths.NON_SCOPED_HOME)
         try:
             assert bridge.is_scoped_home() is False
-            assert _check_profile_scope_guard(f"cat {OUT_OF_SCOPE}") is None
+            assert _check_profile_scope_guard(f"cat {scope_paths.OUT_OF_SCOPE}") is None
         finally:
             reset_hermes_home_override(token)
 
@@ -430,21 +424,21 @@ class TestGovernancePolicyPathUnderMux:
     mode "off". Alles gaat dan door zonder foutmelding.
     """
 
-    def test_beleidspad_volgt_de_echte_gebruiker_niet_de_omgeving(self, monkeypatch):
-        from gateway.platforms.api_server import _beleidspad
+    def test_beleidspad_volgt_de_echte_gebruiker_niet_de_omgeving(self, scope_paths, monkeypatch):
+        from gateway.platforms.api_server_governance import _beleidspad
 
-        monkeypatch.setenv("HOME", MUX_HOME)
-        monkeypatch.setenv("HERMES_HOME", SCOPED_HOME)
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
+        monkeypatch.setenv("HERMES_HOME", scope_paths.SCOPED_HOME)
         pad = _beleidspad()
         assert pad.endswith("/.hermes/dashboard-governance.yaml")
         assert ".hermes-mux" not in pad
         assert "/profiles/" not in pad
 
-    def test_beleid_blijft_afdwingend_onder_de_mux(self, monkeypatch):
-        from gateway.platforms.api_server import _beleidspad
+    def test_beleid_blijft_afdwingend_onder_de_mux(self, scope_paths, monkeypatch):
+        from gateway.platforms.api_server_governance import _beleidspad
         from hermes_cli.dashboard_governance import load_governance_policy
 
-        monkeypatch.setenv("HOME", MUX_HOME)
+        monkeypatch.setenv("HOME", scope_paths.MUX_HOME)
         beleid = load_governance_policy(path=_beleidspad())
         # Stil terugvallen op "off" is precies wat we niet willen zien.
         assert beleid.mode != "off"

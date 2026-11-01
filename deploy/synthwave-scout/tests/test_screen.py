@@ -8,10 +8,12 @@ import time
 
 import pytest
 
-from test_scout import WAKE_FALSE, env, last_line, run, write_jobs, write_output, write_profile  # noqa: F401
+from test_scout import WAKE_FALSE, last_line, run, write_jobs, write_output, write_profile
 
-import scout_collect  # noqa: E402
-import scout_ledger  # noqa: E402
+pytest_plugins = ["test_scout"]
+
+import scout_collect
+import scout_ledger
 
 SCOUT = "sc01"
 
@@ -35,7 +37,7 @@ def answer(env, text, failed=False):
 
 
 def shown_hashes(out):
-    return re.findall(r"^- \[([0-9a-f]{8})\]", out, re.M)
+    return re.findall(r"^- \[([0-9a-f]{8})\]", out, re.MULTILINE)
 
 
 def rows(env):
@@ -80,10 +82,10 @@ def test_screen_human_holding_long(env, capsys):
     sd = screen(env, {"holder": "human", "viewer_id": "v1", "since": since, "reason": "log in bij Exact",
                       "epoch": 4})
     before = (sd / "lease.json").read_bytes()
-    code, out = run(capsys)
+    _code_83, out = run(capsys)
     assert "Bot Screen: al lang door een mens overgenomen" in out and "log in bij Exact" in out
     assert (sd / "lease.json").read_bytes() == before, "the lease is never written"
-    code, out = run(capsys)  # unclassified, so shown again: same id, not a new item
+    _code, out = run(capsys)  # unclassified, so shown again: same id, not a new item
     assert out.count("Bot Screen") == 1
 
 

@@ -2,7 +2,9 @@
 import pytest
 from agent import background_review as review
 from agent import model_metadata as metadata
-from tests.agent.test_explicit_router_metadata import endpoint, MODEL, URL, NATIVE
+from tests.agent.test_explicit_router_metadata import MODEL, URL, NATIVE
+
+pytest_plugins = ["tests.agent.test_explicit_router_metadata"]
 from run_agent import AIAgent
 
 

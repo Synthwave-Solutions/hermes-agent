@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import yaml
-
-
+import hermes_yaml as yaml
 def _policy_from_dict(data):
     from hermes_cli.dashboard_governance.loader import parse_governance_policy
 

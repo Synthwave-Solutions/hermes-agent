@@ -13,8 +13,7 @@ import importlib
 import sys
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 SALT = "sp-test-salt-v1"
 PERSON = "Alice.Example@Acme.Example "
 PSEUDONYM = "u_00ce9e9f4c1f"

@@ -241,7 +241,7 @@ def _load() -> tuple:
         scoped, roots, deny = _build(_parse(open(path, encoding="utf-8").read()))
         _cache.update(key=key, scoped=scoped, roots=roots, deny=deny,
                       source="config", error="")
-    except Exception as exc:  # noqa: BLE001 - any parse problem locks down
+    except Exception as exc:
         armed = _marker_profiles()
         _cache.update(key=key, scoped=armed, roots={p: [] for p in armed},
                       deny={}, source="degraded",

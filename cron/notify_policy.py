@@ -25,20 +25,20 @@ never change one without the other.
 from __future__ import annotations
 
 __all__ = [
-    "LEVELS_IN_APP",
-    "LEVELS_DELIVERY",
-    "UI_IN_APP_CHOICES",
     "ALERT_KINDS",
-    "OUTCOME_MUTED",
+    "LEVELS_DELIVERY",
+    "LEVELS_IN_APP",
     "MANAGED_BY",
-    "normalize_notify",
-    "resolve_notify",
-    "default_notify_for_new_job",
-    "should_deliver",
-    "in_app_flags",
+    "OUTCOME_MUTED",
+    "UI_IN_APP_CHOICES",
     "combine_flags",
+    "default_notify_for_new_job",
+    "in_app_flags",
     "legacy_toast_value",
     "normalize_managed_by",
+    "normalize_notify",
+    "resolve_notify",
+    "should_deliver",
 ]
 
 LEVELS_IN_APP = ("all", "failures", "quiet", "off")
@@ -91,7 +91,7 @@ def normalize_notify(value) -> dict | None:
         level = value[key]
         if not isinstance(level, str) or level not in allowed:
             raise ValueError(
-                "notify.%s must be one of %s" % (key, ", ".join(allowed))
+                "notify.{} must be one of {}".format(key, ", ".join(allowed))
             )
         result[key] = level
     return result

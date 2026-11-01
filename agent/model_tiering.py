@@ -14,7 +14,8 @@ is classified on two INDEPENDENT axes before the API call:
 The axes are deliberately decoupled: a huge-context but trivial step can run
 sol-low, a short but genuinely hard question can run terra-xhigh or luna-xhigh.
 
-Kill switch: HERMES_MODEL_TIERING=0 (or config model.tiering: false).
+Configure model.tiering: false to disable; the legacy environment switch is
+read only when the profile has no explicit setting.
 Explicit reasoning settings and provider recovery decisions always take precedence.
 Fail-open: any error leaves the original kwargs untouched.
 """
@@ -24,7 +25,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
-import os
 import re
 from typing import Any, Optional, Tuple
 
@@ -43,22 +43,22 @@ TIER_TO_MODEL = {
 # Explicit deep-thinking requests from the user.
 _XHIGH_RE = re.compile(
     r"\b(think\s+(?:very\s+)?(?:hard|deep(?:ly)?)|ultrathink|denk\s+(?:heel\s+)?(?:diep|hard)"
-    r"|maximum\s+reasoning|xhigh)\b", re.I)
+    r"|maximum\s+reasoning|xhigh)\b", re.IGNORECASE)
 # Work where reasoning depth genuinely pays off.
 _HIGH_RE = re.compile(
     r"\b(architect(?:ure|uur)?|security\s*review|root\s*cause|design\s+(?:a|the|een)"
     r"|waarom\s+faalt|why\s+does\s+.{0,40}\s+fail|deadlock|race\s*condition"
-    r"|migration\s+plan|migratieplan|proof|bewijs|complex)\b", re.I)
+    r"|migration\s+plan|migratieplan|proof|bewijs|complex)\b", re.IGNORECASE)
 # Ordinary coding / editing / analysis work.
 _MEDIUM_RE = re.compile(
     r"\b(implement|refactor|debug|fix|bouw|build|schrijf|write|analyseer|analy[sz]e"
-    r"|deploy|genereer|generate|maak\s+(?:een|de|het)|create|review)\b", re.I)
+    r"|deploy|genereer|generate|maak\s+(?:een|de|het)|create|review)\b", re.IGNORECASE)
 # Capability cues that want the big model regardless of thinking depth.
 _SOL_RE = re.compile(
     r"\b(productie|production|klant|client[-\s]facing|deliverable|volledige?\s+(?:app|rapport|document)"
-    r"|hele\s+codebase|end[-\s]to[-\s]end|architect\w*)\b", re.I)
+    r"|hele\s+codebase|end[-\s]to[-\s]end|architect\w*)\b", re.IGNORECASE)
 
-_ERROR_MARKER_RE = re.compile(r"(traceback|error|failed|exception|denied)", re.I)
+_ERROR_MARKER_RE = re.compile(r"(traceback|error|failed|exception|denied)", re.IGNORECASE)
 
 
 def _msg_text(msg: Any) -> str:
@@ -93,7 +93,7 @@ def tiering_request_user(agent, messages: list, original_user_message: Any):
         _REQUEST_USER.reset(token)
 
 
-def classify_turn(api_messages: list) -> Tuple[str, str, str]:
+def classify_turn(api_messages: list) -> tuple[str, str, str]:
     """Return (tier, effort, reason) for the upcoming call."""
     last_user = ""
     recent_error_count = 0
@@ -143,9 +143,8 @@ def classify_turn(api_messages: list) -> Tuple[str, str, str]:
 
 def configure_model_tiering(agent, config: dict) -> None:
     """Snapshot the owning profile's switch at construction, without per-call I/O."""
-    model = config.get("model") or {}
-    value = model.get("tiering", True) if isinstance(model, dict) else True
-    agent._model_tiering_enabled = str(value).strip().lower() not in ("0", "false", "off", "no")
+    from hermes_cli.synthpulse_settings import enabled
+    agent._model_tiering_enabled = enabled("model.tiering", True, config=config)
 
 
 def _automatic_effort_allowed(agent) -> bool:
@@ -174,9 +173,9 @@ def _automatic_effort_allowed(agent) -> bool:
 def apply_model_tiering(agent, kwargs: dict, api_messages: list) -> None:
     """Mutate *kwargs* in place with the per-turn tier and effort."""
     try:
-        if os.getenv("HERMES_MODEL_TIERING", "1").strip().lower() in ("0", "false", "off"):
-            return
-        if getattr(agent, "_model_tiering_enabled", True) is False:
+        if not hasattr(agent, "_model_tiering_enabled"):
+            configure_model_tiering(agent, {})
+        if agent._model_tiering_enabled is False:
             return
         model = str(kwargs.get("model") or "")
         if model not in TIERED_SOURCE_MODELS:
@@ -198,4 +197,6 @@ def apply_model_tiering(agent, kwargs: dict, api_messages: list) -> None:
         reasoning["effort"] = effort
         logger.info("model_tiering: %s -> %s effort=%s (%s)", model, target, effort, reason)
     except Exception as exc:  # fail-open: never break the turn
+        logging.getLogger(__name__).error("apply_model_tiering: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("model_tiering skipped: %s", exc)

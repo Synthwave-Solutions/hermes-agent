@@ -45,13 +45,16 @@ def _mock_http(monkeypatch, handler):
 
 @pytest.mark.parametrize("head_fallback", [False, True])
 def test_preflight_budget_is_shared_by_all_requests(monkeypatch, head_fallback):
-    """Each reply fits the budget; their cumulative delay does not."""
+    """Advance the loop clock: each reply fits, the cumulative time does not."""
     cancelled, completed = [], []
     delay = 0.4 if head_fallback else 0.6
+    clock = [0.0]
 
     async def handler(request):
         try:
-            await asyncio.sleep(delay)
+            clock[0] += delay
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
         except asyncio.CancelledError:
             cancelled.append(request.method)
             raise
@@ -64,6 +67,9 @@ def test_preflight_budget_is_shared_by_all_requests(monkeypatch, head_fallback):
     clients, _, transports = _mock_http(monkeypatch, handler)
 
     async def scenario():
+        loop = asyncio.get_running_loop()
+        clock[0] = loop.time()
+        monkeypatch.setattr(loop, "time", lambda: clock[0])
         server = mcp_tool.MCPServerTask("budget-test")
         await asyncio.wait_for(
             server._preflight_content_type("https://mcp.example.invalid", timeout=1.0),

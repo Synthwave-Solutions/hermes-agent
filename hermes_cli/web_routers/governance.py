@@ -61,7 +61,7 @@ async def get_governance_policy(request: Request):
 
 
 @router.put("/api/governance/policy")
-async def put_governance_policy(request: Request, body: Dict[str, Any]):
+async def put_governance_policy(request: Request, body: dict[str, Any]):
     from hermes_cli.dashboard_governance.enforcement import (
         effective_access_for_request, policy_for_request, safe_policy_payload,
         serialize_effective_access)
@@ -86,7 +86,9 @@ async def put_governance_policy(request: Request, body: Dict[str, Any]):
             path = save_governance_policy(body)
         except GovernancePolicyError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("put_governance_policy: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             _log.exception("PUT /api/governance/policy failed")
             raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -120,7 +122,7 @@ async def get_governance_groups(request: Request):
 
 
 @router.post("/api/governance/groups")
-async def post_governance_group(request: Request, body: Dict[str, Any]):
+async def post_governance_group(request: Request, body: dict[str, Any]):
     require_governance_admin(request)
     name = str(body.get("name") or "").strip() if isinstance(body, dict) else ""
     if not name:
@@ -145,7 +147,7 @@ async def post_governance_group(request: Request, body: Dict[str, Any]):
 
 
 @router.put("/api/governance/groups/{name}")
-async def put_governance_group(request: Request, name: str, body: Dict[str, Any]):
+async def put_governance_group(request: Request, name: str, body: dict[str, Any]):
     require_governance_admin(request)
     group_name = str(name or "").strip()
     entry = validated_governance_entry(body, kind="group")
@@ -185,7 +187,7 @@ async def delete_governance_group(request: Request, name: str):
 
 
 @router.put("/api/governance/users/{email}")
-async def put_governance_user(request: Request, email: str, body: Dict[str, Any]):
+async def put_governance_user(request: Request, email: str, body: dict[str, Any]):
     from hermes_cli.dashboard_governance.models import _norm_email
 
     require_governance_admin(request)
@@ -238,7 +240,7 @@ async def delete_governance_user(request: Request, email: str):
 
 
 @router.post("/api/governance/preview")
-async def post_governance_preview(body: Dict[str, Any]):
+async def post_governance_preview(body: dict[str, Any]):
     from hermes_cli.dashboard_governance.enforcement import safe_policy_payload, serialize_effective_access
     from hermes_cli.dashboard_governance.loader import GovernancePolicyError, parse_governance_policy
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
@@ -263,7 +265,7 @@ async def post_governance_preview(body: Dict[str, Any]):
 
 
 @router.post("/api/governance/simulate")
-async def post_governance_simulate(body: Dict[str, Any]):
+async def post_governance_simulate(body: dict[str, Any]):
     from hermes_cli.dashboard_governance.loader import GovernancePolicyError, parse_governance_policy
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
     from hermes_cli.dashboard_governance.route_catalog import route_permission

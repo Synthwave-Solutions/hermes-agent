@@ -67,6 +67,7 @@ ROUTE_CATALOG: tuple[RouteRule, ...] = (
     RouteRule("/api/config/schema", "config:read", match="exact"),
     RouteRule("/api/config/defaults", "config:read", match="exact"),
     RouteRule("/api/config", "config:read", "config:write"),
+    RouteRule("/api/delegation", "config:read", "config:write"),
     RouteRule("/api/env", "env:read", "env:write"),
     RouteRule("/api/providers/validate", "config:write", "config:write", match="exact"),
     RouteRule("/api/providers/oauth", "config:read", "config:write"),

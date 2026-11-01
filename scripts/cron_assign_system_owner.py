@@ -49,6 +49,8 @@ several people); 2 usage error.
 
 from __future__ import annotations
 
+import logging
+
 import argparse
 import getpass
 import json
@@ -89,18 +91,17 @@ def _bootstrap_imports() -> Path:
     return sandbox
 
 
-def _read_yaml(path: Path) -> Dict[str, Any]:
-    import yaml
-
+def _read_yaml(path: Path) -> dict[str, Any]:
+    import hermes_yaml as yaml
     if not path.exists():
         return {}
-    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
     if not isinstance(loaded, dict):
         raise ValueError(f"{path} is not a mapping")
     return loaded
 
 
-def _read_jobs(home: Path) -> List[Dict[str, Any]]:
+def _read_jobs(home: Path) -> list[dict[str, Any]]:
     """Read cron/jobs.json without locks, repairs or directory creation."""
     from cron.jobs import _parse_jobs_file
 
@@ -119,7 +120,7 @@ def _read_jobs(home: Path) -> List[Dict[str, Any]]:
     return [job for job in jobs if isinstance(job, dict) and job.get("id")]
 
 
-def _profile_stores(root: Path) -> List[Path]:
+def _profile_stores(root: Path) -> list[Path]:
     """The named profile stores under ``root`` that have cron jobs."""
     profiles_root = root / "profiles"
     if not profiles_root.is_dir():
@@ -131,8 +132,8 @@ def _profile_stores(root: Path) -> List[Path]:
     ]
 
 
-def _unique(homes: List[Path]) -> List[Path]:
-    unique: List[Path] = []
+def _unique(homes: list[Path]) -> list[Path]:
+    unique: list[Path] = []
     for home in homes:
         resolved = home.resolve()
         if resolved not in unique:
@@ -140,7 +141,7 @@ def _unique(homes: List[Path]) -> List[Path]:
     return unique
 
 
-def _stores(args: argparse.Namespace, default_home: Path) -> List[Path]:
+def _stores(args: argparse.Namespace, default_home: Path) -> list[Path]:
     """The stores this run may change."""
     homes = [Path(h).expanduser() for h in (args.hermes_home or [])] or [default_home]
     if args.all_profiles:
@@ -149,7 +150,7 @@ def _stores(args: argparse.Namespace, default_home: Path) -> List[Path]:
     return _unique(homes)
 
 
-def _other_platform_stores(selected: List[Path]) -> List[Path]:
+def _other_platform_stores(selected: list[Path]) -> list[Path]:
     """Every store of the selected stores' platforms that was not selected.
 
     The platform of a store is its root home and all of the root's named
@@ -158,7 +159,7 @@ def _other_platform_stores(selected: List[Path]) -> List[Path]:
     """
     from cron.jobs import platform_root_for
 
-    candidates: List[Path] = []
+    candidates: list[Path] = []
     for home in selected:
         root = platform_root_for(home) or home
         candidates.append(root)
@@ -178,7 +179,7 @@ def _principal_policy_entry(policy: Any, principal: str) -> str:
     return "admin" if dwd_identity_for(access) is None else "restricted"
 
 
-def _profile_people(policy: Any, profile: str) -> List[str]:
+def _profile_people(policy: Any, profile: str) -> list[str]:
     """The governed people the policy gives ``profile`` to, by its name.
 
     Only people who are not administrators count (an administrator's jobs
@@ -190,7 +191,7 @@ def _profile_people(policy: Any, profile: str) -> List[str]:
     from hermes_cli.dashboard_governance.resolver import resolve_effective_access
     from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
 
-    people: List[str] = []
+    people: list[str] = []
     for email in sorted(policy.users):
         access = resolve_effective_access(policy, GovernanceSubject(email=email))
         if dwd_identity_for(access) is None:  # None means administrator
@@ -200,7 +201,7 @@ def _profile_people(policy: Any, profile: str) -> List[str]:
     return people
 
 
-def _job_creator(job: Dict[str, Any]) -> str:
+def _job_creator(job: dict[str, Any]) -> str:
     """The address the job's origin names as its creator, or ""."""
     from cron.jobs import normalize_owner_identity
 
@@ -212,7 +213,7 @@ def _job_creator(job: Dict[str, Any]) -> str:
         return ""
 
 
-def _creator_standing(policies: List[Any], creator: str) -> str:
+def _creator_standing(policies: list[Any], creator: str) -> str:
     """How the policies know a job's creator.
 
     "admin" when every policy makes them an administrator (their job may
@@ -236,7 +237,84 @@ def _creator_standing(policies: List[Any], creator: str) -> str:
     return "unknown"
 
 
-def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> Dict[str, Any]:
+def _inspect_ownerless_jobs(jobs, people, principal, known_policies, agent_only, errors):
+    """Classify ownerless jobs without broadening a governed creator's access."""
+    items = []
+    if len(people) == 1:
+        new_owner, action, detail, assign_as = people[0], "would_assign", "", "profile_person"
+    elif people:
+        new_owner, action, assign_as = "", "left", ""
+        detail = (
+            "this profile belongs to several people ("
+            + ", ".join(people)
+            + "): an administrator must choose with hermes cron reassign-owner"
+        )
+    else:
+        new_owner, action, detail, assign_as = principal, "would_assign", "", "principal"
+    for job in jobs:
+        if str(job.get("owner_email") or "").strip():
+            continue
+        kind = "script" if job.get("no_agent") else "agent"
+        if agent_only and kind == "script":
+            continue
+        item = {
+            "id": str(job["id"]),
+            "name": str(job.get("name") or ""),
+            "kind": kind,
+            "enabled": job.get("enabled", True) is not False,
+            "action": action,
+            "new_owner": new_owner,
+            "detail": detail,
+            "assign_as": assign_as,
+        }
+        creator = _job_creator(job)
+        if creator and known_policies:
+            try:
+                standing = _creator_standing(known_policies, creator)
+            except Exception as exc:
+                logging.getLogger(__name__).error("inspect_store: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
+                errors.append(f"The creator of job {item['id']} could not be checked: {exc}")
+                standing = "unknown"
+            if standing == "person":
+                item.update(
+                    action="would_assign",
+                    new_owner=creator,
+                    detail=f"created by {creator}",
+                    assign_as="creator",
+                )
+            elif standing == "unknown":
+                item.update(
+                    action="left",
+                    new_owner="",
+                    detail=(
+                        f"created by {creator}, who has no entry in the governance policy: "
+                        "an administrator must choose with hermes cron reassign-owner"
+                    ),
+                    assign_as="",
+                )
+        items.append(item)
+    return items
+
+
+def _profile_owners(home, policy, platform_policy, root, errors):
+    # Whose own profile this is: the people are defined in the platform
+    # policy, and a profile with a policy of its own may name them too.
+    people: list[str] = []
+    if policy is not None and root is not None:
+        try:
+            for known in (policy, platform_policy):
+                if known is not None:
+                    people.extend(p for p in _profile_people(known, home.name) if p not in people)
+        except Exception as exc:
+            logging.getLogger(__name__).error("inspect_store: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
+            errors.append(f"Who this profile belongs to could not be read: {exc}")
+    people.sort()
+    return people
+
+
+def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> dict[str, Any]:
     """Read one store and decide what ``--apply`` would do. Writes nothing.
 
     A named profile store that sets neither a principal nor a policy of its
@@ -262,7 +340,7 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
     )
     from hermes_cli.dashboard_governance.loader import load_governance_policy
 
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "home": str(home),
         "principal": "",
         "principal_source": "",
@@ -276,11 +354,13 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
         "warnings": [],
     }
     # Problems with the principal block only a store that would assign it.
-    principal_errors: List[str] = []
+    principal_errors: list[str] = []
     root = platform_root_for(home)
     try:
         config = _read_yaml(home / "config.yaml")
     except Exception as exc:
+        logging.getLogger(__name__).error("inspect_store: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         report["errors"].append(f"config.yaml could not be read: {exc}")
         config = {}
     configured = system_principal_from_config(config)
@@ -315,6 +395,8 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
         report["policy_file"] = str(policy_path)
         policy = load_governance_policy(path=policy_path)
     except Exception as exc:
+        logging.getLogger(__name__).error("inspect_store: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         report["errors"].append(f"The governance policy could not be read: {exc}")
     if policy is not None:
         report["governance_mode"] = policy.mode
@@ -348,6 +430,8 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
                 hermes_home=root, config=read_config_file(root / "config.yaml")
             )
         except Exception as exc:
+            logging.getLogger(__name__).error("inspect_store: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             report["errors"].append(f"The platform governance policy could not be read: {exc}")
         else:
             report["warnings"].append(
@@ -356,77 +440,18 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
                 "the platform policy governs this profile instead."
             )
 
-    # Whose own profile this is: the people are defined in the platform
-    # policy, and a profile with a policy of its own may name them too.
-    people: List[str] = []
-    if policy is not None and root is not None:
-        try:
-            for known in (policy, platform_policy):
-                if known is not None:
-                    people.extend(p for p in _profile_people(known, home.name) if p not in people)
-        except Exception as exc:
-            report["errors"].append(f"Who this profile belongs to could not be read: {exc}")
-    people.sort()
+    people = _profile_owners(home, policy, platform_policy, root, report["errors"])
     report["profile_people"] = people
 
     try:
         jobs = _read_jobs(home)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
         report["errors"].append(f"cron/jobs.json could not be read: {exc}")
         jobs = []
-    if len(people) == 1:
-        new_owner, action, detail, assign_as = people[0], "would_assign", "", "profile_person"
-    elif people:
-        new_owner, action, assign_as = "", "left", ""
-        detail = (
-            "this profile belongs to several people ("
-            + ", ".join(people)
-            + "): an administrator must choose with hermes cron reassign-owner"
-        )
-    else:
-        new_owner, action, detail, assign_as = principal, "would_assign", "", "principal"
     known_policies = [known for known in (policy, platform_policy) if known is not None]
-    for job in jobs:
-        if str(job.get("owner_email") or "").strip():
-            continue
-        kind = "script" if job.get("no_agent") else "agent"
-        if agent_only and kind == "script":
-            continue
-        item = {
-            "id": str(job["id"]),
-            "name": str(job.get("name") or ""),
-            "kind": kind,
-            "enabled": job.get("enabled", True) is not False,
-            "action": action,
-            "new_owner": new_owner,
-            "detail": detail,
-            "assign_as": assign_as,
-        }
-        creator = _job_creator(job)
-        if creator and known_policies:
-            try:
-                standing = _creator_standing(known_policies, creator)
-            except Exception as exc:
-                report["errors"].append(f"The creator of job {item['id']} could not be checked: {exc}")
-                standing = "unknown"
-            if standing == "person":
-                item.update(
-                    action="would_assign",
-                    new_owner=creator,
-                    detail=f"created by {creator}",
-                    assign_as="creator",
-                )
-            elif standing == "unknown":
-                item.update(
-                    action="left",
-                    new_owner="",
-                    detail=(
-                        f"created by {creator}, who has no entry in the governance policy: "
-                        "an administrator must choose with hermes cron reassign-owner"
-                    ),
-                    assign_as="",
-                )
-        report["jobs"].append(item)
+    report["jobs"] = _inspect_ownerless_jobs(
+        jobs, people, principal, known_policies, agent_only, report["errors"],
+    )
     if any(item["assign_as"] == "principal" for item in report["jobs"]):
         report["errors"].extend(principal_errors)
     else:
@@ -439,17 +464,17 @@ def inspect_store(home: Path, *, principal_override: str, agent_only: bool) -> D
     return report
 
 
-def inspect_other_store(home: Path) -> Dict[str, Any]:
+def inspect_other_store(home: Path) -> dict[str, Any]:
     """Read a store this run does not change: its ownerless agent jobs."""
-    report: Dict[str, Any] = {"home": str(home), "ownerless_agent_jobs": [], "errors": []}
+    report: dict[str, Any] = {"home": str(home), "ownerless_agent_jobs": [], "errors": []}
     try:
         report["ownerless_agent_jobs"] = _left_ownerless_agent_jobs(home)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
         report["errors"].append(f"cron/jobs.json could not be read: {exc}")
     return report
 
 
-def apply_store(report: Dict[str, Any], *, actor: str, reason: str) -> None:
+def apply_store(report: dict[str, Any], *, actor: str, reason: str) -> None:
     """Give every job in ``report`` its new owner (compare and set).
 
     ``reason`` is kept for jobs that go to the principal; a job that goes to
@@ -490,7 +515,7 @@ def apply_store(report: Dict[str, Any], *, actor: str, reason: str) -> None:
         reset_hermes_home_override(token)
 
 
-def _left_ownerless_agent_jobs(home: Path) -> List[str]:
+def _left_ownerless_agent_jobs(home: Path) -> list[str]:
     return [
         str(job["id"])
         for job in _read_jobs(home)
@@ -498,7 +523,7 @@ def _left_ownerless_agent_jobs(home: Path) -> List[str]:
     ]
 
 
-def _print_report(report: Dict[str, Any], *, apply: bool) -> None:
+def _print_report(report: dict[str, Any], *, apply: bool) -> None:
     print(f"Store: {report['home']}")
     source = f" (from {report['principal_source']})" if report["principal_source"] else ""
     print(f"  System principal: {report['principal'] or '(none)'}{source}")
@@ -524,7 +549,7 @@ def _print_report(report: Dict[str, Any], *, apply: bool) -> None:
         print(f"  Ownerless agent jobs left: {len(report['left_ownerless_agent_jobs'])}")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="cron_assign_system_owner.py",
         description=(
@@ -569,14 +594,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def _agent_jobs_left_behind(reports: List[Dict[str, Any]], others: List[Dict[str, Any]]) -> List[str]:
+def _agent_jobs_left_behind(reports: list[dict[str, Any]], others: list[dict[str, Any]]) -> list[str]:
     """Where agent jobs without an owner remain, or would remain after apply.
 
     After an apply that ran: what the store holds now. Otherwise (a dry run,
     or an apply that blocking problems stopped): every ownerless agent job
     that apply would not, or could not, give an owner.
     """
-    places: List[str] = []
+    places: list[str] = []
     for report in reports:
         if "left_ownerless_agent_jobs" in report:
             ids = report["left_ownerless_agent_jobs"]

@@ -13,6 +13,7 @@ import json
 
 import pytest
 from fastapi import HTTPException
+from datetime import UTC
 
 IDENTITY_FIELDS = ("owner_email", "origin", "created_at")
 ORIGIN = {"platform": "telegram", "chat_id": "111", "user_id": "alice"}
@@ -718,7 +719,7 @@ def test_the_mutations_by_id_refuse_a_foreign_job_even_without_the_lookup(foreig
 
 
 def test_the_cronjob_tool_cannot_touch_a_foreign_job(foreign_jobs, as_mallory, monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from tools.cronjob_tools import cronjob
 
     runs = []
@@ -747,7 +748,7 @@ def test_the_cronjob_tool_cannot_touch_a_foreign_job(foreign_jobs, as_mallory, m
 
 
 def test_a_governed_person_keeps_full_control_of_their_own_job(foreign_jobs, as_mallory, monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from cron.jobs import pause_job, resume_job, trigger_job, update_job
     from tools.cronjob_tools import cronjob
 
@@ -872,7 +873,7 @@ def test_a_governed_shell_keeps_its_own_notepad(foreign_jobs, monkeypatch):
 def test_a_scheduled_fire_writes_its_own_job_but_not_another(foreign_jobs, monkeypatch):
     """The ticker binds the owner for the whole fire: the run's own
     bookkeeping passes, a write to someone else's job does not."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from cron.jobs import CronJobAccessDenied, update_job
     from hermes_constants import get_hermes_home
 
@@ -929,7 +930,7 @@ def test_a_governed_person_cannot_chain_a_foreign_jobs_output(foreign_jobs, as_m
 
 def test_a_fire_never_reads_a_foreign_jobs_output(foreign_jobs):
     """A job stored before this check still cannot read what is not its owner's."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from cron.jobs import create_job, save_job_output
     from hermes_cli.dashboard_governance.context import governance_context
 
@@ -1052,7 +1053,7 @@ def _ceiling_ctx(email, *, admin=True):
 
 @pytest.mark.parametrize("which", ["principal", "ownerless"])
 def test_a_ceiled_session_cannot_act_on_a_job_it_does_not_own(foreign_jobs, monkeypatch, which):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from cron.jobs import CronJobAccessDenied, pause_job, remove_job, trigger_job, update_job
     from hermes_cli.dashboard_governance.context import governance_context
 
@@ -1091,7 +1092,7 @@ WEBUI_PANEL_ORIGIN = {"platform": "webui", "chat_id": None, "user_id": ADMIN}
 
 @pytest.fixture()
 def fake_runs(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     runs = []
     monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))
@@ -1171,7 +1172,7 @@ def test_a_ceiled_session_cannot_resume_or_rearm_its_own_job(fake_runs, email, a
     from cron.jobs import CronJobAccessDenied, pause_job, rearm_oneshot, resume_job
     from hermes_cli.dashboard_governance.context import governance_context
 
-    soon = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    soon = (datetime.now(UTC) + timedelta(days=1)).replace(microsecond=0)
     paused = pause_job(_own_job(email)["id"])
     once = _own_job(email, name="once", schedule=soon.isoformat())
     with governance_context(_ceiling_ctx(email, admin=admin)):
@@ -1194,7 +1195,7 @@ def test_the_cronjob_tool_in_a_ceiled_session_cannot_rewrite_or_run_its_own_job(
     from hermes_cli.dashboard_governance.context import governance_context
     from tools.cronjob_tools import cronjob
 
-    soon = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+    soon = (datetime.now(UTC) + timedelta(days=1)).replace(microsecond=0)
     mine = _own_job(email)
     once = _own_job(email, name="once", schedule=soon.isoformat())
     with governance_context(_ceiling_ctx(email, admin=admin)):

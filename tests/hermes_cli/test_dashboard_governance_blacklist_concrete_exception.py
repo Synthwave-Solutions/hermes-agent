@@ -1,6 +1,5 @@
 """An approved concrete path reopens a specific deny for a blacklist account; wildcards never do."""
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.dashboard_governance.loader import load_governance_policy
 from hermes_cli.dashboard_governance.models import GovernanceSubject
 from hermes_cli.dashboard_governance.resolver import resolve_effective_access

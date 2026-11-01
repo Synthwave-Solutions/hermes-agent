@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from langfuse import Langfuse, propagate_attributes
-except Exception:  # pragma: no cover - fail-open when optional dep is missing
+except ImportError:  # pragma: no cover - fail-open when optional dep is missing
     Langfuse = None
     propagate_attributes = None
 
@@ -34,12 +34,12 @@ class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
-    generations: Dict[str, Any] = field(default_factory=dict)
-    tools: Dict[str, Any] = field(default_factory=dict)
-    pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
+    generations: dict[str, Any] = field(default_factory=dict)
+    tools: dict[str, Any] = field(default_factory=dict)
+    pending_tools_by_name: dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     # Keyed by child_session_id: subagent_stop carries no child_subagent_id.
-    subagents: Dict[str, Any] = field(default_factory=dict)
+    subagents: dict[str, Any] = field(default_factory=dict)
     # Fingerprints of MoA fan-outs already recorded: the client holds its last
     # fan-out until the next one, so tool-loop turns would re-emit advisors.
     moa_emitted: set = field(default_factory=set)
@@ -47,7 +47,7 @@ class TraceState:
 
 
 _STATE_LOCK = threading.Lock()
-_TRACE_STATE: Dict[str, TraceState] = {}
+_TRACE_STATE: dict[str, TraceState] = {}
 # Ceiling on live trace state (per turn_id): turns that never reach _finish_trace
 # would leak forever, so over the cap the least-recently-updated are evicted.
 # Bounds the leak, not concurrency.
@@ -56,7 +56,7 @@ _LANGFUSE_CLIENT = None
 # Under a multiplexed profile override, one settled client (or _INIT_FAILED) per Hermes home: the
 # keys live in each profile's .env, so a single slot would trace profile B into profile A's project
 # (or pin B to A's failed init). The slot above stays for the unscoped single-profile path.
-_LANGFUSE_CLIENT_BY_HOME: Dict[str, Any] = {}
+_LANGFUSE_CLIENT_BY_HOME: dict[str, Any] = {}
 # Separate from _STATE_LOCK (hot path) so the two never nest; serializes the
 # first client build so racing callers can't each construct a client.
 _LANGFUSE_CLIENT_LOCK = threading.Lock()
@@ -69,7 +69,7 @@ _READ_FILE_META_KEYS = ("total_lines", "file_size", "truncated", "is_binary", "i
 # Langfuse-issued keys always carry these prefixes. Anything else is a leftover
 # template value: the SDK accepts it at construction time but silently drops
 # every trace at flush time (#23823).
-_LANGFUSE_KEY_PREFIXES: Dict[str, str] = {
+_LANGFUSE_KEY_PREFIXES: dict[str, str] = {
     "HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-",
     "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-",
 }
@@ -108,6 +108,8 @@ def _failsafe(label: str):
     try:
         yield
     except Exception as exc:  # pragma: no cover - fail-open
+        logging.getLogger(__name__).error("_failsafe: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         _debug(f"{label} failed: {exc}")
 
 
@@ -140,7 +142,9 @@ def _redact_secrets(value: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
         return redact_sensitive_text(value, force=True)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_redact_secrets: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return value
 
 
@@ -180,11 +184,11 @@ def _redact_personal_data(value: str) -> str:
     value = _PD_EMAIL_RE.sub("[email]", value)
     value = _PD_IBAN_RE.sub("[iban]", value)
 
-    def _card(match: "re.Match[str]") -> str:
+    def _card(match: re.Match[str]) -> str:
         digits = re.sub(r"\D", "", match.group(0))
         return "[card]" if 13 <= len(digits) <= 19 and _luhn_valid(digits) else match.group(0)
 
-    def _bsn(match: "re.Match[str]") -> str:
+    def _bsn(match: re.Match[str]) -> str:
         return "[bsn]" if _bsn_valid(match.group(0).replace(".", "")) else match.group(0)
 
     value = _PD_CARD_RE.sub(_card, value)
@@ -318,7 +322,7 @@ def _build_client() -> Optional[Langfuse]:
         )
         return None
 
-    kwargs: Dict[str, Any] = {"public_key": public_key, "secret_key": secret_key}
+    kwargs: dict[str, Any] = {"public_key": public_key, "secret_key": secret_key}
     for key, name, default in (("base_url", "BASE_URL", "https://cloud.langfuse.com"), ("environment", "ENV", ""),
                                ("release", "RELEASE", "")):
         value = _secret(f"HERMES_LANGFUSE_{name}") or _secret(f"LANGFUSE_{name}") or default
@@ -334,6 +338,8 @@ def _build_client() -> Optional[Langfuse]:
     try:
         return Langfuse(**kwargs)
     except Exception as exc:  # pragma: no cover - fail-open
+        logging.getLogger(__name__).error("_build_client: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.warning("Could not initialize Langfuse client: %s", exc)
         return None
 
@@ -382,7 +388,7 @@ def _maybe_parse_json_string(value: str) -> Any:
         return value
     try:
         parsed, idx = json.JSONDecoder().raw_decode(stripped)
-    except Exception:
+    except ValueError:
         return value
     if not isinstance(parsed, (dict, list)):
         return value
@@ -459,7 +465,7 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
         return value
     if isinstance(value, bytes):
         return {"type": "bytes", "len": len(value)}
-    recurse = lambda v, d: _safe_value(v, max_chars=max_chars, depth=d, parse_json_strings=parse_json_strings, max_depth=max_depth)  # noqa: E731
+    recurse = lambda v, d: _safe_value(v, max_chars=max_chars, depth=d, parse_json_strings=parse_json_strings, max_depth=max_depth)
     if isinstance(value, str):
         parsed = _maybe_parse_json_string(value) if parse_json_strings else value
         return recurse(parsed, depth) if parsed is not value else _truncate_text(value, max_chars)
@@ -542,11 +548,11 @@ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
 def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
                               base_url: str) -> tuple[dict[str, int], dict[str, float]]:
     """Translate canonical Hermes usage into Langfuse usage and cost maps."""
-    usage_details: Dict[str, int] = {
+    usage_details: dict[str, int] = {
         key: tokens for key, attr, _ in _USAGE_FIELDS
         if (tokens := getattr(canonical, attr)) or key in ("input", "output")
     }
-    cost_details: Dict[str, float] = {}
+    cost_details: dict[str, float] = {}
     try:
         from agent.usage_pricing import estimate_usage_cost, resolve_billing_route
 
@@ -557,6 +563,8 @@ def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
             return usage_details, cost_details
         cost = estimate_usage_cost(model, canonical, provider=provider, base_url=base_url, api_key="")
     except Exception as exc:  # pragma: no cover - fail-open
+        logging.getLogger(__name__).error("_canonical_usage_and_cost: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         _debug(f"usage pricing failed: {exc}")
         return usage_details, cost_details
 
@@ -582,9 +590,10 @@ def _canonical_usage_and_cost(canonical: Any, *, provider: str, model: str,
             rate = getattr(entry, rate_attr, None) if rate_attr else None
             tokens = getattr(canonical, attr)
             if rate is not None and tokens:
-                cost_details[key] = float(Decimal(tokens) * rate / Decimal("1000000"))
-    except Exception:  # pragma: no cover - canonical total remains usable
-        pass
+                cost_details[key] = float(Decimal(tokens) * rate / Decimal(1000000))
+    except Exception as _boundary_error:  # pragma: no cover - canonical total remains usable
+        logging.getLogger(__name__).error("_canonical_usage_and_cost: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
 
     return usage_details, cost_details
 
@@ -606,12 +615,14 @@ def _usage_and_cost(response: Any, *, provider: str, model: str, base_url: str, 
         )
         return _canonical_usage_and_cost(canonical, provider=provider, model=model, base_url=base_url)
     except Exception as exc:  # pragma: no cover - fail-open
+        logging.getLogger(__name__).error("_usage_and_cost: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         if usage is None:
             _debug(f"usage normalization failed: {exc}")
         return {}, {}
 
 
-def _trace_identity() -> Dict[str, Any]:
+def _trace_identity() -> dict[str, Any]:
     """User, profile, organisation, module and installation for every trace."""
     try:
         from agent import model_gateway
@@ -620,6 +631,8 @@ def _trace_identity() -> Dict[str, Any]:
             environment=_env("HERMES_LANGFUSE_ENV") or _env("LANGFUSE_ENV"),
         )
     except Exception as exc:
+        logging.getLogger(__name__).error("_trace_identity: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         _debug(f"trace identity unavailable: {exc}")
         return {"user_id": None, "tags": [], "metadata": {}}
 
@@ -642,7 +655,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "capture_mode": _capture_mode(),
     }
     # session_id must be in trace_context for Langfuse session grouping.
-    trace_ctx: Dict[str, Any] = {"trace_id": trace_id, **({"session_id": session_id} if session_id else {})}
+    trace_ctx: dict[str, Any] = {"trace_id": trace_id, **({"session_id": session_id} if session_id else {})}
 
     def open_root():
         ctx = client.start_as_current_observation(trace_context=trace_ctx, name="Hermes turn", as_type="chain",
@@ -655,7 +668,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             with propagate_attributes(session_id=session_id or task_key, trace_name="Hermes turn",
                                       tags=trace_tags, user_id=trace_user, metadata=identity_metadata):
                 root_ctx, root_span = open_root()
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_start_root_trace: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             root_ctx = None
     if root_ctx is None:
         root_ctx, root_span = open_root()
@@ -753,6 +768,8 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
                     getattr(state.root_span, method)(output=final_output)
         _end_root(state, "root end()")
     except Exception as exc:  # pragma: no cover - fail-open
+        logging.getLogger(__name__).error("_finish_trace: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         _debug(f"finish trace failed: {exc}")
         with contextlib.suppress(Exception):  # last-chance end so the root still exports
             state.root_span.end()
@@ -772,7 +789,7 @@ def _client_and_key(task_id: str, session_id: str, turn_id: str, api_request_id:
     return client, _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
 
 
-def _duration_meta(api_duration: Any) -> Dict[str, Any]:
+def _duration_meta(api_duration: Any) -> dict[str, Any]:
     return {"api_duration_s": round(api_duration, 3)} if api_duration and api_duration > 0 else {}
 
 
@@ -1011,7 +1028,7 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", api_call_co
     error_type, error_message = str(error.get("type") or ""), str(error.get("message") or "")
 
     # Error messages can embed request fragments (URLs w/ keys, prompt echoes) — capture-pipeline them.
-    error_metadata: Dict[str, Any] = {
+    error_metadata: dict[str, Any] = {
         "error": True, "error_type": error_type, "error_message": _capture_content(error_message),
         **{k: v for k, v in (("status_code", status_code), ("retry_count", retry_count), ("max_retries", max_retries),
                              ("retryable", retryable), ("reason", str(reason) if reason else None)) if v is not None},

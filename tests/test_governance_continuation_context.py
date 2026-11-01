@@ -4,8 +4,7 @@ from types import SimpleNamespace
 import json
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.dashboard_governance.context import (
     DashboardGovernanceContext, context_from_env_payload, governance_context,
     policy_contexts, serialize_context_for_env,

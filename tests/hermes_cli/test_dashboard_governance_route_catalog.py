@@ -28,6 +28,10 @@ def test_management_route_catalog_maps_core_endpoint_families():
     cases = [
         ("/api/config", "GET", "config:read"),
         ("/api/config", "PUT", "config:write"),
+        ("/api/delegation/routing", "GET", "config:read"),
+        ("/api/delegation/backend", "PUT", "config:write"),
+        ("/api/delegation/backends/model_map", "PUT", "config:write"),
+        ("/api/delegation/backends/profile_routes", "PUT", "config:write"),
         ("/api/env", "GET", "env:read"),
         ("/api/env", "POST", "env:write"),
         ("/api/model/options", "GET", "model:read"),

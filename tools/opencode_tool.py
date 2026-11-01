@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import pwd
 import secrets
 import shlex
 import subprocess
@@ -39,26 +38,37 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "opencode_task"
 DEFAULT_MODEL = "omniroute/auto/best-coding"
-try:
-    MAX_SLOTS = max(1, int(os.environ.get("HERMES_OPENCODE_MAX_SLOTS", "12")))
-except ValueError:
-    MAX_SLOTS = 12
 RUNNER = Path(__file__).resolve().with_name("opencode_task_runner.py")
 
-# Pinned on the passwd home: under the profile multiplexer $HOME points at
-# ~/.hermes-mux/home, and a guard that reads the wrong home silently does
-# nothing (see the synthpulse-governance skill, "De stille storing").
-_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
-OPENCODE_BIN = os.environ.get("HERMES_OPENCODE_BIN") or str(
-    _HOME / ".npm-global" / "lib" / "node_modules" / "opencode-ai" / "bin" / "opencode.exe")
-JOBS_DIR = _HOME / ".hermes" / "cache" / "opencode-tasks"
-SLOT_DIR = _HOME / ".hermes" / "run" / "opencode-slots"
+
+def _host_home() -> Path:
+    # Sandbox masks refer to the host's passwd home, even under the multiplexer.
+    if sys.platform == "win32":
+        return Path.home()
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) if hasattr(os, "getuid") else Path.home()
+
+
+def _opencode_binary() -> str:
+    from hermes_cli.synthpulse_settings import setting
+    configured = setting("opencode.binary")
+    return str(configured or (_host_home() / ".npm-global/lib/node_modules/opencode-ai/bin/opencode.exe"))
+
+
+def _max_slots() -> int:
+    from hermes_cli.synthpulse_settings import setting
+    try:
+        return max(1, int(setting("opencode.max_slots", 12)))
+    except (TypeError, ValueError):
+        return 12
+
 
 # Candidate locations with credentials or other people's state. Each one is
 # masked only when the caller may not read it through Hermes; an owner sees
@@ -107,25 +117,30 @@ def _current_context():
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context
         return current_governance_context(), None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        logging.getLogger(__name__).error("_current_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         return None, exc
 
 
 def _governed_without_context() -> bool:
     """True when this process should have a governance context but has none."""
-    if os.environ.get("HERMES_DASHBOARD_GOVERNANCE_CONTEXT"):
+    from hermes_cli.dashboard_governance.context import GOVERNANCE_CONTEXT_ENV
+    if os.environ.get(GOVERNANCE_CONTEXT_ENV):
         return True
     try:
         from tools import profile_scope_bridge
         mod = profile_scope_bridge.load_profile_scope()
         if mod is not None and mod.is_scoped(mod.resolve_profile()):
             return True
-    except Exception:  # noqa: BLE001
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_governed_without_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return True
     return False
 
 
-def check_governance(args: Dict[str, Any]):
+def check_governance(args: dict[str, Any]):
     """(context, error). Fail closed whenever the caller's access cannot be resolved."""
     ctx, exc = _current_context()
     if exc is not None:
@@ -145,7 +160,7 @@ def check_governance(args: Dict[str, Any]):
         if not decision.allowed:
             detail = f" ({decision.detail})" if getattr(decision, "detail", "") else ""
             return ctx, f"Blocked by governance: {decision.reason}{detail}."
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("opencode_task governance check failed", exc_info=True)
         return ctx, "Blocked by governance: policy check failed (fail-closed)."
     return ctx, None
@@ -155,14 +170,18 @@ def check_folderguard(workdir: str) -> Optional[str]:
     try:
         from tools import profile_scope_bridge
         mod = profile_scope_bridge.load_profile_scope()
-    except Exception:  # noqa: BLE001
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("check_folderguard: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         mod = None
     if mod is None:
         return "Blocked: profile scope guard unavailable (fail-closed)." if _governed_without_context() else None
     try:
         profile = mod.resolve_profile()
         ok, reason = mod.check_path(profile, workdir, "write")
-    except Exception:  # noqa: BLE001
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("check_folderguard: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return "Blocked: profile scope check failed (fail-closed)."
     return None if ok else f"Blocked by folder scope: {reason}"
 
@@ -170,7 +189,7 @@ def check_folderguard(workdir: str) -> Optional[str]:
 def _git_top(workdir: Path) -> Optional[Path]:
     try:
         done = subprocess.run(["git", "-C", str(workdir), "rev-parse", "--show-toplevel"],
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if done.returncode != 0 or not done.stdout.strip():
@@ -182,8 +201,7 @@ def _literal_path(glob: str) -> Optional[str]:
     """A denied glob that names one concrete place (optionally with /**)."""
     raw = os.path.expanduser(str(glob).strip())
     for suffix in ("/**", "/*"):
-        if raw.endswith(suffix):
-            raw = raw[: -len(suffix)]
+        raw = raw.removesuffix(suffix)
     if not raw.startswith("/") or any(ch in raw for ch in "*?["):
         return None
     return raw.rstrip("/") or None
@@ -195,7 +213,9 @@ def _caller_may_read(access, path: str) -> bool:
     try:
         from hermes_cli.dashboard_governance.tool_policy import decide_tool_argument_access
         return decide_tool_argument_access(access, "read_file", {"path": path}).allowed
-    except Exception:  # noqa: BLE001
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_caller_may_read: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 
@@ -204,7 +224,7 @@ def mask_plan(access) -> tuple[list[str], list[str], list[str]]:
 
     Everything the caller may read stays visible; a location is masked only
     when the policy refuses it to them."""
-    home = str(_HOME)
+    home = str(_host_home())
     dirs = list(HARD_MASK_DIRS)
     files: list[str] = []
     patterns: list[str] = ["/run/synthpulse/secrets/**"]
@@ -252,7 +272,7 @@ def home_layout(access) -> dict:
     roots = sorted(str(Path(os.path.expanduser(r))) for r in (getattr(access.grants, "file_read_roots", ()) or ())
                    if r and r != "*" and not any(ch in str(r) for ch in "*?["))
     return {"home_mode": "allowlist", "read_roots": roots,
-            "runtime_paths": [str(_HOME / p) for p in RUNTIME_PATHS]}
+            "runtime_paths": [str(_host_home() / p) for p in RUNTIME_PATHS]}
 
 
 def opencode_config(deny_patterns: list[str]) -> dict:
@@ -307,14 +327,17 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
     blocked = check_folderguard(str(resolved))
     if blocked:
         return tool_error(blocked)
-    if not Path(OPENCODE_BIN).is_file():
-        return tool_error(f"OpenCode binary not found at {OPENCODE_BIN}.")
+    opencode_bin = _opencode_binary()
+    if not Path(opencode_bin).is_file():
+        return tool_error(f"OpenCode binary not found at {opencode_bin}.")
     # The runner is a Hermes control-plane process on the host. A profile whose
     # terminal is sandboxed (docker, ssh) must not gain a host process this way.
     try:
         from tools.terminal_tool import _get_env_config
         env_type = _get_env_config().get("env_type", "local")
-    except Exception:  # noqa: BLE001
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("opencode_task: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         env_type = "unknown"
     if env_type != "local":
         return tool_error(f"opencode_task needs the host terminal backend; this profile uses '{env_type}'.")
@@ -322,12 +345,12 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
     access = getattr(ctx, "access", None) if ctx is not None else None
     top = _git_top(resolved)
     job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    job: Dict[str, Any] = {
+    job: dict[str, Any] = {
         "id": job_id, "task": task, "workdir": str(resolved), "model": (model or DEFAULT_MODEL).strip(),
-        "opencode_bin": OPENCODE_BIN, "home": str(_HOME), "slot_dir": str(SLOT_DIR), "slots": MAX_SLOTS,
+        "opencode_bin": opencode_bin, "home": str(_host_home()), "slot_dir": str(get_default_hermes_root() / "run/opencode-slots"), "slots": _max_slots(),
         "slot_wait": 600, "timeout": max(60, min(int(timeout or 3600), 7200)),
         "test_command": (test_command or "").strip(),
-        "path": ":".join([str(_HOME / ".npm-global" / "bin"), str(_HOME / ".local" / "bin"),
+        "path": ":".join([str(_host_home() / ".npm-global" / "bin"), str(_host_home() / ".local" / "bin"),
                           "/usr/local/bin", "/usr/bin", "/bin"]),
         "owner_email": getattr(getattr(access, "subject", None), "email", "") if access is not None else "",
     }
@@ -360,14 +383,14 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
     job["opencode_config"] = opencode_config(deny_patterns)
     job.update(home_layout(access))
 
-    run_dir = JOBS_DIR / job_id
+    run_dir = get_hermes_home() / "cache/opencode-tasks" / job_id
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (run_dir / "job.json").write_text(json.dumps(job, indent=1))
+    (run_dir / "job.json").write_text(json.dumps(job, indent=1), encoding="utf-8")
     key = os.environ.get("OMNIROUTE_API_KEY", "")
     if key:
         key_path = run_dir / "omniroute.key"
         fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(key)
 
     command = f"{shlex.quote(sys.executable)} -I {shlex.quote(str(RUNNER))} {shlex.quote(str(run_dir))}"
@@ -389,7 +412,9 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
 
 
 def check_opencode_requirements() -> bool:
-    return Path(OPENCODE_BIN).is_file() and RUNNER.is_file()
+    # The worker depends on Linux bubblewrap; keep discovery importable on
+    # other hosts without advertising an unavailable sandbox.
+    return sys.platform == "linux" and Path(_opencode_binary()).is_file() and RUNNER.is_file()
 
 
 def _handle_opencode_task(args, **kw):

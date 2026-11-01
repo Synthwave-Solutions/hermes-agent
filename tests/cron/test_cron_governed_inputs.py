@@ -27,8 +27,7 @@ from __future__ import annotations
 import json
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 PRINCIPAL = "cron-system@example.test"
 ADMIN = "root@example.test"
 MALLORY = "mallory@example.test"

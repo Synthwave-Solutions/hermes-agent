@@ -9,7 +9,7 @@ PLUGIN_DIR = REPO / "synthwave-policy"
 EXAMPLE_POLICY = REPO / "policy" / "autonomy.example.yaml"
 sys.path.insert(0, str(PLUGIN_DIR))
 
-import policy_engine as pe  # noqa: E402
+import policy_engine as pe
 
 
 def load_plugin_package():

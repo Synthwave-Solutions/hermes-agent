@@ -25,7 +25,7 @@ for candidate in (HERE.parent / "synthwave-policy", HERE):
         sys.path.insert(0, str(candidate))
         break
 
-import policy_engine as pe  # noqa: E402
+import policy_engine as pe
 
 EXIT = {"AUTO": 0, "ASK": 10, "BLOCK": 20}
 

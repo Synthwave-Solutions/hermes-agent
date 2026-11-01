@@ -59,7 +59,7 @@ class _GatewayRefusedProvider(VideoGenProvider):
     def is_available(self) -> bool:
         return False
 
-    def generate(self, prompt: str, **kwargs: Any) -> Dict[str, Any]:
+    def generate(self, prompt: str, **kwargs: Any) -> dict[str, Any]:
         from agent.video_gen_provider import error_response
 
         return error_response(

@@ -53,7 +53,7 @@ def test_mandatory_cli_review_still_parks_on_a_human(monkeypatch):
     monkeypatch.setattr(review, "_hard_check", lambda c, t, a, r: "")
     monkeypatch.setattr(review, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(review, "_ask_model", lambda *a, **k: (_ for _ in ()).throw(AssertionError("model must not be asked")))
-    import tools.approval as approval
+    from tools import approval
     monkeypatch.setattr(approval, "request_governance_action_approval",
                         lambda tool, serialized, fallback, op: {"approved": False, "message": "declined"})
     result = review.authorize_tool_action(ctx, "terminal", {"command": "deploy-prod api"}, None)

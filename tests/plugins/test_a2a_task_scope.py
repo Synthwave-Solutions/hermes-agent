@@ -17,8 +17,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from gateway import synthpulse_identity
 from plugins.platforms.a2a import protocol
 from plugins.platforms.a2a.synthpulse_assertion import ACTOR_HEADER, sign_actor

@@ -61,7 +61,7 @@ def permission_matches(values, value: str) -> bool:
                for pattern in values)
 
 
-def intersect_grants(grants: "GrantSet", ceiling: "GrantSet") -> "GrantSet":
+def intersect_grants(grants: GrantSet, ceiling: GrantSet) -> GrantSet:
     def intersect(left, right, path=False, permissions=False):
         if permissions:
             return frozenset(v for v in left if permission_matches(right, v)) | frozenset(
@@ -103,7 +103,7 @@ def _string_set(value: Any) -> frozenset[str]:
     return frozenset({str(value).strip()}) if str(value).strip() else frozenset()
 
 
-def _deep_merge_grants(base: "GrantSet", other: "GrantSet") -> "GrantSet":
+def _deep_merge_grants(base: GrantSet, other: GrantSet) -> GrantSet:
     return GrantSet(
         permissions=base.permissions | other.permissions,
         profiles=base.profiles | other.profiles,
@@ -191,7 +191,7 @@ class GrantSet:
     usage_caps: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "GrantSet":
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> GrantSet:
         if not isinstance(data, Mapping):
             return cls()
         settings = data.get("settings") if isinstance(data.get("settings"), Mapping) else {}
@@ -243,7 +243,7 @@ class GrantSet:
             usage_caps=dict(data.get("usage_caps") or {}),
         )
 
-    def merge(self, other: "GrantSet") -> "GrantSet":
+    def merge(self, other: GrantSet) -> GrantSet:
         return _deep_merge_grants(self, other)
 
     def is_empty(self) -> bool:
@@ -267,7 +267,7 @@ class GrantSet:
             "env": {"vars": sorted(self.env_vars)}, "usage_caps": dict(self.usage_caps),
         }
 
-    def subtract(self, deny: "GrantSet") -> "GrantSet":
+    def subtract(self, deny: GrantSet) -> GrantSet:
         """Return this grant set with everything in ``deny`` removed.
 
         A per-user (or per-group) deny block overrides the grants inherited
@@ -512,7 +512,7 @@ class EffectiveAccess:
 
 def _concrete_base(pattern: str) -> str | None:
     """"<abs dir>" for "<abs dir>" or "<abs dir>/**" without other wildcards, else None."""
-    base = pattern[:-3] if pattern.endswith("/**") else pattern
+    base = pattern.removesuffix("/**")
     if not base.startswith("/") or any(ch in base for ch in "*?["):
         return None
     return base.rstrip("/") or "/"

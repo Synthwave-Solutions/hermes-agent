@@ -8,10 +8,12 @@ import time
 
 import pytest
 
-from test_scout import WAKE_FALSE, env, last_line, run, write_jobs, write_output, write_profile  # noqa: F401
+from test_scout import WAKE_FALSE, last_line, run, write_jobs, write_output, write_profile
 
-import scout_collect  # noqa: E402
-import scout_ledger  # noqa: E402
+pytest_plugins = ["test_scout"]
+
+import scout_collect
+import scout_ledger
 
 SCOUT = "sc01"
 
@@ -35,7 +37,7 @@ def answer(env, text, failed=False):
 
 
 def shown_hashes(out):
-    return re.findall(r"^- \[([0-9a-f]{8})\]", out, re.M)
+    return re.findall(r"^- \[([0-9a-f]{8})\]", out, re.MULTILINE)
 
 
 def rows(env):
@@ -68,16 +70,16 @@ def test_recovered_job_failing_again_is_reported_again(env, capsys, monkeypatch)
     fail1 = {"id": "j1", "name": "Daily", "last_status": "error", "last_error": "boom", "failure_streak": 1,
              "last_run_at": "2026-10-17T07:00:00+02:00"}
     write_jobs(env["home"], [fail1])
-    code, out = run(capsys)
+    _code_71, out = run(capsys)
     (h1,) = shown_hashes(out)
     answer(env, f"SCOUT-LEDGER: {h1}=notified")
     write_jobs(env["home"], [dict(fail1, failure_streak=2, last_run_at="2026-10-18T07:00:00+02:00")])
-    code, out = run(capsys)
+    _code_75, out = run(capsys)
     assert last_line(out) == WAKE_FALSE, "same streak is not reported twice"
     write_jobs(env["home"], [dict(fail1, last_status="ok", failure_streak=0)])
-    code, out = run(capsys)
+    _code_78, out = run(capsys)
     write_jobs(env["home"], [dict(fail1, failure_streak=1, last_run_at="2026-10-19T07:00:00+02:00")])
-    code, out = run(capsys)
+    _code, out = run(capsys)
     assert "Job faalt: Daily" in out and shown_hashes(out) != [h1]
 
 

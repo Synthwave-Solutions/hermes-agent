@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import fnmatch
 import os
 import re
@@ -588,11 +590,14 @@ def _entry_toolset(registry: Any, tool_name: str) -> str:
         toolset = getattr(entry, "toolset", "") if entry is not None else ""
         if toolset:
             return str(toolset)
-    except Exception:
-        pass
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_entry_toolset: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
     try:
         return str(registry.get_toolset_for_tool(tool_name) or "")
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_entry_toolset: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return ""
 
 
@@ -646,7 +651,6 @@ def decide_tool_access(access: EffectiveAccess | None, tool_name: str, registry:
     if tool_name == OPENCODE_TOOL_NAME:
         return _decide_opencode_tool_access(access, registry)
     identity = identify_tool(tool_name, registry)
-    grants = access.grants
     from .models import grant_matches
     if grant_matches(access.deny.tools, tool_name) or (identity.toolset and grant_matches(access.deny.toolsets, identity.toolset)):
         return AccessDecision(False, "explicit_deny", detail=tool_name)
@@ -761,7 +765,9 @@ def tool_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: 
             if index == 0:
                 first = decision
         return first
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("tool_allowed_for_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return AccessDecision(False, "continuation_policy_unavailable")
 
 
@@ -783,7 +789,9 @@ def _live_tool_scope_decision(ctx):
         try:
             if not callable(checker) or checker() is not True:
                 return AccessDecision(False, "bot_access_revoked")
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_live_tool_scope_decision: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             return AccessDecision(False, "bot_access_revoked")
     return AccessDecision(True, "tool_scope_allowed")
 
@@ -822,7 +830,9 @@ def tool_projection_scope_allowed(ctx: DashboardGovernanceContext | None) -> boo
     from .context import policy_contexts
     try:
         return _projection_contexts_allowed(policy_contexts(ctx))
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("tool_projection_scope_allowed: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 
@@ -851,13 +861,17 @@ def project_tool_names_for_context(ctx, tool_names, registry) -> ToolSchemaProje
                 if all(_tool_allowed_for_validated_scope(bounded_ctx, name, registry).allowed
                        for bounded_ctx in contexts):
                     allowed.add(name)
-            except Exception:
+            except Exception as _boundary_error:
                 # Match a failed single-tool decision without exposing it.
+                logging.getLogger(__name__).error("project_tool_names_for_context: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
                 continue
         if not _projection_contexts_allowed(contexts):
             return ToolSchemaProjection(frozenset(), False)
         return ToolSchemaProjection(frozenset(allowed), True)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("project_tool_names_for_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return ToolSchemaProjection(frozenset(), False)
 
 
@@ -867,7 +881,7 @@ def _resolve_candidate_path(value: Any) -> str:
         return ""
     try:
         return str(Path(os.path.expanduser(raw)).resolve(strict=False))
-    except Exception:
+    except (OSError, RuntimeError):
         return os.path.abspath(os.path.expanduser(raw))
 
 
@@ -903,13 +917,14 @@ _SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
 
 
 def _attachment_inbox_root() -> str:
-    override = os.getenv("HERMES_WEBUI_ATTACHMENT_DIR", "").strip()
+    from hermes_cli.synthpulse_settings import setting
+    override = str(setting("webui.attachment_dir", "") or "").strip()
     if override:
         return _resolve_candidate_path(override)
     try:
         from hermes_cli.config import get_hermes_home
         return _resolve_candidate_path(str(Path(get_hermes_home()) / "webui" / "attachments"))
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         return ""
 
 
@@ -950,7 +965,7 @@ def _own_state_cache_roots() -> tuple[str, ...]:
     try:
         from hermes_constants import get_hermes_home
         base = Path(get_hermes_home()) / "cache"
-    except Exception:
+    except (ImportError, OSError):
         return ()
     return tuple(_resolve_candidate_path(str(base / sub)) for sub in _OWN_STATE_CACHE_SUBDIRS)
 
@@ -1154,7 +1169,7 @@ def _secret_path_candidates(raw: Any, *, likely_only: bool = False) -> list[str]
         return []
     try:
         expanded = os.path.expanduser(text)
-    except Exception:
+    except (OSError, RuntimeError):
         expanded = text
     lexical: list[str] = []
     if os.path.isabs(expanded):
@@ -1277,6 +1292,22 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, i
     denied_path = _check_denied_paths(command_s, grants, inbox)
     if not denied_path.allowed:
         return denied_path
+    decision = _cli_compound_decision(command_s, grants, dwd_identity)
+    if not decision.allowed:
+        return decision
+    decision = _cli_identity_decision(command_s, grants, dwd_identity)
+    if not decision.allowed:
+        return decision
+    decision = _cli_deny_decision(command_s, grants, dwd_identity)
+    if not decision.allowed:
+        return decision
+    decision = _cli_allow_decision(command_s, grants, dwd_identity)
+    if not decision.allowed:
+        return decision
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _cli_compound_decision(command_s, grants, dwd_identity) -> AccessDecision:
     if grants.cli_denied_commands or (grants.cli_commands and "*" not in grants.cli_commands):
         # shlex identifies ordinary command chains; it is not a shell AST.
         # A compound head can hide a second executable in the same segment.
@@ -1290,6 +1321,10 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, i
             head = _segment_argv0(tokens)
             if head in _SHELL_CONTROL_HEADS or any(char in head for char in "(){}"):
                 return AccessDecision(False, "cli_compound_command_not_allowed")
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _cli_identity_decision(command_s, grants, dwd_identity) -> AccessDecision:
     if dwd_identity is not _DWD_UNRESTRICTED:
         tamper = _check_identity_env_tamper(command_s)
         if not tamper.allowed:
@@ -1303,6 +1338,10 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, i
         dwd_decision = _check_dwd_identity(dwd_segments, dwd_identity)
         if not dwd_decision.allowed:
             return dwd_decision
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _cli_deny_decision(command_s, grants, dwd_identity) -> AccessDecision:
     # A per-person CLI deny is subtracted into cli_denied_commands and has to
     # bite even when the role hands out a wildcard, otherwise the only way to
     # keep one command away from an administrator is to take the wildcard back
@@ -1325,6 +1364,10 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, i
                 if target and (grant_matches(grants.cli_denied_commands, target)
                                or grant_matches(grants.cli_denied_commands, os.path.basename(target))):
                     return AccessDecision(False, "cli_command_denied", detail=target)
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _cli_allow_decision(command_s, grants, dwd_identity) -> AccessDecision:
     if grants.cli_commands and "*" not in grants.cli_commands:
         try:
             segments = _split_shell_segments(command_s)
@@ -1342,6 +1385,7 @@ def _check_cli_command(command_s: str, grants, dwd_identity=_DWD_UNRESTRICTED, i
             if seg_argv0 not in grants.cli_commands and seg_base not in grants.cli_commands:
                 return AccessDecision(False, "cli_command_not_allowed", detail=seg_argv0)
     return AccessDecision(True, "arguments_allowed")
+
 
 
 def cli_command_requires_manual_approval(access: EffectiveAccess, command: str) -> bool:
@@ -1367,36 +1411,78 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
         return AccessDecision(True, "governance_inactive")
     if tool_name == OPENCODE_TOOL_NAME:
         return _opencode_argument_decision(access, args, session_id)
-    grants = access.grants
     inbox = session_attachment_inbox(session_id)
     if tool_name in {"read_file", "search_files"}:
         if _in_own_state_cache(args.get("path") or "."):
             return AccessDecision(True, "own_state_cache_allowed")
         if _in_session_inbox(args.get("path") or ".", inbox):
             return AccessDecision(True, "session_attachment_allowed")
+    handler = _ARGUMENT_HANDLERS.get(tool_name)
+    if handler is None:
+        return AccessDecision(True, "arguments_allowed")
+    return handler(access, tool_name, args, inbox)
+
+
+def _decide_skill_arguments(access, tool_name, args, inbox) -> AccessDecision:
     from .models import grant_matches
-    if tool_name in {"skill_view", "skill_manage"}:
-        dim = "skills_view" if tool_name == "skill_view" else "skills_manage"
-        for name in _skill_names(args):
-            if grant_matches(getattr(access.deny, dim), name) or grant_matches(getattr(access.deny, dim), name.rsplit("/", 1)[-1]):
-                return AccessDecision(False, "explicit_deny", detail=name)
-            if tool_name == "skill_view" and (grant_matches(access.deny.skills_load, name) or
-                                              grant_matches(access.deny.skills_load, name.rsplit("/", 1)[-1])):
-                return AccessDecision(False, "explicit_deny", detail=name)
-            if (access.access_mode or access.access_level) and not access.allows(dim, name):
-                return AccessDecision(False, "skill_not_allowed", detail=name)
-    if tool_name in {"read_file", "search_files", "write_file", "patch"}:
-        path = str(args.get("path") or ".")
-        canonical = _resolve_candidate_path(path)
-        dim = "file_read_roots" if tool_name in {"read_file", "search_files"} else "file_write_roots"
-        if access.access_mode == "blacklist" and access.configuration_denies_file(path, canonical):
-            return AccessDecision(False, "file_denied_glob", detail=path)
-        if (_matches_denied_glob(path, access.deny.file_denied_globs)
-                or _matches_denied_glob(canonical, access.deny.file_denied_globs)
-                or grant_matches(getattr(access.deny, dim), canonical, path=True)):
-            return AccessDecision(False, "explicit_deny", detail=path)
-        if (access.access_mode or access.access_level) and not access.allows(dim, canonical, path=True):
-            return AccessDecision(False, "file_root_not_allowed", detail=path)
+    grants = access.grants
+    dim = "skills_view" if tool_name == "skill_view" else "skills_manage"
+    for name in _skill_names(args):
+        if grant_matches(getattr(access.deny, dim), name) or grant_matches(getattr(access.deny, dim), name.rsplit("/", 1)[-1]):
+            return AccessDecision(False, "explicit_deny", detail=name)
+        if tool_name == "skill_view" and (grant_matches(access.deny.skills_load, name) or
+                                          grant_matches(access.deny.skills_load, name.rsplit("/", 1)[-1])):
+            return AccessDecision(False, "explicit_deny", detail=name)
+        if (access.access_mode or access.access_level) and not access.allows(dim, name):
+            return AccessDecision(False, "skill_not_allowed", detail=name)
+    if tool_name == "skill_view":
+        if not _skill_name_allowed(grants.skills_view, args.get("name")):
+            return AccessDecision(False, "skill_not_allowed", detail=str(args.get("name") or ""))
+    elif tool_name == "skill_manage":
+        names = _skill_names(args)
+        if not names:
+            return AccessDecision(False, "skill_manage_not_allowed", detail="")
+        for name in names:
+            if not _skill_name_allowed(grants.skills_manage, name):
+                return AccessDecision(False, "skill_manage_not_allowed", detail=name)
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _decide_file_arguments(access, tool_name, args, inbox) -> AccessDecision:
+    from .models import grant_matches
+    grants = access.grants
+    path = str(args.get("path") or ".")
+    canonical = _resolve_candidate_path(path)
+    dim = "file_read_roots" if tool_name in {"read_file", "search_files"} else "file_write_roots"
+    if access.access_mode == "blacklist" and access.configuration_denies_file(path, canonical):
+        return AccessDecision(False, "file_denied_glob", detail=path)
+    if (_matches_denied_glob(path, access.deny.file_denied_globs)
+            or _matches_denied_glob(canonical, access.deny.file_denied_globs)
+            or grant_matches(getattr(access.deny, dim), canonical, path=True)):
+        return AccessDecision(False, "explicit_deny", detail=path)
+    if (access.access_mode or access.access_level) and not access.allows(dim, canonical, path=True):
+        return AccessDecision(False, "file_root_not_allowed", detail=path)
+    if tool_name in {"read_file", "search_files"}:
+        path = args.get("path") or "."
+        if _matches_denied_glob(str(path), grants.file_denied_globs) \
+                and not _matches_denied_glob(str(path), grants.file_allow_globs):
+            return AccessDecision(False, "file_denied_glob", detail=str(path))
+        if grants.file_read_roots and not _path_within_roots(str(path), grants.file_read_roots):
+            return AccessDecision(False, "file_read_root_not_allowed", detail=str(path))
+    elif tool_name in {"write_file", "patch"}:
+        path = args.get("path")
+        if path:
+            if _matches_denied_glob(str(path), grants.file_denied_globs) \
+                    and not _matches_denied_glob(str(path), grants.file_allow_globs):
+                return AccessDecision(False, "file_denied_glob", detail=str(path))
+            if grants.file_write_roots and not _path_within_roots(str(path), grants.file_write_roots):
+                return AccessDecision(False, "file_write_root_not_allowed", detail=str(path))
+    return AccessDecision(True, "arguments_allowed")
+
+
+def _decide_terminal_arguments(access, tool_name, args, inbox) -> AccessDecision:
+    from .models import grant_matches
+    grants = access.grants
     if tool_name == "terminal" and (access.access_mode or access.access_level):
         if not grants.cli_commands:
             return AccessDecision(False, "cli_command_not_allowed")
@@ -1415,60 +1501,50 @@ def decide_tool_argument_access(access: EffectiveAccess | None, tool_name: str, 
                     or _matches_denied_glob(candidate, access.deny.file_denied_globs)
                     or _matches_denied_glob(canonical, access.deny.file_denied_globs)):
                 return AccessDecision(False, "explicit_deny", detail=candidate)
-    if tool_name == "skill_view":
-        if not _skill_name_allowed(grants.skills_view, args.get("name")):
-            return AccessDecision(False, "skill_not_allowed", detail=str(args.get("name") or ""))
-    elif tool_name == "skill_manage":
-        names = _skill_names(args)
-        if not names:
-            return AccessDecision(False, "skill_manage_not_allowed", detail="")
-        for name in names:
-            if not _skill_name_allowed(grants.skills_manage, name):
-                return AccessDecision(False, "skill_manage_not_allowed", detail=name)
-    elif tool_name in {"read_file", "search_files"}:
-        path = args.get("path") or "."
-        if _matches_denied_glob(str(path), grants.file_denied_globs) \
-                and not _matches_denied_glob(str(path), grants.file_allow_globs):
-            return AccessDecision(False, "file_denied_glob", detail=str(path))
-        if grants.file_read_roots and not _path_within_roots(str(path), grants.file_read_roots):
-            return AccessDecision(False, "file_read_root_not_allowed", detail=str(path))
-    elif tool_name in {"write_file", "patch"}:
-        path = args.get("path")
-        if path:
-            if _matches_denied_glob(str(path), grants.file_denied_globs) \
-                    and not _matches_denied_glob(str(path), grants.file_allow_globs):
-                return AccessDecision(False, "file_denied_glob", detail=str(path))
-            if grants.file_write_roots and not _path_within_roots(str(path), grants.file_write_roots):
-                return AccessDecision(False, "file_write_root_not_allowed", detail=str(path))
-    elif tool_name == "terminal":
-        command = args.get("command")
-        command_s = str(command or "")
-        decision = _check_cli_command(command_s, grants, dwd_identity_for(access), inbox=inbox,
-                                      lenient=access.access_mode == "blacklist")
-        if not decision.allowed:
-            return decision
-        workdir = args.get("workdir")
-        if workdir and grants.cli_workdir_roots and not _path_within_roots(str(workdir), grants.cli_workdir_roots):
-            return AccessDecision(False, "cli_workdir_not_allowed", detail=str(workdir))
-    elif tool_name == "execute_code":
-        # 15-10-2026: execute_code skipped the file denies entirely, so a
-        # path the terminal refuses was one open() away. Same string-level
-        # check as the lenient terminal gate; not process isolation.
-        code_s = str(args.get("code") or "")
-        denied_path = _check_denied_paths(code_s, grants, inbox)
-        if not denied_path.allowed:
-            return denied_path
-        identity = dwd_identity_for(access)
-        if identity is not _DWD_UNRESTRICTED:
-            tamper = _check_identity_env_tamper(code_s)
-            if not tamper.allowed:
-                return tamper
-        if isinstance(identity, DwdExclusion):
-            lowered = code_s.lower()
-            for subject in identity:
-                if subject in lowered:
-                    return AccessDecision(False, "dwd_identity_excluded", detail=f"execute_code {subject}")
+    command = args.get("command")
+    command_s = str(command or "")
+    decision = _check_cli_command(command_s, grants, dwd_identity_for(access), inbox=inbox,
+                                  lenient=access.access_mode == "blacklist")
+    if not decision.allowed:
+        return decision
+    workdir = args.get("workdir")
+    if workdir and grants.cli_workdir_roots and not _path_within_roots(str(workdir), grants.cli_workdir_roots):
+        return AccessDecision(False, "cli_workdir_not_allowed", detail=str(workdir))
     return AccessDecision(True, "arguments_allowed")
+
+
+def _decide_code_arguments(access, tool_name, args, inbox) -> AccessDecision:
+    grants = access.grants
+    # 15-10-2026: execute_code skipped the file denies entirely, so a
+    # path the terminal refuses was one open() away. Same string-level
+    # check as the lenient terminal gate; not process isolation.
+    code_s = str(args.get("code") or "")
+    denied_path = _check_denied_paths(code_s, grants, inbox)
+    if not denied_path.allowed:
+        return denied_path
+    identity = dwd_identity_for(access)
+    if identity is not _DWD_UNRESTRICTED:
+        tamper = _check_identity_env_tamper(code_s)
+        if not tamper.allowed:
+            return tamper
+    if isinstance(identity, DwdExclusion):
+        lowered = code_s.lower()
+        for subject in identity:
+            if subject in lowered:
+                return AccessDecision(False, "dwd_identity_excluded", detail=f"execute_code {subject}")
+    return AccessDecision(True, "arguments_allowed")
+
+
+_ARGUMENT_HANDLERS = {
+    "skill_view": _decide_skill_arguments,
+    "skill_manage": _decide_skill_arguments,
+    "read_file": _decide_file_arguments,
+    "search_files": _decide_file_arguments,
+    "write_file": _decide_file_arguments,
+    "patch": _decide_file_arguments,
+    "terminal": _decide_terminal_arguments,
+    "execute_code": _decide_code_arguments,
+}
 
 
 def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, tool_name: str, args: dict[str, Any]) -> AccessDecision:
@@ -1487,7 +1563,9 @@ def tool_arguments_allowed_for_context(ctx: DashboardGovernanceContext | None, t
             if index == 0:
                 first = decision
         return first
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("tool_arguments_allowed_for_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return AccessDecision(False, "continuation_policy_unavailable")
 
 
@@ -1515,7 +1593,9 @@ def _tool_arguments_for_single_context(ctx, tool_name, args):
         try:
             if not callable(checker) or checker() is not True:
                 return AccessDecision(False, "bot_access_revoked")
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_tool_arguments_for_single_context: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             return AccessDecision(False, "bot_access_revoked")
         if tool_name in {"terminal", OPENCODE_TOOL_NAME} and not ceiling.grants.cli_commands:
             return AccessDecision(False, "bot_cli_not_selected")
@@ -1552,7 +1632,9 @@ def _tool_arguments_for_single_context(ctx, tool_name, args):
         check = getattr(ctx, "project_access_check", None)
         if not callable(check) or check(str(path), tool_name in {"write_file", "patch"}) is not True:
             return denied
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_tool_arguments_for_single_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return denied
     # Never override denied globs, tool permissions, or other argument denials.
     if decision.reason in {"file_read_root_not_allowed", "file_write_root_not_allowed"}:

@@ -19,8 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from tools import tts_tool_openai
 
 GATEWAY_KEY = "sk-gw-engine-test-0002"
@@ -39,7 +38,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         self.server.requests.append(
@@ -144,7 +143,11 @@ def test_edge_default_gets_a_structured_refusal(gateway, key_file, no_outbound, 
     monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: (_ for _ in ()).throw(AssertionError("edge used")))
     _enforce(gateway)
     _assert_refusal(tts_tool.text_to_speech_tool("hello"), "tts", "edge")
-    _assert_refusal(tts_tool.text_to_speech_tool("hello", provider="elevenlabs"), "tts", "elevenlabs")
+    # Provider selection belongs to configuration in v0.22.5; a model-supplied
+    # argument must neither bypass the gateway nor select a paid backend.
+    _assert_refusal(tts_tool.text_to_speech_tool("hello", provider="elevenlabs"), "tts", "edge")
+    _enforce(gateway, tts={"provider": "elevenlabs"})
+    _assert_refusal(tts_tool.text_to_speech_tool("hello"), "tts", "elevenlabs")
     assert tts_tool.check_tts_requirements() is False
     assert no_outbound == []
 
@@ -200,7 +203,7 @@ def test_tts_unchanged_without_enforcement():
     _write_config({})
     assert tts_tool._get_provider({}) == "edge"
     assert tts_tool._get_provider({"provider": "nous"}) == "openai"
-    assert tts_tool._get_provider({}, override="ElevenLabs ") == "elevenlabs"
+    assert tts_tool._get_provider({"provider": "ElevenLabs "}) == "elevenlabs"
 
 
 # ---------------------------------------------------------------------------

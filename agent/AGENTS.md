@@ -18,6 +18,16 @@ config/provider later), `max_iterations` (default 500, shared with subagents),
 `chat(message) -> str` is the simple interface; `run_conversation(user_message, system_message=None,
 conversation_history=None, task_id=None) -> dict` returns `final_response` + `messages`.
 
+Provider matching and governance admission live in `agent_init_provider_routes.py` and
+`agent_init_governance.py`. Gateway routing and watchdog resolution live in
+`chat_completion_gateway.py` and `chat_completion_watchdogs.py`; auxiliary gateway admission is
+in `auxiliary_client_gateway.py`. Import these owners directly, without facade re-exports.
+`model_metadata.py` retains the shared caches/locks; its `model_metadata_{disk,endpoint,payloads,protocol}`
+siblings own parsing, probing and persistence. Preserve per-profile/credential cache keys and
+the single-flight/stale-while-revalidate behavior when changing those boundaries. Request dumps,
+recovery logs and compression image eviction live in `runtime_request_diagnostics.py`,
+`turn_recovery_diagnostics.py` and `compression_media.py`, respectively.
+
 ## Agent loop (`agent/conversation_loop.py` + `agent/turn_*.py`)
 
 Entirely synchronous, with interrupt checks, budget tracking, and a one-turn grace call:
@@ -39,7 +49,8 @@ Each phase of an iteration is its own sibling, so a change to (say) overflow han
 ~600-line file: `turn_preflight*`, `turn_iteration_prep`, `turn_request_assembly`/`turn_api_request`,
 `turn_api_call`, `turn_api_error`, `turn_response_intake`/`turn_response_check`,
 `turn_empty_response`, `turn_tool_round`/`turn_tool_validation`, `turn_overflow`,
-`turn_truncation`, `turn_context_compaction`, `turn_recovery`, `turn_recovery_autorecover`
+`turn_truncation`, `turn_scripted_prelude` (tool calls a prompt built-in plays before the first model
+call), `turn_context_compaction`, `turn_recovery`, `turn_recovery_autorecover`
 (post-exhaustion wait-and-retry ladder), `turn_retry_state`,
 `turn_stop_gates`, `turn_liveness`, `turn_usage`, `turn_final_response`, `turn_finalizer`,
 `turn_summary`. Find the phase with `grep -rn "def X" agent/turn_*.py`.

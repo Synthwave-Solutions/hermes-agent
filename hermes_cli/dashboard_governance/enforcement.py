@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Mapping, cast
 
 from fastapi import Request
@@ -132,9 +134,11 @@ def _audit_governance_decision(request: Request, access: EffectiveAccess, reason
             mode=access.mode,
             report_only=report_only,
         )
-    except Exception:
+    except Exception as _boundary_error:
         # Authorization must not become unavailable because the audit sink is
         # temporarily unwritable. The denial still happens in enforce mode.
+        logging.getLogger(__name__).error("_audit_governance_decision: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return
 
 

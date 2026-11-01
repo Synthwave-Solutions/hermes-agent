@@ -3,8 +3,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.dashboard_governance.context import DashboardGovernanceContext, governance_context
 from hermes_cli.dashboard_governance.loader import load_governance_policy
 from hermes_cli.dashboard_governance.models import GovernanceSubject

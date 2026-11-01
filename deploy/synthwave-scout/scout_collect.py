@@ -28,6 +28,8 @@ The only write is the Scout's own ledger (``<HERMES_HOME>/scout/seen.db`` or
 
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 import re
@@ -37,15 +39,15 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import scout_ledger  # noqa: E402
+import scout_ledger
 
 WAKE_FALSE = json.dumps({"wakeAgent": False})
 MAX_ITEMS = 40
-MAX_CHARS = int(os.environ.get("SCOUT_MAX_CHARS", "6000"))
+MAX_CHARS = 6000
 SUMMARY_CHARS = 400
 STALE_DAYS = 3
 FIRST_RUN_LOOKBACK_HOURS = 72
-TOPIC_INTERVAL_HOURS = float(os.environ.get("SCOUT_TOPIC_INTERVAL_HOURS", "20"))
+TOPIC_INTERVAL_HOURS = 20.0
 MAX_TOPICS = 8
 RUNTIME_BUDGET_S = 50.0
 OK_STATUSES = {"ok", "success", "silent", "skipped", None, ""}
@@ -77,16 +79,19 @@ def resolve_context() -> dict:
         kanban_db = (Path(khome).expanduser() if khome else root) / "kanban.db"
     return {"home": home, "profile": profile, "root": root, "kanban_db": kanban_db,
             "ledger": scout_ledger.ledger_path(home),
-            "self_job": os.environ.get("HERMES_CRON_JOB_ID", "").strip()}
+            "self_job": os.environ.get("HERMES_CRON_JOB_ID", "").strip()}  # health: allow HX002 -- server-owned current-job identifier excludes the running collector from its own feed; not a user setting
 
 
 # --- profile metadata ----------------------------------------------------------------------
 
 def _load_yaml(text: str):
     try:
-        import yaml  # the engine's interpreter ships PyYAML
+        import hermes_yaml as yaml
     except ImportError:
-        return _mini_yaml(text)
+        try:
+            import yaml  # Standalone installations and older engines.
+        except ImportError:
+            return _mini_yaml(text)
     return yaml.safe_load(text)
 
 
@@ -177,7 +182,7 @@ def load_meta(home: Path) -> dict:
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _BOX = re.compile(r"[─-╿▀-▟⠀-⣿]")
-_INVISIBLE = re.compile(r"[​-‏‪-‮⁠-⁤﻿\x00-\x08\x0b-\x1f\x7f]")
+_INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff\x00-\x08\x0b-\x1f\x7f]")
 # Copied from synthwave-policy (policy_engine._SECRET_PATTERNS) plus AWS access keys and Telegram
 # bot tokens. Kept in this repo on purpose: the Scout script must run without the plugin.
 _SECRET_PATTERNS = [
@@ -241,7 +246,7 @@ _NOISE_LINE = re.compile(
 def summarize_output(text: str) -> tuple[str, str]:
     """``(status, summary)`` from a cron output markdown document."""
     status = ""
-    m = re.search(r"^\*\*Status:\*\*\s*(.+)$", text, re.M)
+    m = re.search(r"^\*\*Status:\*\*\s*(.+)$", text, re.MULTILINE)
     if m:
         status = m.group(1).strip()
     body = text.rpartition("## Response")[2] if "## Response" in text else text
@@ -249,7 +254,7 @@ def summarize_output(text: str) -> tuple[str, str]:
     return status, clean(" ".join(kept), SUMMARY_CHARS)
 
 
-def iso(ts: float | int | None) -> str:
+def iso(ts: float | None) -> str:
     if not ts:
         return ""
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
@@ -260,7 +265,7 @@ def _parse_iso(value) -> float | None:
         return None
     try:
         from datetime import datetime
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(str(value)).timestamp()
     except ValueError:
         return None
 
@@ -461,10 +466,10 @@ def collect_kanban(ctx: dict, now: float) -> list[dict]:
 
 # --- ledger feedback from the previous Scout answer ---------------------------------------------
 
-LEDGER_LINE = re.compile(r"^[ \t>*`_-]{0,6}SCOUT-LEDGER:[ \t]*(?P<body>[^\n]{0,4000})", re.M)
+LEDGER_LINE = re.compile(r"^[ \t>*`_-]{0,6}SCOUT-LEDGER:[ \t]*(?P<body>[^\n]{0,4000})", re.MULTILINE)
 LEDGER_ENTRY = re.compile(r"^(?P<hash>[0-9a-f]{8,12})=(?P<status>ignored|saved|attached|notified)$")
 WEB_LINE = re.compile(r"^[ \t>*`_-]{0,6}SCOUT-WEB:[ \t]*(?P<url>https?://[^\s|]{1,2000})[ \t]*\|[ \t]*"
-                      r"(?P<title>[^|\n]{0,300}?)[ \t]*(?:\|[ \t]*(?P<status>ignored|saved|notified)[ \t]*)?`?$", re.M)
+                      r"(?P<title>[^|\n]{0,300}?)[ \t]*(?:\|[ \t]*(?P<status>ignored|saved|notified)[ \t]*)?`?$", re.MULTILINE)
 MAX_LEDGER_ENTRIES = 100
 MAX_WEB_LINES = 30
 MAX_FEEDBACK_FILES = 5
@@ -491,10 +496,10 @@ def classify_run_doc(text: str) -> tuple[str, str]:
     ``gate`` (the collector said wakeAgent=false, no agent ran) or ``failed``.
     """
     head = text[:4000]
-    if re.search(r"^# Cron Job: .*\(FAILED\)\s*$", head, re.M) or re.search(
-            r"^\*\*Status:\*\* (script failed|monitor source failed|BLOCKED)", head, re.M):
+    if re.search(r"^# Cron Job: .*\(FAILED\)\s*$", head, re.MULTILINE) or re.search(
+            r"^\*\*Status:\*\* (script failed|monitor source failed|BLOCKED)", head, re.MULTILINE):
         return "failed", ""
-    if re.search(r"^\*\*Status:\*\* (silent|no_change)", head, re.M):
+    if re.search(r"^\*\*Status:\*\* (silent|no_change)", head, re.MULTILINE):
         return "gate", ""
     frames = list(_RESPONSE_FRAME.finditer(text))
     if frames:
@@ -591,7 +596,7 @@ def apply_feedback(ctx: dict, led, now: float) -> list[str]:
 
 def render(meta: dict, ctx: dict, items: list[dict], notes: list[str], topics: list[str],
            budget: int | None = None, known_web: list[tuple[str, str]] | None = None) -> tuple[str, list[dict]]:
-    budget = MAX_CHARS if budget is None else budget
+    budget = int(os.environ.get("SCOUT_MAX_CHARS", MAX_CHARS)) if budget is None else budget
     head = [f"# Scout digest: {meta['title']} (profiel {ctx['profile']})"]
     who = " | ".join(x for x in (meta.get("role"), meta.get("category")) if x)
     if who:
@@ -653,6 +658,8 @@ def run() -> int:
         try:
             notes.extend(apply_feedback(ctx, led, now))
         except Exception as exc:  # feedback must never stop the digest
+            logging.getLogger(__name__).error("run: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
             notes.append(f"ledger-terugkoppeling: niet gelezen ({type(exc).__name__}: {clean(exc, 120)})")
         led.auto_ignore(now=int(now))
         # Job-output watermark: outputs newer than this are candidates. It only advances past
@@ -674,6 +681,8 @@ def run() -> int:
                 if label == "cron-jobs":
                     jobs_ok = time.monotonic() - started <= RUNTIME_BUDGET_S
             except Exception as exc:
+                logging.getLogger(__name__).error("run: operation failed",
+                    exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
                 notes.append(f"{label}: niet gelezen ({type(exc).__name__}: {clean(exc, 120)})")
 
         fresh: list[dict] = []
@@ -696,7 +705,7 @@ def run() -> int:
 
         topics = scout.get("topics") or []
         last_topics = float(led.get_meta("last_topic_sweep") or 0)
-        topics_due = bool(topics) and (now - last_topics) >= TOPIC_INTERVAL_HOURS * 3600
+        topics_due = bool(topics) and (now - last_topics) >= float(os.environ.get("SCOUT_TOPIC_INTERVAL_HOURS", TOPIC_INTERVAL_HOURS)) * 3600
         last_notes_wake = float(led.get_meta("last_notes_wake") or 0)
         notes_due = bool(notes) and (now - last_notes_wake) >= NOTES_WAKE_HOURS * 3600
 

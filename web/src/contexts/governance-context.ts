@@ -1,5 +1,5 @@
 import { createContext } from "react";
-import type { GovernanceEffectiveAccessResponse } from "@/lib/api";
+import type { GovernanceEffectiveAccessResponse } from "@/lib/api-governance";
 
 export interface GovernanceContextValue {
   access: GovernanceEffectiveAccessResponse | null;

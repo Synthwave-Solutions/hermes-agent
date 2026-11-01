@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import gateway.run_profile_config as _run_profile_config
+
 import asyncio
 from unittest.mock import AsyncMock
 
@@ -90,7 +92,7 @@ def test_secondary_profile_does_not_start_the_a2a_listener(monkeypatch, tmp_path
     monkeypatch.setattr(runner, "_create_adapter", fake_create)
     monkeypatch.setattr(runner, "_connect_initial_adapter_with_timeout",
                         AsyncMock(return_value=True))
-    monkeypatch.setattr(gateway_run, "_synthpulse_root_shared_credential", lambda adapter, home: False)
+    monkeypatch.setattr(_run_profile_config, "_synthpulse_root_shared_credential", lambda adapter, home: False)
 
     connected = asyncio.run(runner._start_one_profile_adapters("sales", tmp_path, {}))
 

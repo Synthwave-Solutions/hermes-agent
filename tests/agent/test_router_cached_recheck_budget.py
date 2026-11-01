@@ -64,7 +64,7 @@ def test_real_slow_get_retains_window_promptly_then_recovers(isolated, monkeypat
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     worker = threading.Thread(target=server.serve_forever)
     worker.start()
-    url = "http://127.0.0.1:%s/v1" % server.server_port
+    url = f"http://127.0.0.1:{server.server_port}/v1"
     send = httpx.Client.send
     def only_fixture(client, request, **kwargs):
         assert request.url.host == "127.0.0.1" and request.url.port == server.server_port

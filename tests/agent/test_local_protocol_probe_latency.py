@@ -24,6 +24,7 @@ def probes(monkeypatch):
     def install(*, first="read_timeout", winner=None, earlier_connect_timeout=False, speculative_stall=None):
         state = {"paths": [], "active": 0, "maximum": 0, "threads": set(), "cancelled": 0, "closed_streams": 0}
         lock = threading.Lock()
+        all_started = asyncio.Event()
 
         def handle(request):
             path = request.url.path
@@ -35,7 +36,6 @@ def probes(monkeypatch):
                 state["threads"].add(threading.current_thread().name)
             if path == "/api/v1/models":
                 if first == "read_timeout":
-                    time.sleep(0.02)
                     raise httpx.ReadTimeout("synthetic optional endpoint timeout", request=request)
                 if first == "connect_timeout":
                     raise httpx.ConnectTimeout("synthetic endpoint unreachable", request=request)
@@ -45,7 +45,6 @@ def probes(monkeypatch):
                     state["active"] += 1
                     state["maximum"] = max(state["maximum"], state["active"])
                 try:
-                    time.sleep(0.08 if path == "/api/tags" else 0.05)
                     if earlier_connect_timeout and path == "/api/tags":
                         raise httpx.ConnectTimeout("synthetic first-priority connection failure", request=request)
                     if winner is not None:
@@ -71,9 +70,8 @@ def probes(monkeypatch):
         class Drip(httpx.AsyncByteStream):
             async def __aiter__(self):
                 try:
-                    while True:
-                        await asyncio.sleep(0.005)
-                        yield b" "
+                    yield b" "
+                    await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     state["cancelled"] += 1
                     raise
@@ -91,7 +89,12 @@ def probes(monkeypatch):
                 state["active"] += 1
                 state["maximum"] = max(state["maximum"], state["active"])
             try:
-                if speculative_stall and path != "/api/tags":
+                if state["active"] == 3:
+                    all_started.set()
+                await all_started.wait()
+                if speculative_stall == "needed" and path == "/api/tags":
+                    await asyncio.Event().wait()
+                if speculative_stall in {"headers", "body"} and path != "/api/tags":
                     if speculative_stall == "headers":
                         try:
                             await asyncio.Event().wait()
@@ -99,7 +102,7 @@ def probes(monkeypatch):
                             state["cancelled"] += 1
                             raise
                     return httpx.Response(200, stream=Drip())
-                await asyncio.sleep(0.08 if path == "/api/tags" else 0.05)
+                await asyncio.sleep(0)
                 if earlier_connect_timeout and path == "/api/tags":
                     raise httpx.ConnectTimeout("synthetic first-priority connection failure", request=request)
                 if winner is not None:
@@ -182,8 +185,8 @@ def test_lower_priority_trickle_is_cancelled_before_join(probes, stall, connect_
 
 
 def test_incomplete_needed_probe_falls_back_to_original_native_allocation(probes, monkeypatch):
-    monkeypatch.setattr(metadata, "_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS", 0.01)
-    state = probes(winner="all")
+    monkeypatch.setattr(metadata, "_SPECULATIVE_PROTOCOL_DEADLINE_SECONDS", 2.0)
+    state = probes(winner="all", speculative_stall="needed")
     metadata.save_context_length(MODEL, URL, 65536)
     assert metadata.get_model_context_length(MODEL, URL, api_key="fixture-key", provider="custom") == 98304
     assert state["paths"].count("/api/tags") == 2  # speculative, then original serial

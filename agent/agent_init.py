@@ -9,6 +9,10 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 
 from __future__ import annotations
 
+import agent.agent_init_governance as _agent_init_governance
+
+import agent.agent_init_provider_routes as _agent_init_provider_routes
+
 import contextvars
 import functools
 import json
@@ -26,15 +30,18 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
+from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
 from agent.agent_runtime_helpers import _ra
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
-from agent.memory_manager import StreamingContextScrubber
+from agent.memory_context import StreamingContextScrubber
 from agent.memory_provider import is_core_memory_provider
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH, fetch_model_metadata, is_local_endpoint, is_explicit_remote_router,
-    query_ollama_num_ctx
+    MINIMUM_CONTEXT_LENGTH, fetch_model_metadata, is_local_endpoint, is_explicit_remote_router
 )
+from agent.agent_init_ollama import _clamp_compressor_to_ollama_num_ctx, _configure_ollama_num_ctx
+from agent.primary_runtime_snapshot import _snapshot_primary_runtime
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
@@ -87,93 +94,16 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "", say=None) -> 
         say(message)
 
 
-def _provider_default_routes(provider: str) -> set[str]:
-    """Return known exact default routes for a canonical provider id."""
-    routes: set[str] = set()
-
-    def add(value):
-        route = normalize_route_base_url(value)
-        if route:
-            routes.add(route)
-
-    with suppress(Exception):
-        from hermes_cli.providers import HERMES_OVERLAYS, get_provider
-        overlay = HERMES_OVERLAYS.get(provider)
-        provider_def = get_provider(provider, allow_network=False)
-        add(getattr(overlay, "base_url_override", ""))
-        add(getattr(provider_def, "base_url", ""))
-
-    with suppress(Exception):
-        from providers import get_provider_profile
-        add(getattr(get_provider_profile(provider), "base_url", ""))
-
-    with suppress(Exception):
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        from hermes_cli.models import normalize_provider as normalize_model_provider
-        from hermes_cli.providers import normalize_provider as normalize_registry_provider
-        for provider_id, config in PROVIDER_REGISTRY.items():
-            if normalize_registry_provider(normalize_model_provider(provider_id)) == provider:
-                add(getattr(config, "inference_base_url", ""))
-
-    if provider == "gemini":
-        routes.update(f"{route.rstrip('/')}/openai" for route in list(routes))
-    return routes
 
 
-def _context_route_mismatch(
-    configured_base_url: Any, active_base_url: Any, configured_provider: Any, active_provider: Any,
-    *, already_normalized: bool = False,
-) -> bool:
-    """Return whether a context pin's configured route differs from runtime."""
-    _norm = (lambda v: str(v or "")) if already_normalized else normalize_route_base_url
-    configured_route, active_route = _norm(configured_base_url), _norm(active_base_url)
-    if configured_route:
-        return configured_route != active_route
-
-    configured_provider = str(configured_provider or "").strip()
-    active_provider = str(active_provider or "").strip()
-    if not configured_provider:
-        return False
-    try:
-        from hermes_cli.models import normalize_provider as normalize_model_provider
-        configured_provider = normalize_model_provider(configured_provider)
-        active_provider = normalize_model_provider(active_provider)
-    except Exception:
-        configured_provider = configured_provider.lower()
-        active_provider = active_provider.lower()
-    with suppress(Exception):
-        from hermes_cli.providers import normalize_provider as normalize_registry_provider
-        configured_provider = normalize_registry_provider(configured_provider)
-        active_provider = normalize_registry_provider(active_provider)
-
-    if active_route:
-        configured_routes = _provider_default_routes(configured_provider)
-        if configured_routes:
-            return active_route not in configured_routes
-        # Named/custom providers have no catalog default routes: an empty configured URL
-        # with a matching provider identity is the same route (gateway display paths
-        # compare the raw empty model.base_url and must not drop model.context_length).
-        return not (active_provider and configured_provider == active_provider)
-    return bool(
-        configured_provider and active_provider and configured_provider != active_provider
-    )
 
 
-def _normalize_custom_provider_name(value: Any) -> str:
-    """Mirror runtime normalization for a requested custom-provider identity."""
-    return str(value or "").strip().lower().replace(" ", "-")
 
 
-def _custom_provider_runtime_ids(value: Any) -> set[str]:
-    """Return raw/menu identities that runtime accepts for a configured name."""
-    normalized = _normalize_custom_provider_name(value)
-    if not normalized:
-        return set()
-    return {normalized, f"custom:{normalized}"}
 
 
 def _build_codex_gpt5_autoraise_notice(
-    autoraise: Dict[str, Any], context_length: Optional[int] = None
+    autoraise: dict[str, Any], context_length: Optional[int] = None
 ) -> str:
     """One-time notice when Codex gpt-5.x raises compaction (``autoraise``: model/from/to).
 
@@ -187,8 +117,8 @@ def _build_codex_gpt5_autoraise_notice(
     else:
         # Static fallback: codex-spark is natively 128K; gpt-5.4/5.5/5.6 are capped at 272K.
         cap = "128K" if model.startswith("gpt-5.3-codex-spark") else "272K"
-    from_pct = int(round(autoraise["from"] * 100))
-    to_pct = int(round(autoraise["to"] * 100))
+    from_pct = round(autoraise["from"] * 100)
+    to_pct = round(autoraise["to"] * 100)
     return (
         f"ℹ Codex {model} caps context at {cap}, so auto-compaction was raised "
         f"to {to_pct}% (from {from_pct}%) to use more of the window before "
@@ -200,7 +130,7 @@ def _build_codex_gpt5_autoraise_notice(
 def _resolve_compression_threshold(
     global_threshold: float, model_cthresh: Optional[float], *, model: Optional[str] = None,
     is_codex_autoraise: bool,
-) -> tuple[float, Optional[Dict[str, Any]]]:
+) -> tuple[float, Optional[dict[str, Any]]]:
     """Global compaction threshold merged with a per-model override.
 
     Returns ``(threshold, autoraise_notice)``; the notice is set only when a Codex autoraise
@@ -221,19 +151,19 @@ def _codex_gpt55_autoraise_notice_marker():
     return get_hermes_home() / ".codex_gpt55_autoraise_notice"
 
 
-def _codex_gpt55_autoraise_notice_state(autoraise: Dict[str, Any]) -> str:
+def _codex_gpt55_autoraise_notice_state(autoraise: dict[str, Any]) -> str:
     """Notice identity keyed on what it displays (model + from→to percentages).
 
     An unchanged threshold stays silent across restarts; a changed global threshold or a
     different autoraised Codex model re-notifies once.
     """
     model = str(autoraise.get("model") or "").strip().lower().rsplit("/", 1)[-1]
-    from_pct = int(round(float(autoraise["from"]) * 100))
-    to_pct = int(round(float(autoraise["to"]) * 100))
+    from_pct = round(float(autoraise["from"]) * 100)
+    to_pct = round(float(autoraise["to"]) * 100)
     return f"{model}:{from_pct}:{to_pct}"
 
 
-def _codex_gpt55_autoraise_notice_seen(autoraise: Dict[str, Any]) -> bool:
+def _codex_gpt55_autoraise_notice_seen(autoraise: dict[str, Any]) -> bool:
     """True if this exact notice was already shown for this profile (unreadable = unseen)."""
     try:
         current = _codex_gpt55_autoraise_notice_state(autoraise)
@@ -244,7 +174,7 @@ def _codex_gpt55_autoraise_notice_seen(autoraise: Dict[str, Any]) -> bool:
         return False
 
 
-def _record_codex_gpt55_autoraise_notice(autoraise: Dict[str, Any]) -> None:
+def _record_codex_gpt55_autoraise_notice(autoraise: dict[str, Any]) -> None:
     """Persist that the notice was shown. Best-effort: a failure only re-shows it later."""
     with suppress(OSError, KeyError, TypeError, ValueError):
         marker = _codex_gpt55_autoraise_notice_marker()
@@ -252,73 +182,12 @@ def _record_codex_gpt55_autoraise_notice(autoraise: Dict[str, Any]) -> None:
         marker.write_text(_codex_gpt55_autoraise_notice_state(autoraise), encoding="utf-8")
 
 
-def _normalized_custom_base_url(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip().rstrip("/")
 
 
-def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
-    agent_model_norm = str(agent_model or "").strip().lower()
-    # Multi-model entries (`providers.<name>.models` mapping / legacy `models:` list):
-    # matching ANY catalog entry counts, else a provider whose `model` differs from the
-    # session model drops its extra_body (e.g. OpenAI service_tier) → wrong billing tier.
-    models = entry.get("models")
-    catalog = [str(m).strip().lower() for m in models] if isinstance(models, (dict, list, tuple)) else []
-    if catalog and agent_model_norm in catalog:
-        return True
-    provider_model = str(entry.get("model", "") or "").strip().lower()
-    return (not provider_model and not catalog) or provider_model == agent_model_norm
 
 
-def _custom_provider_extra_body_for_agent(
-    *, provider: str, model: str, base_url: str, custom_providers: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    provider_norm = (provider or "").strip().lower()
-    if provider_norm != "custom" and not provider_norm.startswith("custom:"):
-        return None
-    provider_key_filter = provider_norm.partition(":")[2].strip()
-    target_url = _normalized_custom_base_url(base_url)
-    if not target_url:
-        return None
-
-    fallback: Optional[Dict[str, Any]] = None
-    for entry in custom_providers or []:
-        if not isinstance(entry, dict):
-            continue
-        entry_keys = {
-            str(entry.get("provider_key", "") or "").strip().lower(),
-            str(entry.get("name", "") or "").strip().lower(),
-        }
-        if provider_key_filter and provider_key_filter not in entry_keys:
-            continue
-        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
-            continue
-        extra_body = entry.get("extra_body")
-        if not isinstance(extra_body, dict) or not extra_body:
-            continue
-        if str(entry.get("model", "") or "").strip():
-            if _custom_provider_model_matches(model, entry):
-                return dict(extra_body)
-        elif fallback is None:
-            fallback = dict(extra_body)
-    return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
-    extra_body = _custom_provider_extra_body_for_agent(
-        provider=agent.provider, model=agent.model, base_url=agent.base_url,
-        custom_providers=custom_providers,
-    )
-    if not extra_body:
-        return
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
-    agent.request_overrides = overrides
 
 
 def _normalize_run_budget_seconds(value) -> Optional[float]:
@@ -364,25 +233,6 @@ def _parse_config_int(raw: Any, default: int) -> int:
         return default
 
 
-def _enforce_dashboard_governance_model_policy(agent) -> None:
-    try:
-        from hermes_cli.dashboard_governance.context import current_governance_context
-        from hermes_cli.dashboard_governance.model_policy import model_allowed_for_context
-
-        ctx = current_governance_context()
-        if ctx is None:
-            return
-        decision = model_allowed_for_context(ctx, provider=agent.provider, model=agent.model)
-    except Exception as exc:
-        try:
-            ctx = current_governance_context()  # type: ignore[name-defined]
-            if ctx is not None and (getattr(ctx.access, "mode", "off") == "enforce" or getattr(ctx, "continuation_contexts", ()) or getattr(ctx, "workspace_path", "")):
-                raise PermissionError("dashboard governance denied model: governance_model_policy_error") from exc
-        except NameError:
-            pass
-        return
-    if not decision.allowed:
-        raise PermissionError(f"dashboard governance denied model: {decision.reason}")
 
 
 _CONSTRUCTOR_PHASES = frozenset({
@@ -437,17 +287,19 @@ def _trace_constructor(function):
                     logger.info("agent_init_timing %s", json.dumps({
                         "session_id": sid, "outcome": outcome, "phases": trace["phases"],
                     }, separators=(",", ":"), allow_nan=False))
-                except Exception:
-                    pass  # Optional observation must never mask construction/cancellation.
+                except Exception as _boundary_error:
+                    logging.getLogger(__name__).error("_trace_constructor.wrapped: operation failed",
+                        exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
+                    # Optional observation must never mask construction/cancellation.
     return wrapped
 
 
-def _cfg_flag(cfg: Dict[str, Any], key: str, default: bool) -> bool:
+def _cfg_flag(cfg: dict[str, Any], key: str, default: bool) -> bool:
     """Legacy string-set truthiness used by the ``compression`` section."""
     return str(cfg.get(key, default)).lower() in {"true", "1", "yes"}
 
 
-def _cfg_dict(cfg: Dict[str, Any], key: str) -> Dict[str, Any]:
+def _cfg_dict(cfg: dict[str, Any], key: str) -> dict[str, Any]:
     """``cfg[key]`` if it is a mapping, else ``{}`` (malformed sections are ignored)."""
     section = cfg.get(key, {})
     return section if isinstance(section, dict) else {}
@@ -558,7 +410,7 @@ def _finalize_routing(agent, api_mode, credential_pool):
     from hermes_cli.anon_auth import pin_model_for_route
     agent.model = pin_model_for_route(agent.provider, agent.base_url, agent.model)
     # SYNTHWAVE fork: dashboard governance gates the resolved provider/model before any client exists.
-    _enforce_dashboard_governance_model_policy(agent)
+    _agent_init_governance._enforce_dashboard_governance_model_policy(agent)
 
     # Auto-upgrade to Responses for GPT-5.x-style models and direct OpenAI URLs, unless
     # api_mode was explicit, the runtime is ACP (`acp://` clients route themselves, no
@@ -602,14 +454,14 @@ def _finalize_routing(agent, api_mode, credential_pool):
         ).start()
 
 
-def _set_defaults(agent, table: Dict[str, Any]) -> None:
+def _set_defaults(agent, table: dict[str, Any]) -> None:
     """Assign each ``name -> value`` on ``agent``; callables are factories (fresh per agent)."""
     for name, value in table.items():
         setattr(agent, name, value() if callable(value) else value)
 
 
 # Control-flow state (interrupts / steer / redirect / delegation / background review).
-_CONTROL_STATE: Dict[str, Any] = {
+_CONTROL_STATE: dict[str, Any] = {
     "_executing_tools": False,  # lets _vprint print while tools run with stream consumers on
     "_trim_after_tool_batch": False,  # a >=1 MB tool result was committed; trim once the batch unwinds
     "_tool_guardrails": ToolCallGuardrailController,
@@ -648,7 +500,7 @@ _CONTROL_STATE: Dict[str, Any] = {
 }
 
 # Per-turn bookkeeping: budgets, activity tracking, rate-limit/credits telemetry.
-_TURN_STATE: Dict[str, Any] = {
+_TURN_STATE: dict[str, Any] = {
     # Intermediate pressure warnings made models give up early; ordinary conversations
     # remain opt-in. Dispatcher workers receive a bounded completion checkpoint.
     "_iteration_budget_warning_injected": False,
@@ -678,7 +530,7 @@ _TURN_STATE: Dict[str, Any] = {
 }
 
 # Session persistence state.
-_SESSION_STATE: Dict[str, Any] = {
+_SESSION_STATE: dict[str, Any] = {
     "_session_messages": list,
     # Responses encrypted-reasoning replay. The first ``invalid_encrypted_content`` rejection only
     # strips the stale blobs (a rotated sealing key); a second one means the route cannot round-trip
@@ -719,7 +571,7 @@ _SESSION_STATE: Dict[str, Any] = {
 }
 
 # Streaming delivery state.
-_STREAM_STATE: Dict[str, Any] = {
+_STREAM_STATE: dict[str, Any] = {
     "_stream_callback": None,  # streaming TTS; set early so _vprint can reference it
     "_stream_needs_break": False,  # one "\n\n" before the next real text delta after tools
     # Stateful scrubbers: <memory-context> / thinking spans split across deltas defeat
@@ -774,8 +626,8 @@ def _init_prompt_cache_config(agent):
         elif _ttl == AUTO_CACHE_TTL:
             # Decided once per session from its source (a delegated child is clamped to 5m again
             # in delegate_tool regardless).
-            from run_agent import _session_source_for_agent  # late: run_agent imports this module
-            agent._cache_ttl = auto_cache_ttl_for_source(_session_source_for_agent(getattr(agent, "platform", None)))
+            from agent.session_source import session_source_for
+            agent._cache_ttl = auto_cache_ttl_for_source(session_source_for(getattr(agent, "platform", None)))
         elif cache_ttl_means_disabled(_ttl):
             agent._use_prompt_caching = False
             agent._use_native_cache_layout = False
@@ -810,11 +662,11 @@ def _setup_logging(agent):
 
 
 def _print_key_banner(key, label: str, warn_missing: bool = False) -> None:
-    """Masked credential line. ``key`` may be a callable Entra ID bearer provider (Azure
-    Foundry) — never invoke or inspect it. Keys ≤ 12 chars (incl. "dummy-key") are not shown."""
-    from agent.azure_identity_adapter import is_token_provider
-    if is_token_provider(key):
-        print("🔑 Using credentials: Microsoft Entra ID")
+    """Masked credential line. A callable ``key`` (Entra ID, Vertex OAuth, key_cmd, ...) is labelled
+    by its tagged source and never invoked. Keys ≤ 12 chars (incl. "dummy-key") are not shown."""
+    from agent.credential_source import credential_label
+    if source_label := credential_label(key):
+        print(f"🔑 Using credentials: {source_label}")
     elif isinstance(key, str) and len(key) > 12:
         print(f"🔑 Using {label}: {key[:8]}...{key[-4:]}")
     elif warn_missing:
@@ -848,7 +700,7 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
         try:
             from hermes_cli.auth import build_minimax_oauth_token_provider
             effective_key = build_minimax_oauth_token_provider()
-        except Exception as _mm_exc:  # noqa: BLE001 — never block startup on this
+        except Exception as _mm_exc:
             logging.getLogger(__name__).warning(
                 "MiniMax OAuth: failed to install per-request token provider "
                 "(%s); falling back to static bearer that will expire ~15min in.",
@@ -896,7 +748,7 @@ def _init_bedrock_client(agent, base_url):
         print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
 
 
-def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict[str, Any]:
+def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict[str, Any]:
     """OpenAI-client kwargs from explicit CLI/gateway credentials (auth already resolved)."""
     _parsed_url = urlparse(base_url)
     client_kwargs = {"api_key": api_key, "base_url": base_url}
@@ -927,7 +779,7 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict
     return client_kwargs
 
 
-def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[Dict[str, Any]]:
+def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[dict[str, Any]]:
     """OpenAI-client kwargs via the centralized provider router (no explicit creds).
 
     Falls through to the init-time fallback chain, then raises with the missing-key /
@@ -981,11 +833,9 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             from agent.moa_loop import bind_moa_runtime
             bind_moa_runtime(agent, _fb["model"])
             return None
-        agent.provider = _fb["provider"]
-        # SYNTHWAVE fork: the fallback's provider wins over a retained requested-provider label
-        # (hermes_cli.timeouts.provider_timeout_id / is_explicit_remote_router).
-        agent.requested_provider = _fb["provider"]
+        agent.provider = agent.requested_provider = _fb["provider"]
         agent.model = _fb_model or _fb["model"]
+        recompute_init_fallback_api_mode(agent, _fb_client)
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
     # so name it even when no fallback entries are configured.
@@ -1038,7 +888,7 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     )
 
 
-def _apply_openai_header_policy(agent, client_kwargs: Dict[str, Any]) -> None:
+def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
     """Mutate ``client_kwargs`` (== ``agent._client_kwargs``) with header/TLS policy, in order:
     OpenRouter Claude beta header → model.default_headers → custom-provider TLS/extra_headers."""
     # Fine-grained tool streaming for Claude on OpenRouter: without the beta header
@@ -1139,7 +989,7 @@ def _lazy_headers(module: str, name: str, pass_key: bool = False, pass_base: boo
 
 # Host → default_headers factory for explicit base_url client construction. Ordered: first
 # host match wins; no match falls back to the provider profile's declared headers.
-_HOST_DEFAULT_HEADERS: List[tuple[str, Callable[[Any, str], Dict[str, str]]]] = [
+_HOST_DEFAULT_HEADERS: list[tuple[str, Callable[[Any, str], dict[str, str]]]] = [
     ("openrouter.ai", _lazy_headers("agent.auxiliary_client", "build_or_headers")),
     ("integrate.api.nvidia.com",
      _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
@@ -1159,7 +1009,7 @@ def _host_default_headers_factory(base_url: str):
     return None
 
 
-def _client_kwargs_from_routed(client, timeout) -> Dict[str, Any]:
+def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
     """OpenAI-client kwargs mirroring a router-resolved client, keeping its provider headers
     (SDK stores them in ``_custom_headers``; older/mocked clients expose ``default_headers``)."""
     kwargs = {"api_key": client.api_key, "base_url": str(client.base_url)}
@@ -1173,38 +1023,6 @@ def _client_kwargs_from_routed(client, timeout) -> Dict[str, Any]:
     if headers:
         kwargs["default_headers"] = dict(headers)
     return kwargs
-
-
-def _fallback_entries(fallback_model) -> List[Dict[str, Any]]:
-    """Normalize legacy single-dict ``fallback_model`` / list ``fallback_providers``."""
-    if isinstance(fallback_model, dict):
-        fallback_model = [fallback_model]
-    if not isinstance(fallback_model, list):
-        return []
-    return [
-        f for f in fallback_model if isinstance(f, dict) and f.get("provider") and f.get("model")
-    ]
-
-
-def _init_fallback_chain(agent, fallback_model):
-    # Stable pool-entry identity: OAuth refreshes can replace the token before a failed
-    # request is recovered, so the key value alone can't attribute the failure.
-    from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-    sync_credential_pool_entry_id(agent)
-
-    # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
-    agent._fallback_chain = _fallback_entries(fallback_model)
-    agent._fallback_index = 0
-    agent._fallback_activated = getattr(agent, "_fallback_activated", False)
-    # Legacy attribute kept for backward compat (tests, external callers)
-    agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
-    chain = agent._fallback_chain
-    if chain and not agent.quiet_mode:
-        labels = [f"{f['model']} ({f['provider']})" for f in chain]
-        if len(chain) == 1:
-            print(f"🔄 Fallback model: {labels[0]}")
-        else:
-            print(f"🔄 Fallback chain ({len(chain)} providers): " + " → ".join(labels))
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
@@ -1229,6 +1047,9 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         agent._tool_snapshot_generation = 0
     _constructor_phase("tool_definitions")
     import model_tools
+    from toolsets import agent_tool_drops, session_disabled_toolsets
+    disabled_toolsets = session_disabled_toolsets(disabled_toolsets, getattr(agent, "platform", None))
+    agent.disabled_toolsets = disabled_toolsets  # so the tool_search bridge and delegate children drop them too
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
@@ -1237,9 +1058,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
     agent.tools = prune_oneshot_tools(agent.tools or [])
-    from tools.connectors.turn import side_agent_tool_drops
-    drops = side_agent_tool_drops(agent)
-    if drops:
+    if drops := agent_tool_drops(agent):
         agent.tools = [t for t in agent.tools if t["function"]["name"] not in drops]
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
@@ -1394,14 +1213,14 @@ def _memory_agent_context(agent, platform) -> str:
         return "primary" if getattr(agent, "_gateway_session_key", None) else "background"
     source = ""
     with suppress(Exception):
-        from run_agent import _session_source_for_agent  # late: run_agent imports this module
-        source = _session_source_for_agent(platform)
+        from agent.session_source import session_source_for
+        source = session_source_for(platform)
     if source == "oneshot":
         return "background"
     return "primary"
 
 
-def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
+def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
     """Scoping kwargs for ``MemoryManager.initialize_all`` (status_callback is CLI-only:
     gateway status travels a different path and the indicator no-ops without it)."""
     kwargs = {
@@ -1447,6 +1266,11 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    from agent.safe_worker_policy import safe_worker_enabled
+
+    if safe_worker_enabled():
+        agent._memory_manager = None
+        return
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
     # built-in store so the memory tool never sees store=None.
     # Flush/background agents can still pass enabled_toolsets=["memory"] so the built-in file store exists
@@ -1516,8 +1340,8 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                         _unavailable_reason = _mp.unavailable_reason()
                     _warn_memory_provider_unavailable(
                         _mem_provider_name, _unavailable_reason, say=agent._emit_startup_warning)
-                if agent._memory_manager.providers:
-                    agent._memory_manager.initialize_all(**_memory_provider_init_kwargs(agent, platform))
+                if agent._memory_manager.providers and agent._memory_manager.initialize_for_agent(
+                        say=agent._emit_startup_warning, **_memory_provider_init_kwargs(agent, platform)):
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
@@ -1526,7 +1350,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    from agent.memory_manager import inject_memory_provider_tools
+    from agent.memory_manager_tools import inject_memory_provider_tools
     inject_memory_provider_tools(agent)
 
 
@@ -1613,7 +1437,7 @@ def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
-def _compression_threshold(agent, cfg: Dict[str, Any]) -> tuple[float, bool]:
+def _compression_threshold(agent, cfg: dict[str, Any]) -> tuple[float, bool]:
     """Global threshold merged with the per-model override; stashes the autoraise notice.
     Codex gpt-5.4/5.5 raise to 85% (272K cap → 50% would compact at ~136K); the opt-out flag
     restores the global value, and the notice has its own display gate."""
@@ -1644,7 +1468,7 @@ def _compression_threshold(agent, cfg: Dict[str, Any]) -> tuple[float, bool]:
     return threshold, notice_enabled
 
 
-def _compression_codex_settings(cfg: Dict[str, Any]) -> tuple[str, bool, Optional[int]]:
+def _compression_codex_settings(cfg: dict[str, Any]) -> tuple[str, bool, Optional[int]]:
     """``codex_app_server_auto`` / ``codex_responses_native`` / ``codex_responses_compact_threshold``."""
     app_server_auto = str(cfg.get("codex_app_server_auto", "native") or "native").lower()
     if app_server_auto not in {"native", "hermes", "off"}:
@@ -1787,7 +1611,7 @@ def _custom_provider_configured_base_url(
     ``custom_providers``), normalized for route comparison; "" if unknown.
     Disabled ``providers.*`` entries also mask their ``custom_providers`` twin.
     """
-    _wanted = _normalize_custom_provider_name(_configured_provider)
+    _wanted = _agent_init_provider_routes._normalize_custom_provider_name(_configured_provider)
     _user_providers = _agent_cfg.get("providers")
     _disabled_ids: set[str] = set()
     if isinstance(_user_providers, dict):
@@ -1795,7 +1619,7 @@ def _custom_provider_configured_base_url(
         for _key, _entry in _user_providers.items():
             if not isinstance(_entry, dict):
                 continue
-            _ids = _custom_provider_runtime_ids(_key) | _custom_provider_runtime_ids(_entry.get("name"))
+            _ids = _agent_init_provider_routes._custom_provider_runtime_ids(_key) | _agent_init_provider_routes._custom_provider_runtime_ids(_entry.get("name"))
             if not is_provider_enabled(_entry):
                 _disabled_ids.update(_ids)
                 continue
@@ -1808,10 +1632,10 @@ def _custom_provider_configured_base_url(
     for _entry in _custom_providers:
         if not isinstance(_entry, dict):
             continue
-        _key_ids = _custom_provider_runtime_ids(_entry.get("provider_key"))
+        _key_ids = _agent_init_provider_routes._custom_provider_runtime_ids(_entry.get("provider_key"))
         if _key_ids & _disabled_ids:
             continue
-        if _wanted in _key_ids | _custom_provider_runtime_ids(_entry.get("name")):
+        if _wanted in _key_ids | _agent_init_provider_routes._custom_provider_runtime_ids(_entry.get("name")):
             _url = normalize_route_base_url(_entry.get("base_url"))
             if _url:
                 return _url
@@ -1829,7 +1653,7 @@ def _configured_default_base_url(_agent_cfg, _model_cfg, _custom_providers) -> s
     custom provider's URL when ``model.provider`` is not a first-class/auth provider)."""
     _configured_base_url = normalize_route_base_url(_model_cfg.get("base_url"))
     _configured_provider = str(_model_cfg.get("provider") or "").strip()
-    _norm = _normalize_custom_provider_name(_configured_provider)
+    _norm = _agent_init_provider_routes._normalize_custom_provider_name(_configured_provider)
     _custom_provider_candidate = bool(_norm)
     if _norm in _RUNTIME_FIRST_PROVIDER_IDS:
         _custom_provider_candidate = False
@@ -1883,7 +1707,7 @@ def _scope_context_length_to_default_runtime(
             _active_runtime_model = normalize_model_for_provider(agent.model, agent.provider)
     _configured_base_url = _configured_default_base_url(_agent_cfg, _model_cfg, _custom_providers)
     _active_base_url = _active_route_url(agent, base_url)
-    _route_mismatch = _context_route_mismatch(
+    _route_mismatch = _agent_init_provider_routes._context_route_mismatch(
         _configured_base_url, _active_base_url, str(_model_cfg.get("provider") or "").strip(),
         agent.provider, already_normalized=True,
     )
@@ -2024,7 +1848,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 
     # Reused by _check_compression_model_feasibility (aux compression model detection).
     agent._custom_providers = _custom_providers
-    _merge_custom_provider_extra_body(agent, _custom_providers)
+    _agent_init_provider_routes._merge_custom_provider_extra_body(agent, _custom_providers)
 
     if _config_context_length is None and _custom_providers:
         with suppress(Exception):
@@ -2059,6 +1883,10 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 def _select_context_engine(_agent_cfg):
     """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
     general plugin system → None (built-in ContextCompressor)."""
+    from agent.safe_worker_policy import safe_worker_enabled
+
+    if safe_worker_enabled():
+        return None
     _engine_name = "compressor"
     with suppress(Exception):
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
@@ -2192,7 +2020,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)
     agent.compression_checkpoint_required = cs.checkpoint_required
-    from agent.conversation_compression import _warn_checkpoint_required_without_capable_provider
+    from agent.conversation_compression_checkpoint import _warn_checkpoint_required_without_capable_provider
     _warn_checkpoint_required_without_capable_provider(agent)
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto
     agent.codex_responses_native_compaction = cs.codex_responses_native
@@ -2287,7 +2115,7 @@ def _inject_context_engine_tools(agent):
         _existing_tool_names = {
             t.get("function", {}).get("name") for t in agent.tools if isinstance(t, dict)
         }
-        from agent.memory_manager import normalize_tool_schema
+        from agent.memory_manager_tools import normalize_tool_schema
         for _raw_schema in agent.context_compressor.get_tool_schemas():
             _schema = normalize_tool_schema(_raw_schema)
             if _schema is None:
@@ -2317,68 +2145,6 @@ def _inject_context_engine_tools(agent):
             )
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
-
-
-def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
-    # Ollama defaults num_ctx to 2048, so detect the max window and send num_ctx per request.
-    # model.ollama_num_ctx overrides; model.context_length caps the detected value (VRAM).
-    agent._ollama_num_ctx: int | None = None
-    _override = _model_cfg.get("ollama_num_ctx") if isinstance(_model_cfg, dict) else None
-    if _override is not None:
-        try:
-            agent._ollama_num_ctx = int(_override)
-        except (TypeError, ValueError):
-            _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _override)
-    if (agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url)
-            and not is_explicit_remote_router(agent.provider, agent.requested_provider)):
-        try:
-            # api_key may be a callable (Entra token provider); detection needs a string.
-            _key = agent.api_key if isinstance(agent.api_key, str) else ""
-            _detected = query_ollama_num_ctx(agent.model, agent.base_url, api_key=_key or "")
-            if _detected and _detected > 0:
-                agent._ollama_num_ctx = _detected
-        except Exception as exc:
-            _ra().logger.debug("Local server num_ctx detection failed: %s", exc)
-    # Cap auto-detected num_ctx to the explicit context_length (GGUF metadata can advertise
-    # 256K+ and Ollama would allocate that much VRAM); never override an explicit num_ctx.
-    if (
-        agent._ollama_num_ctx
-        and _config_context_length
-        and _override is None
-        and agent._ollama_num_ctx > _config_context_length
-    ):
-        _ra().logger.info(
-            "Ollama num_ctx capped: %d -> %d (model.context_length override)",
-            agent._ollama_num_ctx, _config_context_length,
-        )
-        agent._ollama_num_ctx = _config_context_length
-    if agent._ollama_num_ctx and not agent.quiet_mode:
-        # Name the real source: a config override is honoured on any local server, /api/show is Ollama-only.
-        _ra().logger.info(
-            "Local server num_ctx: will request %d tokens (%s)",
-            agent._ollama_num_ctx,
-            "model.ollama_num_ctx" if _override is not None else "model max from Ollama /api/show",
-        )
-
-
-def _clamp_compressor_to_ollama_num_ctx(agent):
-    # Recalibrate the compressor to the served window: every request runs at num_ctx, so a
-    # trigger derived from the probed model window could sit above it and never fire.
-    # A config that sets only model.ollama_num_ctx (without model.context_length) previously left the
-    # compressor targeting the probed window while the server truncated/rejected at num_ctx — the compaction
-    # trigger could sit several times ABOVE the real served window and never fire. Clamp the compressor's
-    # window to the effective num_ctx so threshold math operates on the context the server actually serves.
-    # (Overlaps #60103's silent-clamp dead zone; this is the init-order half.)
-    _cc_window = getattr(agent.context_compressor, "context_length", 0) or 0
-    if agent._ollama_num_ctx and agent._ollama_num_ctx > 0 and _cc_window and agent._ollama_num_ctx < _cc_window:
-        _ra().logger.info(
-            "Compressor window clamped to Ollama num_ctx: %d -> %d",
-            _cc_window, agent._ollama_num_ctx,
-        )
-        agent.context_compressor.update_model(
-            model=agent.model, context_length=agent._ollama_num_ctx, base_url=agent.base_url,
-            api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
-        )
 
 
 def _emit_compression_summary(agent, cs):
@@ -2425,38 +2191,6 @@ def _emit_compression_summary(agent, cs):
     agent._compression_feasibility_checked = False
 
 
-def _snapshot_primary_runtime(agent):
-    # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
-    # preferred model gets a fresh attempt.
-    _cc = agent.context_compressor
-    agent._primary_runtime = {
-        "model": agent.model,
-        "provider": agent.provider,
-        "requested_provider": agent.requested_provider,
-        "base_url": agent.base_url,
-        "api_mode": agent.api_mode,
-        "api_key": getattr(agent, "api_key", ""),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
-        "client_kwargs": dict(agent._client_kwargs),
-        "use_prompt_caching": agent._use_prompt_caching,
-        "use_native_cache_layout": agent._use_native_cache_layout,
-        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
-        # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
-        "compressor_model": getattr(_cc, "model", agent.model),
-        "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
-        "compressor_api_key": getattr(_cc, "api_key", ""),
-        "compressor_provider": getattr(_cc, "provider", agent.provider),
-        "compressor_context_length": _cc.context_length,
-        "compressor_threshold_tokens": _cc.threshold_tokens,
-    }
-    if agent.api_mode == "anthropic_messages":
-        agent._primary_runtime.update({
-            "anthropic_api_key": agent._anthropic_api_key,
-            "anthropic_base_url": agent._anthropic_base_url,
-            "is_anthropic_oauth": agent._is_anthropic_oauth,
-        })
-
-
 def _init_usage_state(agent):
     from agent.runtime_cwd import scope_terminal_cwd
     # Prefer the session's explicitly adopted workspace (a Desktop session created under the
@@ -2469,7 +2203,7 @@ def _init_usage_state(agent):
 
 
 # Per-session usage accounting.
-_USAGE_STATE: Dict[str, Any] = {
+_USAGE_STATE: dict[str, Any] = {
     "_user_turn_count": 0,
     "_is_user_initiated_turn": False,  # Copilot x-initiator: first call of a user turn = "user"
     # Usage anchors (agent/usage_anchor.py): last response's exact usage + transcript
@@ -2495,77 +2229,55 @@ _USAGE_STATE: Dict[str, Any] = {
     "_api_output_history": lambda: deque(maxlen=10),
 }
 
-# Constructor params stored verbatim under the same name.
-_PASSTHROUGH_PARAMS = (
-    "model", "max_iterations", "save_trajectories", "verbose_logging", "quiet_mode",
-    "tool_progress_mode", "ephemeral_system_prompt", "platform", "skip_context_files",
-    "load_soul_identity", "pass_session_id", "log_prefix_chars",
-    # OpenRouter provider preferences
-    "providers_allowed", "providers_ignored", "providers_order", "provider_sort",
-    "provider_require_parameters", "provider_data_collection", "openrouter_min_coding_score",
-    # Toolset filtering
-    "enabled_toolsets", "disabled_toolsets",
-    # Model response configuration (None = provider/model default)
-    "max_tokens", "reasoning_config", "service_tier",
-    "side_agent",
-)
-# Gateway identity params stored as ``agent._<name>``. gateway_session_key is the stable
-# per-chat key (e.g. agent:main:telegram:dm:123).
-_GATEWAY_IDENTITY_PARAMS = (
-    "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
-    "gateway_session_key",
-)
-_CALLBACK_PARAMS = (
-    "tool_progress_callback", "tool_start_callback", "tool_complete_callback",
-    "tool_result_metadata_callback",
-    "thinking_callback", "reasoning_callback", "clarify_callback",
-    "read_terminal_callback", "read_preview_callback", "drive_preview_callback",
-    "read_window_below_callback", "connection_callback", "tour_callback",
-    "step_callback", "stream_delta_callback", "interim_assistant_callback",
-    "status_callback", "notice_callback", "notice_clear_callback",
-    "event_callback", "reaction_callback", "tool_gen_callback",
-)
-
 
 @_trace_constructor
 def init_agent(
-    agent, base_url: str = None, api_key: str = None, provider: str = None, api_mode: str = None,
-    acp_command: str = None, acp_args: list[str] | None = None, command: str = None,
+    agent, base_url: str | None = None, api_key: str | None = None, provider: str | None = None, api_mode: str | None = None,
+    acp_command: str | None = None, acp_args: list[str] | None = None, command: str | None = None,
     args: list[str] | None = None, model: str = "", max_iterations: int = sys.maxsize,
-    enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
+    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None,
     save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
-    tool_progress_mode: str = "all", ephemeral_system_prompt: str = None,
-    log_prefix_chars: int = 100, log_prefix: str = "", providers_allowed: List[str] = None,
-    providers_ignored: List[str] = None, providers_order: List[str] = None,
-    provider_sort: str = None, provider_require_parameters: bool = False,
-    provider_data_collection: str = None, openrouter_min_coding_score: Optional[float] = None,
-    session_id: str = None, tool_progress_callback: callable = None,
-    tool_start_callback: callable = None, tool_complete_callback: callable = None,
-    thinking_callback: callable = None, reasoning_callback: callable = None,
-    clarify_callback: callable = None, read_terminal_callback: callable = None,
-    read_preview_callback: callable = None, drive_preview_callback: callable = None,
-    read_window_below_callback: callable = None, connection_callback: callable = None,
-    tour_callback: callable = None, step_callback: callable = None,
-    stream_delta_callback: callable = None, interim_assistant_callback: callable = None,
-    tool_gen_callback: callable = None, status_callback: callable = None,
-    notice_callback: callable = None, notice_clear_callback: callable = None,
+    tool_progress_mode: str = "all", ephemeral_system_prompt: str | None = None,
+    log_prefix_chars: int = 100, log_prefix: str = "", providers_allowed: list[str] | None = None,
+    providers_ignored: list[str] | None = None, providers_order: list[str] | None = None,
+    provider_sort: str | None = None, provider_require_parameters: bool = False,
+    provider_data_collection: str | None = None, openrouter_min_coding_score: Optional[float] = None,
+    session_id: str | None = None, tool_progress_callback: Callable[..., Any] | None = None,
+    tool_start_callback: Callable[..., Any] | None = None, tool_complete_callback: Callable[..., Any] | None = None,
+    thinking_callback: Callable[..., Any] | None = None, reasoning_callback: Callable[..., Any] | None = None,
+    clarify_callback: Callable[..., Any] | None = None, read_terminal_callback: Callable[..., Any] | None = None,
+    read_preview_callback: Callable[..., Any] | None = None, drive_preview_callback: Callable[..., Any] | None = None,
+    read_window_below_callback: Callable[..., Any] | None = None, connection_callback: Callable[..., Any] | None = None,
+    tour_callback: Callable[..., Any] | None = None, theme_callback: Callable[..., Any] | None = None,
+    setup_beat_callback: Callable[..., Any] | None = None,
+    step_callback: Callable[..., Any] | None = None,
+    stream_delta_callback: Callable[..., Any] | None = None, interim_assistant_callback: Callable[..., Any] | None = None,
+    tool_gen_callback: Callable[..., Any] | None = None, status_callback: Callable[..., Any] | None = None,
+    notice_callback: Callable[..., Any] | None = None, notice_clear_callback: Callable[..., Any] | None = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
-    reaction_callback: Optional[Callable[[str], None]] = None, max_tokens: int = None,
-    reasoning_config: Dict[str, Any] = None, service_tier: str = None,
-    request_overrides: Dict[str, Any] = None, prefill_messages: List[Dict[str, Any]] = None,
-    platform: str = None, user_id: str = None, user_id_alt: str = None, user_name: str = None,
-    chat_id: str = None, chat_name: str = None, chat_type: str = None, thread_id: str = None,
-    gateway_session_key: str = None, skip_context_files: bool = False,
+    reaction_callback: Optional[Callable[[str], None]] = None, max_tokens: int | None = None,
+    reasoning_config: dict[str, Any] | None = None, service_tier: str | None = None,
+    request_overrides: dict[str, Any] | None = None, prefill_messages: list[dict[str, Any]] | None = None,
+    platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
+    chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
+    gateway_session_key: str | None = None, skip_context_files: bool = False,
     load_soul_identity: bool = False, skip_memory: bool = False,
-    skip_background_review: bool = False, session_db=None, parent_session_id: str = None,
-    iteration_budget: "IterationBudget" = None, run_budget_seconds: Optional[float] = None,
-    fallback_model: Dict[str, Any] = None, credential_pool=None, checkpoints_enabled: bool = False,
+    skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
+    iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
+    fallback_model: dict[str, Any] | None = None, credential_pool=None, checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
-    requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
+    requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
+    from agent.safe_worker_policy import safe_worker_enabled
+
+    if safe_worker_enabled():
+        skip_context_files = skip_memory = skip_background_review = True
+        load_soul_identity = False
+        prefill_messages = []
+        fallback_model = {}
     _install_safe_stdio()
 
     _params = locals()
@@ -2619,9 +2331,9 @@ def init_agent(
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
-    # Every (provider, model) that rejected image content this session. build_api_request strips
-    # images from requests to those models only, so history keeps them for any model that can see.
+    # Routes that rejected image content / named reasoning keys; build_api_request strips those from wire copies only.
     agent._image_rejecting_models = set()
+    agent._reasoning_rejecting_routes = {}  # (provider, host, model) -> rejected reasoning keys
     # Models whose Anthropic organization answered a fast request with a fast-mode limit of 0;
     # agent.fast_mode stops sending ``speed`` to them for the rest of the session.
     agent._fast_mode_unavailable_models = set()

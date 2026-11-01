@@ -440,7 +440,9 @@ def _run_job_script(
     try:
         from agent.redact import redact_sensitive_text
         return ok, redact_sensitive_text(output, force=True)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_run_job_script: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return ok, "[REDACTED - redaction failed]"
 
 
@@ -540,6 +542,8 @@ def _run_job_script_impl(
             stdout = redact_sensitive_text(stdout, force=True)
             stderr = redact_sensitive_text(stderr, force=True)
         except Exception as e:
+            logging.getLogger(__name__).error("_run_job_script_impl: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(e).__name__), e.__traceback__))
             logger.warning("Failed to redact sensitive text from output: %s", type(e).__name__)
             stdout = stderr = "[REDACTED - redaction failed]"
 
@@ -552,10 +556,14 @@ def _run_job_script_impl(
             return False, "\n".join(parts)
         return True, stdout
     except Exception as exc:
+        logging.getLogger(__name__).error("_run_job_script_impl: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         try:
             from agent.redact import redact_sensitive_text
             return False, redact_sensitive_text(f"Script execution failed: {exc}", force=True)
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("_run_job_script_impl: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             return False, "Script execution failed [details redacted]"
 
 
@@ -620,4 +628,4 @@ def _run_job_script_with_claim_heartbeat(
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
-from cron import scheduler as _sched  # noqa: E402
+from cron import scheduler as _sched

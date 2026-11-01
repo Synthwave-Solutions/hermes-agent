@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from agent import skill_index_focus as focus  # noqa: E402
+from agent import skill_index_focus as focus
 
 
 USAGE_MODE = {"skills": {"index_mode": "usage"}}

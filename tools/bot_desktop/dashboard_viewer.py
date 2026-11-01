@@ -11,6 +11,8 @@ config cannot open the viewer for the whole dashboard.
 
 from __future__ import annotations
 
+import logging
+
 
 def enabled() -> bool:
     """``bot_desktop.dashboard_viewer`` of the process's launch profile; anything but ``True`` is off,
@@ -22,7 +24,9 @@ def enabled() -> bool:
         from hermes_cli.config import load_config_readonly
 
         cfg = load_config_readonly().get("bot_desktop") or {}
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("enabled: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
     finally:
         reset_hermes_home_override(token)

@@ -11,13 +11,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args, **kwargs):
         pass
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(length)
         self.server.paths.append(self.path)

@@ -9,6 +9,10 @@ forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 
 from __future__ import annotations
 
+import agent.chat_completion_watchdogs as _chat_completion_watchdogs
+
+import agent.chat_completion_gateway as _chat_completion_gateway
+
 import contextlib
 import contextvars
 import json
@@ -36,6 +40,8 @@ from agent.error_classifier import (
     _extract_status_code)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
+from agent.chat_completion_local import _streams_llamacpp, stale_giveup
+from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
@@ -46,15 +52,14 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 # misidentify and, without an api_key, return 401 on every leg (issue #89863).
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
-from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, data_use_requirement, stamp_message_timestamp
 from agent.message_sanitization import (
     _sanitize_messages_surrogates, _sanitize_surrogates, _repair_tool_call_arguments,
     normalize_finish_reason as _normalize_finish_reason, sanitize_outbound_kwargs, strip_images_for_rejecting_model,
 )
 from agent.reasoning_summaries import (
-    append_streamed_reasoning_detail, separate_glued_reasoning_blocks,
-    streamed_reasoning_detail_text,
-)
+    append_streamed_reasoning_detail, separate_glued_reasoning_blocks, streamed_reasoning_detail_text)
+from agent.local_prompt_progress import prompt_progress, with_prompt_progress
 from agent.repetition_guard import RunawayStreamWatch, is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.stream_diag import (
@@ -82,68 +87,8 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 _STREAM_5XX_PROBE_WINDOW_S = 60.0
 
 
-def _extract_omniroute_route(http_response) -> tuple[str, str] | None:
-    """Extract the provider and model routed by OmniRoute response headers."""
-    headers = getattr(http_response, "headers", None)
-    if headers is None:
-        return None
-    try:
-        model = headers.get("x-omniroute-model")
-        provider = headers.get("x-omniroute-provider")
-    except Exception:
-        return None
-    if model and provider:
-        return provider, model
-    return None
 
 
-def capture_omniroute_route(agent, response) -> None:
-    """Update context compression for the model actually selected by OmniRoute."""
-    route_info = getattr(agent, "_omniroute_route_info", None)
-    agent._omniroute_route_info = None
-    if route_info:
-        provider, model = route_info
-        resolved_model = f"{provider}/{model}"
-    else:
-        resolved_model = getattr(response, "model", None) if response else None
-    if not resolved_model or resolved_model == agent.model:
-        return
-    # OmniRoute's response header uses the short provider id "cx" for
-    # requests addressed to "codex". This is the same model, not a route
-    # change. Preserve the compressor's already-resolved context window;
-    # probing the unrecognized alias here blocks terminal delivery on HTTP
-    # metadata timeouts after the answer has already streamed to the user.
-    def canonical_route(model):
-        if isinstance(model, str) and model.startswith("cx/"):
-            return "codex/" + model[3:]
-        return model
-
-    compressor = getattr(agent, "context_compressor", None)
-    current_model = getattr(compressor, "model", None)
-    if canonical_route(resolved_model) == canonical_route(current_model):
-        return
-    if getattr(agent, "_effective_routed_model", None) == resolved_model:
-        return
-    from agent.model_metadata import get_model_context_length
-    try:
-        context_length = get_model_context_length(
-            resolved_model, base_url=agent.base_url, api_key=agent.api_key,
-            provider=agent.provider,
-        )
-    except Exception:
-        logger.debug("Failed to resolve context length for routed model %r", resolved_model, exc_info=True)
-        return
-    if context_length is None:
-        logger.debug("No context length resolved for routed model %r", resolved_model)
-        return
-    agent._effective_routed_model = resolved_model
-    agent._effective_context_length = context_length
-    agent.context_compressor.update_model(
-        model=resolved_model, context_length=context_length,
-        base_url=agent.base_url or "", api_key=agent.api_key or "",
-        provider=agent.provider or "", api_mode=agent.api_mode or "",
-        max_tokens=getattr(agent, "max_tokens", None),
-    )
 
 
 def _context_thread_target(callback):
@@ -274,8 +219,7 @@ def _parse_provider_sse_events(text: str) -> list[dict]:
             current["fields"][field.strip().lower()] = ""
             continue
         field = field.strip().lower()
-        if value.startswith(" "):
-            value = value[1:]
+        value = value.removeprefix(" ")
         if field == "event":
             current["event"] = value.strip()
         elif field == "data":
@@ -443,7 +387,7 @@ def _provider_stream_error_from_text(text: str, finish_reason: Optional[str], *,
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
 
 
-def _image_part_chars(part: Dict[str, Any], image_cost: int) -> int:
+def _image_part_chars(part: dict[str, Any], image_cost: int) -> int:
     """Char-equivalent of one image content part: the per-image cost learned from provider usage
     (x4 chars/token), never the base64 payload length. A single native screenshot priced as text
     read as ~100K+ tokens and selected the giant-conversation watchdog tiers (#63871, #76411)."""
@@ -538,7 +482,7 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
-def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
+def _provider_preferences_for_agent(agent) -> dict[str, Any]:
     """Build the validated provider-routing object shared by request paths.
 
     ``provider_routing.models.<id>`` overlays the flat constructor values for the CURRENT
@@ -559,7 +503,7 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     return {key: value for key, value in merged.items() if value}
 
 
-def _prompt_cache_scope_for_agent(agent) -> "str | None":
+def _prompt_cache_scope_for_agent(agent) -> str | None:
     """Rotation-stable logical cache scope for *agent*, or None (transports then
     fall back to the physical session_id, so a failure never blocks the build)."""
     try:
@@ -570,19 +514,18 @@ def _prompt_cache_scope_for_agent(agent) -> "str | None":
         return None
 
 
-def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dict:
-    """Merge Portal ``tags`` / ``session_id`` onto an Anthropic Messages kwargs dict.
-    The Nous profile is only consulted by the OpenAI-wire transport; ``session_id``
-    only — never ``provider_preferences`` (an OpenAI-wire routing object)."""
+def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict, api_messages: list) -> dict:
+    """The Nous profile body on the Messages wire, which the profile hook never reaches; never
+    ``provider_preferences`` (OpenAI-wire routing the Portal 400s on)."""
     if getattr(agent, "provider", None) not in {"nous", "nous-portal", "nousresearch"}:
         return anthropic_kwargs
     try:
         from providers import get_provider_profile
         nous_profile = get_provider_profile("nous")
         if nous_profile is not None:
-            anthropic_kwargs.setdefault("extra_body", {}).update(
-                nous_profile.build_extra_body(session_id=getattr(agent, "session_id", None)))
-    except Exception as exc:  # noqa: BLE001 — never block a turn on tagging
+            anthropic_kwargs.setdefault("extra_body", {}).update(nous_profile.build_extra_body(
+                session_id=getattr(agent, "session_id", None), data_use=data_use_requirement(api_messages)))
+    except Exception as exc:
         logger.debug("Nous Portal extra_body merge failed: %s", exc)
     return anthropic_kwargs
 
@@ -681,7 +624,7 @@ def _touch_stale_kill_activity(agent, elapsed: float) -> None:
 def _check_stale_giveup(agent) -> None:
     """Raise immediately when the consecutive-stale streak is past the
     give-up threshold — no network attempt, no stale-timeout wait."""
-    _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
+    _giveup = stale_giveup()
     _streak = _stale_streak(agent)
     if _giveup > 0 and _streak >= _giveup:
         raise RuntimeError(
@@ -691,7 +634,7 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
-def _stream_env_stale_base() -> "tuple[float, bool]":
+def _stream_env_stale_base() -> tuple[float, bool]:
     """(HERMES_STREAM_STALE_TIMEOUT or the implicit 180s, explicit) — like
     ``AIAgent._resolved_api_call_stale_timeout_base``; an explicit env value is the
     user's deadline, so it is never capped to the run budget."""
@@ -773,7 +716,7 @@ def _cloud_stale_timeout_for(agent, api_kwargs: dict) -> float:
     return timeout if explicit_env else cap_to_run_budget(agent, timeout)
 
 
-def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
+def _bedrock_reasoning_stale_floor(model_id: object) -> float | None:
     """Map a Bedrock inference-profile id to its reasoning stale-timeout floor.
 
     ``us.anthropic.claude-opus-4-6-v1:0`` -> strip the region prefix, then try the
@@ -802,15 +745,14 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
 
 
 def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=None):
-    """Pop the Hermes routing keys and call ``converse`` / ``converse_stream`` (boto3
-    directly) with the shared recovery: a cachePoint rejection (Nova: toolConfig.tools,
-    #97281) drops the marker and resends once inside the same attempt; a streaming IAM
-    denial hands off to ``on_stream_denied(client, kwargs, exc)``; a stale connection
-    evicts the cached client so the outer retry builds a fresh pool. Streaming returns the
-    event stream; non-streaming an OpenAI-shaped SimpleNamespace."""
+    """Pop the Hermes routing keys and call ``converse`` / ``converse_stream`` (boto3 directly) with the
+    adapter's shared recovery: a cachePoint rejection (Nova: toolConfig.tools, #97281) or a replayed sealed
+    reasoning rejection resends once without the offending blocks inside the same attempt; a streaming IAM
+    denial hands off to ``on_stream_denied(client, kwargs, exc)``; a stale connection evicts the cached
+    client so the outer retry builds a fresh pool. Streaming returns the event stream; else a SimpleNamespace."""
     from agent.bedrock_adapter import (_get_bedrock_runtime_client, invalidate_runtime_client,
         is_stale_connection_error, is_streaming_access_denied_error, normalize_converse_response,
-        recover_from_cache_point_rejection)
+        recover_from_cache_point_rejection, recover_from_redacted_reasoning_rejection)
     region = api_kwargs.pop("__bedrock_region__", "us-east-1")
     api_kwargs.pop("__bedrock_converse__", None)
     client = _get_bedrock_runtime_client(region)
@@ -819,7 +761,8 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     try:
         raw_response = method(**api_kwargs)
     except Exception as exc:
-        retry_kwargs = recover_from_cache_point_rejection(exc, api_kwargs)
+        retry_kwargs = (recover_from_cache_point_rejection(exc, api_kwargs)
+                        or recover_from_redacted_reasoning_rejection(exc, api_kwargs))
         if retry_kwargs is not None:
             return finish(method(**retry_kwargs))
         if on_stream_denied is not None and is_streaming_access_denied_error(exc):
@@ -863,24 +806,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     # request transform. No-op unless this really is the OpenAI SDK, so the
     # MoA facade above and the suite's stand-in clients are unaffected.
     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
-    # SYNTHWAVE fork: read OmniRoute's routing headers (x-omniroute-provider/-model) through the
-    # SDK raw-response API so compression can follow the model that actually answered
-    # (capture_omniroute_route). Gated on the real OpenAI SDK like the transform bypass above:
-    # facades and test stand-ins script ``create`` and keep that path.
-    completions = request_client.chat.completions
-    if type(completions).__module__.startswith("openai.") and hasattr(completions, "with_raw_response"):
-        raw_response = completions.with_raw_response.create(**api_kwargs)
-        # ``with_raw_response`` wraps whatever ``Completions.create`` currently is; when that
-        # has been replaced (instrumentation, the suite's SDK-boundary capture) the wrapper
-        # hands back an already-parsed object with no ``parse()`` and no headers to read.
-        parse = getattr(raw_response, "parse", None)
-        if not callable(parse):
-            return raw_response
-        omniroute_route = _extract_omniroute_route(raw_response)
-        if omniroute_route:
-            agent._omniroute_route_info = omniroute_route
-        return parse()
-    return completions.create(**api_kwargs)
+    return _chat_completion_capturing_headers(agent, request_client, api_kwargs)
+
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -919,39 +846,6 @@ def should_use_direct_api_call(agent) -> bool:
 # How often an in-flight direct_api_call refreshes last_activity_ts. Must stay well
 # under the async-delegation idle stall threshold (450s) and below the 30s monitor sweep.
 _DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS = 15.0
-
-
-def _managed_local_load_notice(agent, api_kwargs: dict) -> "Optional[str]":
-    """Live phase notice ("⏳ loading <model> into memory — N%" / "⚙ processing
-    prompt — P%") while the managed local server works before the first token;
-    None when neither applies. Otherwise a cold load reads as a generic stall."""
-    try:
-        base = str(getattr(agent, "base_url", "") or "")
-        if not base:
-            return None
-        from urllib.parse import urlparse
-        from hermes_cli.local_runtime.load_progress import get_loading_progress, get_prefill_progress
-        from hermes_cli.local_runtime.supervisor import state_path
-        state = json.loads(state_path().read_text(encoding="utf-8-sig"))
-        managed = urlparse(str(state.get("base_url", ""))).netloc.lower()
-        if not managed or urlparse(base).netloc.lower() != managed:
-            return None
-        model = str(api_kwargs.get("model", ""))
-        progress = get_loading_progress().get(model)
-        if progress is not None:
-            return (f"⏳ loading {model} into memory — {progress['percent']}% "
-                "(responses start once the model is loaded)")
-        prefill = get_prefill_progress(model)
-        if prefill is None:
-            return None
-        processed = int(prefill["processed"])
-        total = estimate_request_context_tokens(api_kwargs)
-        if total and total >= processed:
-            return f"⚙ processing prompt — {max(0, min(100, round(processed / total * 100)))}%"
-        # Counter past the estimate (estimator undercounted): no honest denominator, label-only.
-        return "⚙ processing prompt"
-    except Exception:  # noqa: BLE001 — a status nicety must never break a call
-        return None
 
 
 def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
@@ -1109,7 +1003,7 @@ def direct_api_call(agent, api_kwargs: dict):
     aborts in-flight sockets via the registered hook, and a per-call ``timeout``
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
-    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    from agent.agent_init_governance import _enforce_dashboard_governance_model_policy
     _enforce_dashboard_governance_model_policy(agent)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
@@ -1284,92 +1178,6 @@ class _NonStreamWatchdogs:
     progress_timeout: float = 0.0
 
 
-def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs:
-    """Stale-call timeout plus the Codex Responses stream watchdogs.
-
-    The stale detector kills a hung provider early so the retry loop can rotate
-    credentials / fall back. Codex adds two failure modes: accepting the connection
-    but never emitting an event (no-event TTFB cutoff; a reconnect succeeds in ~2s)
-    and stalling after substantive model progress begins (event-idle gap; any parsed SSE
-    event remains transport activity). Only the implicit official OpenAI Codex policy
-    for large contexts defers arming until progress; small requests, compatible backends,
-    and explicit overrides retain the legacy first-event semantics. Tunables:
-    HERMES_CODEX_TTFB_TIMEOUT_SECONDS,
-    HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS (0 disables each),
-    HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS / HERMES_CODEX_TTFB_STRICT,
-    HERMES_CODEX_TTFB_MAX_SECONDS (opt-in ceiling, default 0 = none), HERMES_CODEX_HARD_TIMEOUT_SECONDS.
-    """
-    # The effort floor on the STALE timeout lives inside _compute_non_stream_stale_timeout so the
-    # run-budget cap still bounds it; here the floor only raises the TTFB/idle implicit defaults.
-    stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
-    codex = agent.api_mode == "codex_responses"
-    openai_codex_backend = _is_openai_codex_backend(agent)
-    est_tokens = estimate_request_context_tokens(api_kwargs)
-    effort_floor = _high_effort_silence_floor(agent) if codex else 0.0
-    codex_floor = 0.0
-    # Local Responses servers keep their configured local stale/TTFB grace: the hosted
-    # large-context floor, hard ceiling and TTFB scale-up/cap below must not tighten it.
-    base_url = getattr(agent, "base_url", None)
-    local = uses_local_inference_patience(agent, base_url)
-    if codex and not local:
-        codex_floor = openai_codex_stale_timeout_floor(est_tokens)
-        stale_timeout = _bound_openai_codex_stale_timeout(stale_timeout, est_tokens)
-
-    idle_default = max(effort_floor, next(
-        (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
-        12.0))
-
-    # No-event TTFB cutoff. Default 120s: the SDK's own read timeout is 600s,
-    # and a tight 12s killed subscription-backed requests mid-prefill.
-    ttfb_enabled = codex
-    ttfb_explicit = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", -1.0) != -1.0
-    ttfb_timeout = env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
-    if ttfb_timeout <= 0:
-        ttfb_enabled = False
-    elif codex and not local:
-        # Large requests legitimately spend tens of seconds in admission/prefill before the
-        # first SSE event: scale the cutoff up to the idle default unless TTFB_STRICT is set.
-        disable_above = env_float("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0)
-        strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
-        if not strict and disable_above > 0 and est_tokens >= disable_above and ttfb_timeout < idle_default:
-            logger.info("Scaling codex-responses no-event TTFB watchdog from %.0fs to %.0fs "
-                "for large request (context=~%s tokens >= %.0f). "
-                "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.", ttfb_timeout, idle_default,
-                f"{est_tokens:,}", disable_above)
-            ttfb_timeout = idle_default
-        # Opt-in ceiling (0 = off): a 120s default here silently undid the scale-up above (#91621).
-        ttfb_cap = env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
-        if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
-            logger.info("Capping codex-responses no-event TTFB timeout from %.0fs to %.0fs "
-                "(context=~%s tokens) per HERMES_CODEX_TTFB_MAX_SECONDS.", ttfb_timeout, ttfb_cap,
-                f"{est_tokens:,}")
-            ttfb_timeout = ttfb_cap
-    elif not ttfb_explicit and local:
-        # A local server prefills for minutes before its first event; the chat-completions
-        # siblings already grant local endpoints the local stale ceiling, so the Responses
-        # transport gets the same grace instead of the 120s hosted cutoff (#92302).
-        local_ceiling = _local_stream_stale_timeout_default()
-        if local_ceiling > ttfb_timeout:
-            logger.info("Local provider detected (%s) — no-event TTFB watchdog raised from %.0fs to %.0fs "
-                "(agent.local_stream_stale_timeout); set HERMES_CODEX_TTFB_TIMEOUT_SECONDS for an explicit cutoff.",
-                base_url, ttfb_timeout, local_ceiling)
-            ttfb_timeout = local_ceiling
-    if ttfb_enabled and not ttfb_explicit:
-        # High-effort thinking precedes the first event; the floor outranks the cap.
-        ttfb_timeout = max(ttfb_timeout, effort_floor)
-
-    # An operator-set idle timeout keeps first-event semantics; only the implicit
-    # default defers arming until model progress. Sentinel: env_float returns the
-    # default for unset AND unparseable values, so both count as implicit.
-    idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
-    idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
-    progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
-    return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
-        ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
-        idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
-        # A lifecycle frame proves transport liveness, not model progress. Bound that phase
-        # from the physical-attempt start; events cannot restart the grace period.
-        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
@@ -1387,7 +1195,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
-    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    from agent.agent_init_governance import _enforce_dashboard_governance_model_policy
     _enforce_dashboard_governance_model_policy(agent)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
@@ -1515,14 +1323,14 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
-    return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+    return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs, api_messages)
 
 
-def _build_bedrock_kwargs(agent, api_messages, tools_for_api):
+def _build_bedrock_kwargs(agent, api_messages, tools_for_api, reasoning_config):
     # Bedrock Converse — the adapter converts messages/tools and calls boto3 directly.
     return agent._get_transport().build_kwargs(model=agent.model, messages=api_messages, tools=tools_for_api,
         max_tokens=agent.max_tokens, region=getattr(agent, "_bedrock_region", None) or "us-east-1",
-        guardrail_config=getattr(agent, "_bedrock_guardrail_config", None))
+        guardrail_config=getattr(agent, "_bedrock_guardrail_config", None), reasoning_config=reasoning_config)
 
 
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
@@ -1588,6 +1396,8 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         _profile = get_provider_profile(agent.provider)
 
     _ephemeral_out = _consume_ephemeral_max_output(agent)
+    from agent.reasoning_carriers import shape_wire_carriers
+    api_messages = shape_wire_carriers(api_messages, model=agent.model, base_url=agent.base_url)
     # Strip image parts for non-vision models on BOTH paths (registered
     # providers with profiles used to bypass it).
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
@@ -1598,6 +1408,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
+        lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
@@ -1614,56 +1425,18 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
         is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
         is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
-        is_lmstudio=_is_lmstudio,
         is_custom_provider=agent.provider == "custom",
         qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
-        lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         provider_name=agent.provider,
     )
 
 
-def _agent_request_base_url(agent) -> str:
-    if getattr(agent, "api_mode", "") == "anthropic_messages":
-        return str(getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", "") or "")
-    return str(getattr(agent, "base_url", "") or "")
 
-def _check_model_gateway_route(agent) -> None:
-    """Refuse a main-model request that bypasses the model gateway (R2).
 
-    Under ``model_gateway.enforce`` every completion path (chat, Responses,
-    Messages) must target the gateway; Bedrock's native Converse API never
-    does. MoA's facade is exempt because each of its slots is an auxiliary
-    call that resolves to the gateway itself.
-    """
-    from agent import model_gateway
-
-    if not model_gateway.enforced():
-        return
-    if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
-        return
-    if getattr(agent, "api_mode", "") == "bedrock_converse" or not model_gateway.is_gateway_url(
-        _agent_request_base_url(agent)
-    ):
-        raise model_gateway.ModelGatewayRefused(
-            "model",
-            getattr(agent, "provider", "") or "unknown",
-            "the agent's endpoint is not the model gateway",
-        )
-
-def _apply_model_gateway_identity(agent, kwargs: dict) -> dict:
-    """The ``user`` field and session header on every gateway completion."""
-    from agent import model_gateway
-
-    return model_gateway.apply_request_identity(
-        kwargs,
-        base_url=_agent_request_base_url(agent),
-        api_mode=str(getattr(agent, "api_mode", "") or "chat_completions"),
-        session_id=getattr(agent, "session_id", None),
-    )
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode.
@@ -1675,7 +1448,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """
     from agent.opencode_affinity import merge_session_affinity_headers
 
-    _check_model_gateway_route(agent)
+    _chat_completion_gateway._check_model_gateway_route(agent)
     kwargs = merge_session_affinity_headers(
         _build_api_kwargs_for_mode(agent, api_messages, tools_for_api),
         getattr(agent, "provider", None),
@@ -1690,7 +1463,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         apply_model_tiering(agent, kwargs, api_messages)
     except Exception:
         logger.debug("model tiering unavailable", exc_info=True)
-    return _apply_model_gateway_identity(agent, kwargs)
+    return _chat_completion_gateway._apply_model_gateway_identity(agent, kwargs)
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -1705,7 +1478,7 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     if agent.api_mode == "anthropic_messages":
         return _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides)
     if agent.api_mode == "bedrock_converse":
-        return _build_bedrock_kwargs(agent, api_messages, tools_for_api)
+        return _build_bedrock_kwargs(agent, api_messages, tools_for_api, reasoning_config)
     # Rotation-stable logical cache scope shared by every OpenAI-wire branch
     # (memoized on the agent); anthropic/bedrock above don't use it.
     cache_scope_id = _prompt_cache_scope_for_agent(agent)
@@ -1801,6 +1574,11 @@ def _assistant_tool_call_dict(agent, tool_call, index: int) -> dict:
     extra = getattr(tool_call, "extra_content", None)
     if extra is not None:
         tc_dict["extra_content"] = _dump_if_model(extra)
+    # Copilot's Gemini 3 variant signs the call inside ``function`` (replayed only to Copilot).
+    from agent.reasoning_carriers import field
+    fn_sig = field(tool_call, "thought_signature") or getattr(tool_call.function, "thought_signature", None)
+    if isinstance(fn_sig, str) and fn_sig:
+        tc_dict["function"]["thought_signature"] = fn_sig
     return tc_dict
 
 
@@ -1897,6 +1675,13 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
                         _reset_read_dedup_caches(task_id, session_id=getattr(agent, "session_id", None) or "")
 
+    from agent.reasoning_carriers import carrier_record
+    if record := carrier_record(assistant_message):
+        # Gemini text-turn signature / Copilot reasoning_opaque+text: top-level for the live
+        # history, a private reasoning_details record for persistence (reasoning_carriers.py).
+        msg.update({k: v for k, v in record.items() if k != "type"})
+        msg["reasoning_details"] = [*msg.get("reasoning_details", ()), record]
+
     if assistant_tool_calls:
         msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]
     return msg
@@ -1967,7 +1752,7 @@ _FALLBACK_REASON_LABELS = {
 }
 
 
-def _fallback_reason_text(reason: "FailoverReason | None") -> str:
+def _fallback_reason_text(reason: FailoverReason | None) -> str:
     """Return a concise operator-facing explanation for a fallback switch."""
     label = _FALLBACK_REASON_LABELS.get(reason)
     return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
@@ -2073,7 +1858,7 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
-def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
+def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
     """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
     short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
     context across every provider again."""
@@ -2183,7 +1968,7 @@ def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_b
     config injected — a caller override of the same key won at init and differs, so it survives;
     keys the new provider redefines are re-added by the merge."""
     try:
-        from agent.agent_init import _custom_provider_extra_body_for_agent, _merge_custom_provider_extra_body
+        from agent.agent_init_provider_routes import _custom_provider_extra_body_for_agent, _merge_custom_provider_extra_body
         custom_providers = getattr(agent, "_custom_providers", None) or []
         old_provider_eb = _custom_provider_extra_body_for_agent(provider=old_provider, model=old_model, base_url=old_base_url, custom_providers=custom_providers) or {}
         overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -2212,7 +1997,7 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
+def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
@@ -2235,86 +2020,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             continue
 
         try:
-            from agent.auxiliary_client import resolve_provider_client
-            from hermes_cli.fallback_config import resolve_entry_api_key
-            # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
-            # of falling through to OpenRouter defaults.
-            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
-            fb_api_key_hint = resolve_entry_api_key(fb)
-            fb_api_mode_explicit, fb_api_mode = _fallback_api_mode_hint(fb, fb_provider, fb_base_url_hint)
-            # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
-            # substring — GHSA-76xc-57q6-vm5m.
-            if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-                from agent.secret_scope import get_secret
-                fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
-            # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
-            fb_client, _resolved_fb_model = resolve_provider_client(
-                fb_provider, model=fb_model, raw_codex=True, explicit_base_url=fb_base_url_hint, explicit_api_key=fb_api_key_hint, api_mode=fb_api_mode)
-            if fb_client is None:
+            from agent.route_binding import bind_route_entry
+            bound = bind_route_entry(agent, fb, fb_provider, fb_model)
+            if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
                 continue
-            from agent import model_gateway as _model_gateway
-            if _model_gateway.enforced() and fb_provider != "moa":
-                fb_provider = "custom"
-                fb_api_mode = "chat_completions"
-                fb_api_mode_explicit = True
-            if fb_provider == "moa":
-                # A MoA entry means the preset itself, exactly like ``provider: moa`` in config or
-                # ``/model <preset> --provider moa``. The chokepoint's client is the preset's
-                # aggregator: it only proves the preset resolves and the aggregator has credentials.
-                # Installing it as the acting client with the virtual identity is a hybrid nobody
-                # handles (#112525: preset name sent as model id → 404; #112623: every
-                # ``provider == "moa"`` guard and key misfires and the next rebuild swaps in the
-                # facade anyway). Bind the facade with the same pins every other MoA build site uses.
-                fb_base_url, fb_api_mode = "moa://local", "chat_completions"
-            else:
-                try:
-                    from hermes_cli.model_normalize import normalize_model_for_provider
-                    fb_model = normalize_model_for_provider(fb_model, fb_provider)
-                except Exception as _norm_err:
-                    logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
-
-                fb_base_url = str(fb_client.base_url)
-                from hermes_cli.providers import is_actual_route
-                if is_actual_route(fb_provider, fb_base_url):
-                    fb_api_mode = "chat_completions"
-                elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
-                    fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
-
-            old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
-
-            # Clear the per-config context_length override so the fallback model's own context
-            # window is resolved instead of the previous model's stale value.
-            # See #22387.
-            agent._config_context_length = None
-            agent.model, agent.provider, agent.requested_provider = fb_model, fb_provider, fb_provider
-            agent.base_url, agent.api_mode = fb_base_url, fb_api_mode
-            # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
-            agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
-            if hasattr(agent, "_transport_cache"):
-                agent._transport_cache.clear()
-            from agent.turn_recovery import reset_codex_reasoning_replay
-            reset_codex_reasoning_replay(agent)
-            agent._fallback_activated = True
-
-            _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
-            if fb_provider == "moa":
-                from agent.moa_loop import bind_moa_runtime
-                bind_moa_runtime(agent, fb_model)
-            else:
-                from agent.client_lifecycle import _swap_fallback_clients
-                _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
-
-            from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-            sync_credential_pool_entry_id(agent)
-
-            agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
-                provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
-            agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-            _update_fallback_context_compressor(agent)
-            _reresolve_fallback_reasoning_config(agent)
-            _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+            old_model, old_provider = bound
+            fb_model = agent.model  # normalized by the binder
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (
@@ -2402,8 +2115,9 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
     # Compression/resume can orphan a tool result whose parent tool_call was summarized away.
     api_messages = agent._sanitize_api_messages(api_messages)
     # Same send-path vision eviction as the main loop (#89296).
-    from agent.context_compressor import evict_stale_outbound_tool_images
-    evict_stale_outbound_tool_images(api_messages)
+    from agent.context_compressor import outbound_retired_image_ids
+    from agent.compression_media import evict_stale_outbound_tool_images
+    evict_stale_outbound_tool_images(api_messages, outbound_retired_image_ids(agent))
     # Same per-model image strip as turn_api_request.build_api_request: this path builds
     # api_messages by hand and calls _build_api_kwargs directly, so a model recorded in
     # agent._image_rejecting_models would otherwise get images here → 4xx → no summary.
@@ -2477,7 +2191,7 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
             model=agent.model, messages=api_messages, tools=None, max_tokens=agent.max_tokens,
             reasoning_config=agent.reasoning_config, is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(), base_url=getattr(agent, "_anthropic_base_url", None))
-        ant_kw = _merge_nous_portal_messages_extra_body(agent, ant_kw)
+        ant_kw = _merge_nous_portal_messages_extra_body(agent, ant_kw, api_messages)
         response = _managed_summary_call(
             agent, api_request_id, ant_kw, agent._interruptible_api_call, retry_count=retry_count)
         return _summary_text(agent, response, strip_tool_prefix=agent._is_anthropic_oauth)
@@ -2493,6 +2207,9 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     # The summary now carries ``tools``; on cache-planned routes the main loop scrubbed a deep
     # copy, so ``agent.tools`` may still hold bytes the provider 400s on.
     sanitize_outbound_kwargs(agent, summary_kwargs)
+    from agent.conversation_loop import _moa_client_consumes_prepared_request
+    if agent.provider == "moa" and _moa_client_consumes_prepared_request(agent.client):  # transport strips data_use
+        summary_kwargs["_moa_prepared_request"] = agent.client.chat.completions.prepare(api_messages)
 
     def _attempt(retry_count: int) -> str:
         # Use the ordinary request-local lifecycle: a summary can be interrupted
@@ -2512,9 +2229,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
-        # NOT the gate — the interactive CLI runs quiet_mode=True by default and must see this.
-        # Strict machine-readable mode (hermes chat -Q, oneshot, background review): keep diagnostics out of
-        # stdout so wrappers receive only the final assistant content (#93220 class).
+        # NOT the gate — the interactive CLI runs quiet_mode=True by default and must see this (#93220 class).
         logger.warning(warning)
     else:
         agent._safe_print(warning, diagnostic=True)
@@ -2932,70 +2647,6 @@ class _BedrockStream:
         return _with_stream_emitters(self.agent, self._poll)
 
 
-class _ToolCallAccumulator:
-    """Assemble streamed tool-call deltas into complete ``tool_calls`` entries
-    (``acc``: slot index -> entry dict). Ollama-compatible endpoints reuse index 0
-    for every call in a parallel batch, distinguishing them only by id, so a new
-    id at an already-seen raw index is redirected to a fresh slot."""
-
-    def __init__(self):
-        self.acc: dict = {}
-        self._notified: set = set()
-        self._last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
-        self._active_slot_by_idx: dict = {}  # raw_index -> current slot in acc
-        # Argument deltas are collected per slot and joined once in ``materialize`` —
-        # ``+=`` per chunk rebuilds the whole string every delta (quadratic on big args).
-        self._argument_parts: dict[int, list[str]] = {}
-
-    def materialize(self) -> dict:
-        """Join buffered argument deltas into each entry's ``arguments``; idempotent. Returns ``acc``."""
-        for idx, parts in self._argument_parts.items():
-            self.acc[idx]["function"]["arguments"] = "".join(parts)
-        return self.acc
-
-    def feed(self, tc_delta) -> Optional[str]:
-        """Merge one delta; return the tool name the first time it is complete."""
-        raw_idx = getattr(tc_delta, "index", None)
-        if raw_idx is None:
-            raw_idx = 0
-        tc_id = getattr(tc_delta, "id", None)
-        delta_id = tc_id or ""
-        if isinstance(tc_id, int):  # Poolside sends integer ids
-            tc_id = str(tc_id)
-
-        self._active_slot_by_idx.setdefault(raw_idx, raw_idx)
-        if delta_id and raw_idx in self._last_id_at_idx and delta_id != self._last_id_at_idx[raw_idx]:
-            self._active_slot_by_idx[raw_idx] = max(self.acc, default=-1) + 1
-        if delta_id:
-            self._last_id_at_idx[raw_idx] = delta_id
-        idx = self._active_slot_by_idx[raw_idx]
-
-        entry = self.acc.setdefault(
-            idx, {"id": tc_id or "", "type": "function", "function": {"name": "", "arguments": ""}, "extra_content": None},
-        )
-        parts = self._argument_parts.setdefault(idx, [])
-        if tc_id:
-            entry["id"] = tc_id
-        tc_function = getattr(tc_delta, "function", None)
-        if tc_function:
-            if getattr(tc_function, "name", None):
-                # Assignment, not +=: names arrive complete and some providers (MiniMax via
-                # NVIDIA NIM) resend the full name every chunk — += gives "read_fileread_file".
-                entry["function"]["name"] = tc_function.name
-            if getattr(tc_function, "arguments", None):
-                parts.append(tc_function.arguments)
-        extra = getattr(tc_delta, "extra_content", None)
-        if extra is None and hasattr(tc_delta, "model_extra"):
-            extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
-        if extra is not None:
-            entry["extra_content"] = _dump_if_model(extra)
-        name = entry["function"]["name"]
-        if name and idx not in self._notified:
-            self._notified.add(idx)
-            return name
-        return None
-
-
 class _StreamingCall(StreamingWaitMonitor):
     """One streaming request on the chat_completions / anthropic_messages wire.
     State shared between the request worker and the poll-loop monitor (heartbeat,
@@ -3016,6 +2667,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.provider_tool_in_flight = {"yes": False}
         # Last REAL chunk; the monitor detects SSE-ping-only connections with it.
         self.last_chunk_time = {"t": time.time()}
+        self.prompt_progress = {"progress": None, "t": 0.0}  # latest llama-server prompt progress
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
@@ -3073,9 +2725,9 @@ class _StreamingCall(StreamingWaitMonitor):
         with self.stream_attempt_lock:
             self.stream_attempt_state["current"] += 1
             attempt_id = int(self.stream_attempt_state["current"])
-        self.provider_tool_in_flight["yes"] = False
-        # Attempt-local like provider_tool_in_flight: a tool name from a stream that died
-        # before any text must not label a later attempt's partial stub or its retry decision.
+        # Attempt-local: a dead attempt's prompt progress must not mask the next load notice, and
+        # its tool name (died before any text) must not label a later partial stub or retry.
+        self.provider_tool_in_flight["yes"], self.prompt_progress["progress"] = False, None
         self.result["partial_tool_names"] = []
         return attempt_id
 
@@ -3164,6 +2816,29 @@ class _StreamingCall(StreamingWaitMonitor):
             # Delta-length estimate: ~3x cheaper than repr() per chunk.
             diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
 
+    def _take_chunk(self, diag, chunk, llamacpp: bool) -> bool:
+        """Count a real chunk; a llama-server prompt-progress chunk (True) is liveness, no first token."""
+        progress = prompt_progress(chunk) if llamacpp else None
+        if progress is None:
+            self._count_chunk(diag, chunk)
+            return False
+        self.last_chunk_time["t"] = now = time.time()
+        self.prompt_progress["progress"], self.prompt_progress["t"] = progress, now
+        self.agent._touch_activity("model reading the prompt")
+        return True
+
+    @staticmethod
+    def _chunk_identity(diag, chunk, model_name, response_id, upstream_provider) -> tuple:
+        """Model, response id and serving provider, as the stream reports them."""
+        if hasattr(chunk, "model") and chunk.model:
+            model_name = chunk.model
+        if response_id is None and isinstance(getattr(chunk, "id", None), str) and chunk.id:
+            response_id = chunk.id
+        if upstream_provider is None and isinstance(getattr(chunk, "provider", None), str) and chunk.provider:
+            upstream_provider = chunk.provider  # OpenRouter stamps who served
+            diag["serving_provider"] = upstream_provider.strip()[:64]  # attribute a mid-stream drop (#90216)
+        return model_name, response_id, upstream_provider
+
     @staticmethod
     def _mark_finish_seen(diag, finish_reason) -> None:
         """Record that this attempt saw a terminal finish/stop reason (#102766)."""
@@ -3244,7 +2919,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._stream_diag_capture_response(self.clients.diag, response)
         self.agent._check_openrouter_cache_status(response)
         # SYNTHWAVE fork: remember OmniRoute's routed provider/model for capture_omniroute_route.
-        omniroute_route = _extract_omniroute_route(response)
+        omniroute_route = _chat_completion_gateway._extract_omniroute_route(response)
         if omniroute_route:
             self.agent._omniroute_route_info = omniroute_route
         self._writer_token = claim_stream_writer(self.agent)
@@ -3319,8 +2994,11 @@ class _StreamingCall(StreamingWaitMonitor):
         refusal_parts: list[str] = []
         reasoning_details: list = []  # OpenRouter replay data (signatures, encrypted blocks)
         pending_text_parts: list[str] = []
+        from agent.chat_completion_helpers_tool_calls import _ToolCallAccumulator
         tool_calls = _ToolCallAccumulator()
         tool_calls_acc = tool_calls.acc
+        from agent.reasoning_carriers import StreamCarriers
+        carriers = StreamCarriers()
         finish_reason = model_name = usage_obj = None
         response_id = upstream_provider = None  # the provider's own id / serving upstream, from the chunks
         role = "assistant"
@@ -3337,8 +3015,12 @@ class _StreamingCall(StreamingWaitMonitor):
         detail_watch = RunawayStreamWatch()
         runaway = None
 
+        llamacpp = _streams_llamacpp(self.agent)
+
         def _open_stream(next_api_kwargs: dict[str, Any]):
             timeout = _httpx.Timeout(connect=conn_cap, read=read_timeout, write=base_timeout, pool=conn_cap)
+            if llamacpp:
+                next_api_kwargs = with_prompt_progress(next_api_kwargs)
             return self._open_chat_stream({**next_api_kwargs, "stream": True, "timeout": timeout})
 
         def _flush_pending_stream_text():
@@ -3369,20 +3051,17 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.agent._abort_request_openai_client(self._attempt_request_client, reason=reason)
 
         for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
-            self._count_chunk(_diag, chunk)
+            is_progress = self._take_chunk(_diag, chunk, llamacpp)
             if self.agent._interrupt_requested:
                 _close_half_read_stream("interrupt_stream_close_failed")
                 break
             if not self._stream_attempt_is_active(stream_attempt_id):
                 self._discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue
-            if hasattr(chunk, "model") and chunk.model:
-                model_name = chunk.model
-            if response_id is None and isinstance(getattr(chunk, "id", None), str) and chunk.id:
-                response_id = chunk.id
-            if upstream_provider is None and isinstance(getattr(chunk, "provider", None), str) and chunk.provider:
-                upstream_provider = chunk.provider  # OpenRouter stamps who served
-                _diag["serving_provider"] = upstream_provider.strip()[:64]  # attribute a mid-stream drop (#90216)
+            if is_progress:
+                continue
+            model_name, response_id, upstream_provider = self._chunk_identity(
+                _diag, chunk, model_name, response_id, upstream_provider)
             if not chunk.choices:
                 usage, finish_reason = self._choiceless_chunk(chunk, finish_reason)
                 usage_obj = usage or usage_obj
@@ -3403,6 +3082,8 @@ class _StreamingCall(StreamingWaitMonitor):
             # whose deltas carry only this field otherwise trips the empty-stream guard (#56516).
             if reasoning_text is None and isinstance(getattr(delta, "model_extra", None), dict):
                 reasoning_text = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
+            # Copilot /chat/completions names its readable reasoning ``reasoning_text``.
+            reasoning_text = carriers.feed(delta, reasoning_text)
             if reasoning_text:
                 # Summary-part models omit the separator between markdown blocks; re-insert it.
                 reasoning_text = separate_glued_reasoning_blocks(
@@ -3493,6 +3174,7 @@ class _StreamingCall(StreamingWaitMonitor):
             "length" if runaway else finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
             refusal_parts=refusal_parts)
+        carriers.apply(response)
         if runaway:
             # Cut, not finished: the length path ends the turn on this mark instead of continuing.
             response._runaway_repetition = True
@@ -3572,7 +3254,8 @@ class _StreamingCall(StreamingWaitMonitor):
             mock_tool_calls.append(SimpleNamespace(
                 id=tc["id"], type=tc["type"], extra_content=tc.get("extra_content"),
                 function=SimpleNamespace(name=tc["function"]["name"], arguments=arguments,
-                                         args_repaired=arguments != tc["function"]["arguments"])))
+                                         args_repaired=arguments != tc["function"]["arguments"],
+                                         thought_signature=tc.get("thought_signature"))))
         return mock_tool_calls or None, has_truncated_tool_args
 
     def _finish_chat_stream(self, stream, role, content_parts, reasoning_parts, tool_calls_acc, finish_reason,
@@ -3802,7 +3485,10 @@ class _StreamingCall(StreamingWaitMonitor):
         AnthropicBedrock IAM lacking InvokeModelWithResponseStream, a custom anthropic_messages
         provider emitting SSE events out of order (#72833), or a gateway answering
         with contentless SSE keepalive frames (a degraded gateway answers every
-        streaming request that way, so the retry must change channel to make progress)."""
+        streaming request that way, so the retry must change channel to make progress).
+        llama-server stays on streaming: the router can't cancel a non-streamed request."""
+        if _streams_llamacpp(self.agent):
+            return
         if _is_provider_stream_empty_frame_error(e):
             self.agent._disable_streaming = True
             logger.warning(
@@ -3958,6 +3644,9 @@ class _StreamingCall(StreamingWaitMonitor):
         """
         if getattr(self.agent, "_interrupt_requested", False):
             return False
+        if _streams_llamacpp(self.agent):
+            # Same error either way, and the router can't cancel this probe once its watchdog gives up.
+            return False
         status = _extract_status_code(e)
         if status is None or status < 500 or self.deltas_were_sent["yes"]:
             return False
@@ -4011,7 +3700,7 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_anthropic_client(reason="anthropic_stream_request"), kind="anthropic_messages")
         return self._call_anthropic(request_client)
 
-    def _log_attempt_timing(self, stream_attempt: int, error: "BaseException | None") -> None:
+    def _log_attempt_timing(self, stream_attempt: int, error: BaseException | None) -> None:
         """SYNTHWAVE fork: one content-free ``stream_attempt_timing`` row per chat-completions
         attempt (``agent.stream_diag``); the anthropic wire records no timing boundaries."""
         if self.agent.api_mode == "anthropic_messages":
@@ -4282,7 +3971,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
-    from agent.agent_init import _enforce_dashboard_governance_model_policy
+    from agent.agent_init_governance import _enforce_dashboard_governance_model_policy
     _enforce_dashboard_governance_model_policy(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
@@ -4295,5 +3984,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     return _StreamingCall(agent, api_kwargs, on_first_delta).run()
 
 
-__all__ = ["interruptible_api_call", "build_api_kwargs", "build_assistant_message", "try_activate_fallback",
-    "handle_max_iterations", "cleanup_task_resources", "interruptible_streaming_api_call"]
+__all__ = [
+    "build_api_kwargs",
+    "build_assistant_message",
+    "cleanup_task_resources",
+    "handle_max_iterations",
+    "interruptible_api_call",
+    "interruptible_streaming_api_call",
+    "try_activate_fallback",
+]

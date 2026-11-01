@@ -1,3 +1,4 @@
+import { useSidebarCollapse } from "@/hooks/useSidebarCollapse";
 import {
   lazy,
   Suspense,
@@ -68,7 +69,6 @@ import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
-import { ProfileProvider } from "@/contexts/ProfileProvider";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { ProfileSwitcher } from "@/components/ProfileSwitcher";
 import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
@@ -422,33 +422,18 @@ function buildRoutes(
   return routes;
 }
 
-const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
 export default function App() {
   const { t } = useI18n();
   const { pathname } = useLocation();
-  const { manifests, loading: pluginsLoading } = usePlugins();
+  const { profile } = useProfileScope();
+  const { manifests, loading: pluginsLoading } = usePlugins(profile);
   const { theme } = useTheme();
   const { hasPermission } = useGovernance();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
 
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
-    } catch {
-      return false;
-    }
-  });
-  const toggleCollapsed = useCallback(() => {
-    setCollapsed((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(next));
-      } catch { /* localStorage may be unavailable in private browsing */ }
-      return next;
-    });
-  }, []);
+  const { collapsed, toggleCollapsed } = useSidebarCollapse();
   const isMobile = useBelowBreakpoint(1024);
   const isDesktopCollapsed = collapsed && !isMobile;
   const tooltipWarmRef = useRef(0);
@@ -570,7 +555,6 @@ export default function App() {
   }, []);
 
   return (
-    <ProfileProvider>
     <div
       data-layout-variant={layoutVariant}
       className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
@@ -728,37 +712,13 @@ export default function App() {
                 ))}
               </ul>
 
-              {sidebarNav.pluginItems.length > 0 && (
-                <div
-                  aria-labelledby="hermes-sidebar-plugin-nav-heading"
-                  className="flex flex-col border-t border-current/10 pb-2"
-                  role="group"
-                >
-                  <span
-                    className={cn(
-                      "px-5 pt-2.5 pb-1",
-                      "font-sans text-display text-xs tracking-[0.12em] text-text-tertiary",
-                      isDesktopCollapsed && "lg:hidden",
-                    )}
-                    id="hermes-sidebar-plugin-nav-heading"
-                  >
-                    {t.app.pluginNavSection}
-                  </span>
-
-                  <ul className="flex flex-col">
-                    {sidebarNav.pluginItems.map((item) => (
-                      <SidebarNavLink
-                        closeMobile={closeMobile}
-                        collapsed={isDesktopCollapsed}
-                        item={item}
-                        key={item.path}
-                        t={t}
-                        tooltipWarmRef={tooltipWarmRef}
-                      />
-                    ))}
-                  </ul>
-                </div>
-              )}
+              <SidebarPluginNav
+                items={sidebarNav.pluginItems}
+                collapsed={isDesktopCollapsed}
+                closeMobile={closeMobile}
+                t={t}
+                tooltipWarmRef={tooltipWarmRef}
+              />
             </nav>
 
             <SidebarSystemActions
@@ -889,7 +849,6 @@ export default function App() {
 
       <PluginSlot name="overlay" />
     </div>
-    </ProfileProvider>
   );
 }
 
@@ -906,6 +865,42 @@ export default function App() {
 function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
   const { profile } = useProfileScope();
   return <div key={profile || "__own__"} className="contents">{children}</div>;
+}
+
+function SidebarPluginNav({ items, ...props }: Omit<SidebarNavLinkProps, "item"> & { items: NavItem[] }) {
+  const { collapsed, closeMobile, t, tooltipWarmRef } = props;
+  if (items.length === 0) return null;
+  return (
+                <div
+                  aria-labelledby="hermes-sidebar-plugin-nav-heading"
+                  className="flex flex-col border-t border-current/10 pb-2"
+                  role="group"
+                >
+                  <span
+                    className={cn(
+                      "px-5 pt-2.5 pb-1",
+                      "font-sans text-display text-xs tracking-[0.12em] text-text-tertiary",
+                      collapsed && "lg:hidden",
+                    )}
+                    id="hermes-sidebar-plugin-nav-heading"
+                  >
+                    {t.app.pluginNavSection}
+                  </span>
+
+                  <ul className="flex flex-col">
+                    {items.map((item) => (
+                      <SidebarNavLink
+                        closeMobile={closeMobile}
+                        collapsed={collapsed}
+                        item={item}
+                        key={item.path}
+                        t={t}
+                        tooltipWarmRef={tooltipWarmRef}
+                      />
+                    ))}
+                  </ul>
+                </div>
+  );
 }
 
 function SidebarNavLink({

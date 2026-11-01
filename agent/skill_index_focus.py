@@ -64,7 +64,7 @@ def index_mode(config: Optional[dict[str, Any]] = None) -> str:
 
 def _usage_map(skills_dir: Path) -> dict:
     try:
-        raw = (skills_dir / ".usage.json").read_text(encoding="utf-8")
+        raw = (skills_dir / ".usage.json").read_text(encoding="utf-8-sig")
         data = json.loads(raw)
     except (OSError, ValueError):
         return {}
@@ -79,7 +79,7 @@ def _parse_ts(value) -> float:
     try:
         from datetime import datetime
 
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(text).timestamp()
     except (ValueError, TypeError):
         return 0.0
 
@@ -94,7 +94,7 @@ def _skill_identifiers(skill_md: Path) -> tuple[str, str]:
     directory = skill_md.parent.name
     declared = directory
     try:
-        head = skill_md.read_text(encoding="utf-8", errors="replace")[:1500]
+        head = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:1500]
     except OSError:
         return directory, declared
     for line in head.splitlines():
@@ -105,7 +105,7 @@ def _skill_identifiers(skill_md: Path) -> tuple[str, str]:
 
 
 def compact_categories(
-    skills_dir: "Path | str | None" = None,
+    skills_dir: Path | str | None = None,
     *,
     config: Optional[dict[str, Any]] = None,
     now: Optional[float] = None,
@@ -128,7 +128,8 @@ def compact_categories(
             if str(name).strip()
         }
 
-        root = Path(skills_dir) if skills_dir else Path.home() / ".hermes" / "skills"
+        from hermes_constants import get_hermes_home
+        root = Path(skills_dir) if skills_dir else get_hermes_home() / "skills"
         if not root.is_dir():
             return frozenset()
         usage = _usage_map(root)

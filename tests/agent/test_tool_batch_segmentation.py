@@ -965,7 +965,7 @@ class TestProcessPollingAdmission:
     def test_mutating_process_actions_stay_barriers(self, action):
         calls = [
             _tc("process", '{"action":"poll","session_id":"proc_a"}', call_id="p1"),
-            _tc("process", '{"action":"%s","session_id":"proc_b"}' % action, call_id="p2"),
+            _tc("process", f'{{"action":"{action}","session_id":"proc_b"}}', call_id="p2"),
         ]
         segments = _plan_tool_batch_segments(calls)
         assert _flatten_ids(segments) == ["p1", "p2"]

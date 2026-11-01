@@ -25,7 +25,9 @@ def test_dutch_announced_action_is_not_a_final(text):
 def test_dutch_answer_or_user_gate_is_not_retried(text):
     assert not trailing_continue_intent(text)
 
-from tests.agent.test_reasoning_only_stop_persistence import loop_agent, _run
+from tests.agent.test_reasoning_only_stop_persistence import _run
+
+pytest_plugins = ["tests.agent.test_reasoning_only_stop_persistence"]
 
 def test_dutch_stall_reprompts_in_real_conversation_loop(loop_agent):
     from tests.agent.test_run_agent import _mock_response

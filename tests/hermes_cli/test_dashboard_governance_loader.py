@@ -3,9 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
-
-
+import hermes_yaml as yaml
 def test_missing_policy_defaults_to_off(tmp_path):
     from hermes_cli.dashboard_governance.loader import load_governance_policy
 

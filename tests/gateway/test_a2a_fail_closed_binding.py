@@ -12,8 +12,7 @@ import asyncio
 import json
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from gateway import synthpulse_identity as spi
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType

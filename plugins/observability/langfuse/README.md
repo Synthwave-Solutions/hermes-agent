@@ -1,6 +1,8 @@
 # Langfuse Observability Plugin
 
-This plugin ships bundled with Hermes but is **opt-in** — it only loads when
+This SynthPulse variant remains bundled and **opt-in**, preserving actor/profile trace identity
+and metadata-only capture by default. Upstream moved its variant into the plugin catalog;
+the SynthPulse migration keeps this variant in place. It only loads when
 you explicitly enable it.
 
 ## Enable

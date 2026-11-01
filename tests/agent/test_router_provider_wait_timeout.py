@@ -109,7 +109,7 @@ def test_named_router_timeout_settings_use_the_configured_provider_entry(monkeyp
 @pytest.mark.parametrize('setting', ['provider', 'model', 'empty_named', 'partial_named'])
 def test_router_preserves_explicit_canonical_timeout_fallback(monkeypatch,tmp_path,provider,setting):
     from agent.chat_completion_helpers import _derive_stream_stale_timeout
-    import yaml
+    import hermes_yaml as yaml
     agent=make_agent(monkeypatch,tmp_path,provider,'custom:omniroute')
     entry={'request_timeout_seconds':75,'stale_timeout_seconds':420}
     if setting=='model':

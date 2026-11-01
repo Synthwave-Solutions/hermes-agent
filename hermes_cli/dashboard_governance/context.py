@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 import hashlib
@@ -311,7 +313,9 @@ def workspace_allowed_for_context(ctx, candidate_path: str = "") -> bool:
         return False
     try:
         return all(check(path) is True for path in dict.fromkeys((root, candidate_path)) if path)
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("workspace_allowed_for_context: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 

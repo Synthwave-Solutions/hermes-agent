@@ -28,13 +28,12 @@ _STORE_NAME = "governance-grant-requests.json"
 
 
 def _store_path() -> Path:
-    """Resolve the spool lazily from the env so a test STATE_DIR override (or
-    a relocated HERMES_HOME) never writes into the live admin queue."""
-    state_dir = os.environ.get("HERMES_WEBUI_STATE_DIR")
-    if state_dir:
-        return Path(state_dir).expanduser() / _STORE_NAME
-    home = os.environ.get("HERMES_HOME") or "~/.hermes"
-    return Path(home).expanduser() / "webui" / _STORE_NAME
+    """Resolve the owning profile's spool, preserving an explicit host override."""
+    from hermes_constants import get_hermes_home
+    from hermes_cli.synthpulse_settings import setting
+    state_dir = setting("webui.state_dir")
+    root = Path(state_dir).expanduser() if state_dir else get_hermes_home() / "webui"
+    return root / _STORE_NAME
 
 # Denial reasons that map to a grantable request. Everything else (shell
 # operators, denied globs, usage caps) is a deliberate rule, not a grant gap.
@@ -110,12 +109,12 @@ _TRIGGER_ENV = "HERMES_SESSION_LAST_USER_MESSAGE"
 _TRIGGER_MAX = 400
 
 _SECRET_PATTERNS = (
-    re.compile(r"\b(sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}", re.I),
+    re.compile(r"\b(sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}", re.IGNORECASE),
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"),
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
     re.compile(
         r"((?:api[\s_-]?key|token|secret|password|wachtwoord|bearer)\s*[:=]\s*)\S+",
-        re.I,
+        re.IGNORECASE,
     ),
 )
 
@@ -147,10 +146,10 @@ def _trigger_from_env() -> str:
                 from gateway.session_context import get_session_env
 
                 raw = get_session_env(_TRIGGER_ENV) or ""
-            except Exception:
+            except ImportError:
                 raw = ""
         return redact_trigger(raw)
-    except Exception:
+    except (TypeError, ValueError):
         return ""
 
 
@@ -206,10 +205,10 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "", *, tool_ca
                 import fcntl
 
                 fcntl.flock(lock_fh, fcntl.LOCK_EX)
-            except Exception:
-                pass  # windows / no fcntl: best-effort without the lock
+            except ImportError:
+                logging.getLogger(__name__).debug("record_denial: optional fallback used")
             try:
-                store = json.loads(store_file.read_text(encoding="utf-8"))
+                store = json.loads(store_file.read_text(encoding="utf-8-sig"))
                 if not isinstance(store, dict):
                     store = {}
             except (FileNotFoundError, ValueError):
@@ -259,6 +258,8 @@ def record_denial(ctx, tool_name: str, reason: str, detail: str = "", *, tool_ca
             os.replace(tmp, store_file)
         return True
     except Exception as exc:  # pragma: no cover: must never break tool flow
+        logging.getLogger(__name__).error("record_denial: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("grant request record failed: %s", exc)
         return False
 
@@ -284,6 +285,8 @@ def approver_emails() -> list[str]:
                 out.append(str(email))
         return sorted(out)
     except Exception as exc:  # pragma: no cover: never break the denial path
+        logging.getLogger(__name__).error("approver_emails: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         logger.debug("approver lookup failed: %s", exc)
         return []
 
@@ -291,7 +294,7 @@ def approver_emails() -> list[str]:
 def load_store() -> dict:
     """Read the aggregated request store (empty dict when absent/corrupt)."""
     try:
-        data = json.loads(_store_path().read_text(encoding="utf-8"))
+        data = json.loads(_store_path().read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, ValueError):
         return {}

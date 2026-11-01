@@ -6,6 +6,8 @@ any human/model wait; a changed policy cannot inherit an earlier approval.
 """
 from __future__ import annotations
 
+import logging
+
 from dataclasses import replace
 import hashlib
 import json
@@ -161,7 +163,9 @@ def authorize_tool_action(ctx, tool_name, args, registry):
             if len(serialized) <= 12000 and tool_name not in {"execute_code"}:
                 try:
                     verdict = _ask_model(access, json.loads(serialized))
-                except Exception:
+                except Exception as _boundary_error:
+                    logging.getLogger(__name__).error("authorize_tool_action: operation failed",
+                        exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
                     verdict = None
             fallback = "Automatic review needs a human decision: unavailable, uncertain, or unsupported action."
         if verdict and verdict["decision"] in {"approve", "deny"}:
@@ -182,5 +186,7 @@ def authorize_tool_action(ctx, tool_name, args, registry):
         if approved:
             bind_governance_context(current)
         return {"approved": approved, "source": source, "reason": reason, "operation_id": operation_id}
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("authorize_tool_action: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return {"approved": False, "source": "policy", "reason": "governance_review_unavailable"}

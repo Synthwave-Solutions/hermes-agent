@@ -11,6 +11,8 @@ Ensures:
 
 from __future__ import annotations
 
+import agent.chat_completion_watchdogs as _chat_completion_watchdogs
+
 import sys
 import time
 import types
@@ -124,7 +126,6 @@ def test_xai_responses_ttfb_scaled_for_large_requests(monkeypatch):
     # 2. Large request (>50k tokens) scales TTFB timeout to 120s, so it does NOT trip at 0.2s
     closes.clear()
     large_text = "word " * 65_000
-    stop_large = {"flag": False}
 
     def fake_stream_delayed(api_kwargs, client=None, on_first_delta=None):
         # Sleeps for 0.5s (longer than the initial 0.2s TTFB cutoff)
@@ -150,5 +151,5 @@ def test_hard_ceiling_clamps_hosted_but_not_local_responses_endpoints(monkeypatc
     for agent in (hosted, local):
         agent._compute_non_stream_stale_timeout = lambda api_kwargs: 3000.0
 
-    assert h._resolve_nonstream_watchdogs(hosted, kwargs).stale_timeout == 1500.0
-    assert h._resolve_nonstream_watchdogs(local, kwargs).stale_timeout == 3000.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(hosted, kwargs).stale_timeout == 1500.0
+    assert _chat_completion_watchdogs._resolve_nonstream_watchdogs(local, kwargs).stale_timeout == 3000.0

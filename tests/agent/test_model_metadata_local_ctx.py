@@ -4,6 +4,8 @@ get_model_context_length.
 All tests use synthetic inputs — no filesystem or live server required.
 """
 
+import agent.model_metadata_payloads as _model_metadata_payloads
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -98,7 +100,6 @@ class TestQueryLocalContextLengthVllm:
         from agent.model_metadata import _query_local_context_length
 
         detail_resp = self._make_resp(200, {"id": "omnicoder-9b", "max_model_len": 100000})
-        list_resp = self._make_resp(404, {})
 
         client_mock = MagicMock()
         client_mock.__enter__ = lambda s: client_mock
@@ -214,9 +215,9 @@ class TestQueryLocalContextLengthVllm:
         # Every context key the module recognises is honoured by the flat
         # reader the probe branches use, and no completion key ever is.
         for key in mm._CONTEXT_LENGTH_KEYS:
-            assert mm._extract_flat_context_length({key: 123456}) == 123456, key
+            assert _model_metadata_payloads._extract_flat_context_length({key: 123456}) == 123456, key
         for key in mm._MAX_COMPLETION_KEYS:
-            assert mm._extract_flat_context_length({key: 123456}) is None, key
+            assert _model_metadata_payloads._extract_flat_context_length({key: 123456}) is None, key
 
 
 class TestQueryLocalContextLengthModelsList:
@@ -285,7 +286,6 @@ class TestQueryLocalContextLengthModelsList:
         """
         from agent.model_metadata import _query_local_context_length
 
-        detail_resp = self._make_resp(404, {})
         list_resp = self._make_resp(200, {
             "data": [
                 {
@@ -317,7 +317,6 @@ class TestQueryLocalContextLengthModelsList:
         since the server can only actually serve the runtime value."""
         from agent.model_metadata import _query_local_context_length
 
-        detail_resp = self._make_resp(404, {})
         list_resp = self._make_resp(200, {
             "data": [
                 {"id": "/app/models/m.gguf", "meta": {"n_ctx": 256000, "n_ctx_train": 262144}}
@@ -348,20 +347,20 @@ class TestContextLengthFromModelPayload:
 
 
     def test_prefers_max_model_len_over_max_tokens(self):
-        from agent.model_metadata import _context_length_from_model_payload
+        from agent.model_metadata_payloads import _context_length_from_model_payload
 
         payload = {"id": "local-model", "max_model_len": 131072, "max_tokens": 4096}
         assert _context_length_from_model_payload(payload) == 131072
 
     def test_falls_back_to_max_tokens_when_no_input_window_field(self):
-        from agent.model_metadata import _context_length_from_model_payload
+        from agent.model_metadata_payloads import _context_length_from_model_payload
 
         # Some OpenAI-compat servers only expose max_tokens for the window.
         payload = {"id": "odd-server", "max_tokens": 65536}
         assert _context_length_from_model_payload(payload) == 65536
 
     def test_returns_none_for_empty_payload(self):
-        from agent.model_metadata import _context_length_from_model_payload
+        from agent.model_metadata_payloads import _context_length_from_model_payload
 
         assert _context_length_from_model_payload({}) is None
         assert _context_length_from_model_payload(None) is None  # type: ignore[arg-type]
@@ -381,7 +380,6 @@ class TestQueryLocalContextLengthAnthropicProxy:
     def test_models_list_prefers_max_input_tokens(self):
         from agent.model_metadata import _query_local_context_length
 
-        detail_resp = self._make_resp(404, {})
         list_resp = self._make_resp(200, {
             "data": [
                 {
@@ -930,7 +928,6 @@ class TestQueryLocalContextLengthMaxTokensNotContext:
         no genuine context-window key is present."""
         from agent.model_metadata import _query_local_context_length
 
-        detail_resp = self._make_resp(404, {})
         list_resp = self._make_resp(200, {
             "data": [
                 {
@@ -1000,7 +997,6 @@ class TestReconcileSelfHealsPoisonedCache:
         the poisoned 393216 cache entry with 1048576."""
         from agent.model_metadata import _reconcile_local_cached_context_length
 
-        detail_resp = self._make_resp(404, {})
         list_resp = self._make_resp(200, {
             "data": [
                 {

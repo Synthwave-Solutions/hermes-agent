@@ -882,7 +882,7 @@ class TestPreflightCompression:
             patch.object(agent, "_cleanup_task_resources"),
             # The window is pinned by hand above; SynthPulse's routed-window
             # capture would resize it for the mock's "test/model" answer.
-            patch("agent.chat_completion_helpers.capture_omniroute_route"),
+            patch("agent.chat_completion_gateway.capture_omniroute_route"),
         ):
             mock_compress.return_value = (
                 [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
@@ -941,7 +941,7 @@ class TestPreflightCompression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("hello", conversation_history=big_history)
+            agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_not_called()
 
@@ -1443,7 +1443,7 @@ class TestToolResultPreflightCompression:
             patch.object(agent, "_cleanup_task_resources"),
             # The window is pinned by hand above; SynthPulse's routed-window
             # capture would resize it for the mock's "test/model" answer.
-            patch("agent.chat_completion_helpers.capture_omniroute_route"),
+            patch("agent.chat_completion_gateway.capture_omniroute_route"),
         ):
             mock_compress.return_value = (
                 [{"role": "user", "content": "hello"}], "compressed prompt",
@@ -1502,7 +1502,7 @@ class TestToolResultPreflightCompression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             # Window pinned by hand; skip the routed-window resize (SynthPulse).
-            patch("agent.chat_completion_helpers.capture_omniroute_route"),
+            patch("agent.chat_completion_gateway.capture_omniroute_route"),
         ):
             result = agent.run_conversation("hello")
 

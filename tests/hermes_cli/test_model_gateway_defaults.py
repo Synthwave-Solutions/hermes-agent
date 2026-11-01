@@ -3,8 +3,7 @@
 import os
 from unittest.mock import patch
 
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _KNOWN_ROOT_KEYS,

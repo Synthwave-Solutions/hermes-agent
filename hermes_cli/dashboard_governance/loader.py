@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import os
 import tempfile
 from pathlib import Path
@@ -39,7 +41,9 @@ def resolve_policy_path(
     if cfg is None:
         try:
             cfg = load_config()
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("resolve_policy_path: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             cfg = {}
     dash = cfg.get("dashboard") if isinstance(cfg.get("dashboard"), Mapping) else {}
     gov = dash.get("governance") if isinstance(dash.get("governance"), Mapping) else {}
@@ -140,7 +144,7 @@ def load_governance_policy(
     if not policy_path.exists():
         return GovernancePolicy(mode="off", default_effect="deny")
     try:
-        loaded = fast_safe_load(policy_path.read_text(encoding="utf-8")) or {}
+        loaded = fast_safe_load(policy_path.read_text(encoding="utf-8-sig")) or {}
     except yaml.YAMLError as exc:
         raise GovernancePolicyError(f"invalid YAML in dashboard governance policy: {exc}") from exc
     if not isinstance(loaded, Mapping):

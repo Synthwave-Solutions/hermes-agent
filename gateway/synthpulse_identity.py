@@ -76,7 +76,8 @@ def _identities_path() -> Path:
     override = os.getenv("SYNTHPULSE_GATEWAY_IDENTITIES")
     if override:
         return Path(override).expanduser()
-    home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
     return home / "webui" / "gateway-identities.json"
 
 
@@ -100,7 +101,7 @@ def _load() -> dict:
     if _CACHE["path"] == str(path) and _CACHE["mtime"] == st.st_mtime_ns:
         return _CACHE["data"]
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             data = {}
     except (OSError, ValueError):
@@ -193,7 +194,9 @@ def profile_route_for_source(runner: Any, source, adapter_profile: Optional[str]
         try:
             owner = (runner._transport_owner(source)
                      if callable(getattr(source, "_transport_adapter_ref", None)) else None)
-        except Exception:
+        except Exception as _boundary_error:
+            logging.getLogger(__name__).error("profile_route_for_source: operation failed",
+                exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
             owner = None
         if isinstance(owner, tuple):
             adapter_profile = owner[1]
@@ -217,6 +220,8 @@ def profile_route_for_source(runner: Any, source, adapter_profile: Optional[str]
         from gateway.run import _multiplex_profile_homes
         served = {name for name, _home in _multiplex_profile_homes(getattr(runner, "config", None))}
     except Exception as exc:
+        logging.getLogger(__name__).error("profile_route_for_source: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         _reject("cannot be checked (served profiles unavailable)", exc)
     if requested not in served:
         _reject("this gateway does not serve")
@@ -262,7 +267,7 @@ def fail_closed_reason(source, *, multiplexed: bool) -> str:
 
 
 class Handle:
-    __slots__ = ("token", "scope", "email", "profile")
+    __slots__ = ("email", "profile", "scope", "token")
 
     def __init__(self, token, scope, email, profile):
         self.token, self.scope, self.email, self.profile = token, scope, email, profile
@@ -275,8 +280,8 @@ def _runtime_profile(source) -> str:
         identity = identity_of(source)
         if identity is not None and identity.multiplexed and identity.runtime_profile:
             return identity.runtime_profile
-    except Exception:
-        pass
+    except ImportError:
+        logging.getLogger(__name__).debug("_runtime_profile: optional fallback used")
     return (getattr(source, "profile", None) or "").strip() or "default"
 
 
@@ -313,8 +318,8 @@ def bind_for_source(source, session_key: str = "", *, multiplexed: bool = False)
                         scope.__enter__()
                         try:
                             source.profile = profile
-                        except Exception:
-                            pass
+                        except AttributeError:
+                            logging.getLogger(__name__).debug("bind_for_source: optional fallback used")
                     else:
                         logger.warning("synthpulse identity: profile %r for %s does not exist; running on the gateway profile", profile, email)
                 except Exception as exc:
@@ -489,7 +494,9 @@ def a2a_binding_still_valid(binding: A2ABinding) -> bool:
             and binding.agent in current["serve"]
             and current["profile"] == binding.profile
         )
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("a2a_binding_still_valid: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return False
 
 

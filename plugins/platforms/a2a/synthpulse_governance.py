@@ -44,7 +44,7 @@ import os
 import time
 import urllib.parse
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from fnmatch import fnmatchcase
 from typing import Any, Mapping, Optional
 
@@ -160,7 +160,8 @@ def _host_is_loopback(host: str) -> bool:
 
 def public_url_is_loopback(url: Optional[str] = None) -> bool:
     """True only for an explicit ``A2A_PUBLIC_URL`` whose host is loopback."""
-    raw = os.getenv("A2A_PUBLIC_URL", "") if url is None else url
+    from gateway.platforms._shared import get_scoped_secret
+    raw = get_scoped_secret("A2A_PUBLIC_URL", "") if url is None else url
     raw = (raw or "").strip()
     if not raw:
         return False
@@ -192,7 +193,7 @@ def _header(headers: Any, name: str) -> str:
         if value is None and isinstance(headers, Mapping):
             wanted = name.lower()
             value = next((v for k, v in headers.items() if str(k).lower() == wanted), None)
-    except Exception:
+    except (AttributeError, TypeError):
         return ""
     return str(value) if value is not None else ""
 
@@ -258,7 +259,9 @@ def _admit_unauthenticated_local(identity: str, *, client_ip: str, headers: Any,
         return _refuse(401, protocol.ERR_UNAUTHORIZED, "dev_flag_not_loopback", "unauthorized")
     try:
         policy = _load_policy()
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("_admit_unauthenticated_local: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return _refuse(403, protocol.ERR_FORBIDDEN, "policy_unavailable", "call not allowed")
     if policy.enforce:
         return _refuse(401, protocol.ERR_UNAUTHORIZED, "dev_flag_under_enforce", "unauthorized")
@@ -316,7 +319,9 @@ def admit_peer(identity: Optional[str], *, auth_header: Optional[str], client_ip
 
     try:
         policy = _load_policy()
-    except Exception:
+    except Exception as _boundary_error:
+        logging.getLogger(__name__).error("admit_peer: operation failed",
+            exc_info=(RuntimeError, RuntimeError(type(_boundary_error).__name__), _boundary_error.__traceback__))
         return _refuse(403, protocol.ERR_FORBIDDEN, "policy_unavailable", "call not allowed")
 
     local_org = _policy_org_id(policy)
@@ -621,7 +626,7 @@ def record_decision(decision: str, reason: str, *, peer: str = "", actor: str = 
                    reason, peer or "-", agent or "-", rpc_method or "-")
     try:
         _append_central_event({
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "service": CENTRAL_EVENT_SERVICE,
             "kind": CENTRAL_EVENT_KIND,
             "level": "warning",

@@ -29,8 +29,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PRINCIPAL = "cron-system@example.test"
 ADMIN = "root@example.test"
@@ -181,7 +180,7 @@ def _background(tmp_path, ctx, argvs):
         env = _sanitize_subprocess_env(dict(os.environ))
     proc = subprocess.run(
         ["bash", "-c", _child_command(tmp_path, argvs)],
-        env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=240,
+        env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=240, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return _parse(proc.stdout)
@@ -260,9 +259,9 @@ def test_the_real_cli_entry_in_the_foreground_terminal_is_refused(enforced_store
     principal = _job(PRINCIPAL, "ops", prompt="Nightly admin digest")
     before = _stored(principal)
     code = (
-        "import sys, cron; assert cron.__file__.startswith(%r), cron.__file__; "
-        "from hermes_cli.main import main; sys.argv = ['hermes'] + %r; main()"
-    ) % (str(REPO_ROOT) + os.sep, ["cron", "edit", principal, "--prompt", "Export every mailbox"])
+        "import sys, cron; assert cron.__file__.startswith({!r}), cron.__file__; "
+        "from hermes_cli.main import main; sys.argv = ['hermes'] + {!r}; main()"
+    ).format(str(REPO_ROOT) + os.sep, ["cron", "edit", principal, "--prompt", "Export every mailbox"])
     command = f"PYTHONPATH={shlex.quote(str(REPO_ROOT))} {shlex.quote(sys.executable)} -c {shlex.quote(code)}"
     with governance_context(_ctx_for(MALLORY)):
         env = LocalEnvironment(cwd=str(tmp_path), timeout=240)
@@ -398,16 +397,16 @@ def test_the_reassign_owner_path_is_refused_in_a_ceiled_webui_terminal(enforced_
     alice = _job(ALICE, "alice")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
     code = (
-        "import sys, cron; assert cron.__file__.startswith(%r), cron.__file__; "
-        "from hermes_cli.main import main; sys.argv = ['hermes'] + %r; main()"
-    ) % (str(REPO_ROOT) + os.sep, ["cron", "reassign-owner", alice, "--system-principal"])
+        "import sys, cron; assert cron.__file__.startswith({!r}), cron.__file__; "
+        "from hermes_cli.main import main; sys.argv = ['hermes'] + {!r}; main()"
+    ).format(str(REPO_ROOT) + os.sep, ["cron", "reassign-owner", alice, "--system-principal"])
     from hermes_cli.dashboard_governance.context import governance_context
     from tools.environments.local import _sanitize_subprocess_env
 
     with governance_context(_ctx_for(ADMIN, ceiling=True)):
         env = _sanitize_subprocess_env(dict(os.environ))
     env["PYTHONPATH"] = str(REPO_ROOT)
-    proc = subprocess.run([sys.executable, "-c", code], env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=240)
+    proc = subprocess.run([sys.executable, "-c", code], env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=240, check=False)
 
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _stored(alice)["owner_email"] == ALICE
@@ -416,7 +415,7 @@ def test_the_reassign_owner_path_is_refused_in_a_ceiled_webui_terminal(enforced_
 @pytest.fixture()
 def fake_runs(monkeypatch):
     """No test here may start a real agent run in this process."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     runs = []
     monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: runs.append(job["id"]) or (True, "o", "f", None))

@@ -32,6 +32,21 @@ def test_monthly_tool_call_cap_blocks_after_recorded_usage(tmp_path, monkeypatch
     assert decision.reason == "monthly_tool_calls_exceeded"
 
 
+def test_bom_prefixed_usage_file_preserves_existing_caps(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = _ctx({"monthly_tool_calls": 1})
+    record_tool_usage(ctx, "web_search")
+    usage_file = tmp_path / "dashboard-governance-usage.json"
+    # Editors may add a BOM to an existing file. Its counters must still
+    # enforce the limit instead of being treated as an empty usage ledger.
+    usage_file.write_bytes(b"\xef\xbb\xbf" + usage_file.read_bytes())
+
+    decision = check_usage_caps(ctx, "web_search")
+
+    assert decision.allowed is False
+    assert decision.reason == "monthly_tool_calls_exceeded"
+
+
 def test_mcp_call_cap_counts_mcp_tools(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     ctx = _ctx({"daily_mcp_calls": 1})
