@@ -366,7 +366,7 @@ def _inject_dwd_identity_env(env: dict[str, str]) -> None:
     env.pop("HERMES_DWD_IDENTITY", None)
     try:
         from hermes_cli.dashboard_governance.context import current_governance_context, policy_contexts
-        from hermes_cli.dashboard_governance.tool_policy import dwd_identity_for
+        from hermes_cli.dashboard_governance.tool_policy import DwdExclusion, dwd_identity_for
     except ImportError:
         identity = None
     else:
@@ -381,6 +381,11 @@ def _inject_dwd_identity_env(env: dict[str, str]) -> None:
         if inherited:
             env["HERMES_DWD_IDENTITY"] = inherited
         return
+    if isinstance(identity, DwdExclusion):
+        # An admin who may act as anyone except these mailboxes: hermes_dwd
+        # reads "!a,b" as "any --as but a and b" (03-11-2026: str() of the
+        # frozenset was handed on and locked Marcel out of his own Gmail).
+        identity = "!" + ",".join(sorted(str(s).strip().lower() for s in identity))
     identity = str(identity).strip().lower() or "unresolved-identity"
     if inherited and inherited.lower() != identity:
         identity = "unresolved-identity"
