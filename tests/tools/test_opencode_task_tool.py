@@ -137,7 +137,7 @@ def test_owner_sees_keys_and_only_the_secret_mount_is_masked(tmp_path, workroot)
     assert perm["external_directory"] == "deny"
     assert "**/.env*" not in perm["read"] and perm["read"]["*"] == "allow"
     assert perm["bash"]["*opencode*run*"] == "deny"
-    assert cfg["mcp"] == {}
+    assert all(entry == {"enabled": False} for entry in cfg["mcp"].values())  # no MCP server active
     assert cfg["provider"]["omniroute"]["options"]["apiKey"] == "{env:OMNIROUTE_API_KEY}"
 
 
@@ -336,3 +336,101 @@ def test_directory_denies_do_not_mask_unrelated_project_files(tmp_path):
     denied = set(runner._denied_files_under(
         tmp_path, ['**/.ssh/**', '**/.config/bunq/**', '**/*-sa.json']))
     assert denied == {tmp_path / rel for rel in paths[2:]}
+
+
+# ── 07-11-2026: ideas from dsh-superagent ─────────────────────────────────────
+
+FAKE_OPENCODE_DB = r'''#!/usr/bin/env python3
+"""Fake `opencode run`: fails the model call once, then finishes on --session."""
+import json, os, sqlite3, sys, time
+args = sys.argv[1:]
+db = os.path.join(os.environ["XDG_DATA_HOME"], "opencode", "opencode.db")
+os.makedirs(os.path.dirname(db), exist_ok=True)
+con = sqlite3.connect(db)
+con.execute("create table if not exists session (id text primary key, parent_id text, time_updated integer)")
+con.execute("create table if not exists message (id text primary key, session_id text, time_created integer, data text)")
+con.execute("create table if not exists part (id text primary key, message_id text, time_created integer, data text)")
+now = int(time.time() * 1000) + len(con.execute("select id from message").fetchall())
+log = os.path.join(os.environ["XDG_DATA_HOME"], "calls.log")
+with open(log, "a") as fh:
+    fh.write(json.dumps(args) + "\n")
+if "--session" in args:
+    sid = args[args.index("--session") + 1]
+    mid = f"m{now}"
+    con.execute("insert into message values (?,?,?,?)", (mid, sid, now, json.dumps({"role": "assistant"})))
+    con.execute("insert into part values (?,?,?,?)", (f"p{now}", mid, now, json.dumps(
+        {"type": "text", "text": "Changed a.txt, verified with cat.\nSTATUS: blocked\nQUESTION: Keep the old API?"})))
+    open("a.txt", "w").write("done\n")
+else:
+    sid = "ses_test1"
+    con.execute("insert into session values (?,?,?)", (sid, None, now))
+    con.execute("insert into message values (?,?,?,?)", (f"m{now}", sid, now, json.dumps(
+        {"role": "assistant", "error": {"name": "UnknownError", "data": {"message": "Maximum combo retry limit reached"}}})))
+con.commit()
+print("fake opencode done")
+'''
+
+
+def test_parse_status_and_transient_errors():
+    assert runner.parse_status("did x\nSTATUS: ready\nQUESTION: none") == ("ready", "")
+    assert runner.parse_status("**STATUS:** blocked\nQUESTION: Which DB?") == ("blocked", "Which DB?")
+    assert runner.parse_status("no contract here") == ("", "")
+    assert runner.is_transient("Maximum combo retry limit reached")
+    assert runner.is_transient("[codex/x] [503]: busy")
+    assert not runner.is_transient("SyntaxError in a.py")
+    assert not runner.is_transient("")
+
+
+@pytest.mark.skipif(not shutil.which("bwrap"), reason="needs bubblewrap")
+def test_runner_resumes_same_session_after_gateway_error(tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    work.mkdir()
+    fake = tmp_path / "fake-opencode"
+    fake.write_text(FAKE_OPENCODE_DB)
+    fake.chmod(0o755)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    job = {"id": "j1", "task": "make a.txt", "workdir": str(work), "model": "m/x", "opencode_bin": str(fake),
+           "home": str(tmp_path), "slot_dir": str(tmp_path / "slots"), "slots": 2, "slot_wait": 5,
+           "timeout": 600, "test_command": "", "mask_dirs": [], "mask_files": [], "deny_patterns": [],
+           "opencode_config": {}, "path": os.environ.get("PATH", "/usr/bin:/bin")}
+    (run_dir / "job.json").write_text(json.dumps(job))
+    monkeypatch.setattr(runner, "RETRY_BACKOFF", (0, 0, 0))
+    monkeypatch.delenv("OPENCODE_RECURSION_GUARD", raising=False)
+    assert runner.main(str(run_dir)) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[2] == "STATUS: blocked"
+    assert "QUESTION: Keep the old API?" in out
+    assert "retry 1" in out and "a.txt" in out
+    calls = [json.loads(l) for l in (run_dir / "state" / "data" / "calls.log").read_text().splitlines()]
+    assert len(calls) == 2 and "--session" not in calls[0] and calls[1][calls[1].index("--session") + 1] == "ses_test1"
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["status"] == "blocked" and result["retries"] == 1 and result["session"] == "ses_test1"
+    assert (run_dir / "report.md").read_text().startswith("# opencode_task j1")
+
+
+def test_handoff_contract_is_appended_and_continue_job_checks_owner(tmp_path, monkeypatch):
+    monkeypatch.setattr(opencode_tool, "_job_root", lambda: tmp_path)
+    (tmp_path / "j0").mkdir()
+    (tmp_path / "j0" / "job.json").write_text(json.dumps({"id": "j0", "owner_email": "a@x", "workdir": "/w"}))
+    assert "someone else" in opencode_tool.load_previous_job("j0", "b@x")[1]
+    assert "no OpenCode session" in opencode_tool.load_previous_job("j0", "a@x")[1]
+    assert "earlier" in opencode_tool.load_previous_job("../etc", "a@x")[1]
+    assert "no earlier job" in opencode_tool.load_previous_job("nope", "a@x")[1]
+    assert "STATUS: ready | blocked | failed | dropped" in opencode_tool.HANDOFF_CONTRACT
+
+
+def test_lean_jobs_switch_off_host_mcp_servers_and_external_skills(tmp_path, monkeypatch):
+    cfg = tmp_path / ".config" / "opencode"
+    cfg.mkdir(parents=True)
+    (cfg / "opencode.jsonc").write_text('{\n  // comment\n  "mcp": {"mailchimp": {"type": "local"}, "ragflow": {}}\n}')
+    monkeypatch.setattr(opencode_tool, "_host_home", lambda: tmp_path)
+    assert opencode_tool.opencode_config([], lean=True)["mcp"] == {
+        "mailchimp": {"enabled": False}, "ragflow": {"enabled": False}}
+    assert opencode_tool.opencode_config([], lean=False)["mcp"] == {}
+    job = {"home": str(tmp_path), "opencode_config": {}}
+    env = runner.sandbox_env({**job, "lean": True}, tmp_path / "run", "k")
+    assert env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1" and env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] == "1"
+    assert "OPENCODE_DISABLE_EXTERNAL_SKILLS" not in runner.sandbox_env({**job, "lean": False}, tmp_path / "run", "k")
+    assert opencode_tool.wants_lean(None, None) and not opencode_tool.wants_lean(True, None)
+    assert not opencode_tool.wants_lean(None, {"lean": False})

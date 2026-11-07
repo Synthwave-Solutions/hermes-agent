@@ -20,6 +20,16 @@ What this process guarantees (15-10-2026):
   OpenCode starts and is masked inside the sandbox;
 * the recursion guard is set, so a nested ``opencode run`` is refused.
 
+07-11-2026 (ideas taken from DeepSeek's dsh-superagent): a passing model or
+gateway failure (combo retry limit, 408/429/5xx, unavailable, reset) no
+longer kills the job. The runner resumes the same OpenCode session up to
+three times with a growing backoff, so the work done so far is kept. A job
+can continue the session of an earlier job (``continue_job``), so a fix-up
+round does not re-read the repository. OpenCode ends with a structured
+``STATUS:`` line (ready, blocked, failed, dropped) and at most one
+``QUESTION:``; the report starts with them. The report is also kept as
+``report.md`` and ``result.json`` in the job directory.
+
 The report (stdout) is what the completion notification delivers to the agent.
 """
 
@@ -37,7 +47,21 @@ import sys
 import time
 from pathlib import Path
 
+import re
+import sqlite3
+
 REPORT_DIFF_LINES = 400
+RETRY_BACKOFF = (15, 45, 90)
+TRANSIENT_PATTERNS = (
+    "combo retry limit", "model is unavailable", "upstream request failed", "overloaded",
+    "rate limit", "too many requests", "timed out", "timeout", "econnreset", "econnrefused",
+    "socket hang up", "connection reset", "connection refused", "fetch failed", "network",
+    "[408]", "[429]", "[500]", "[502]", "[503]", "[504]", "[520]", "[522]", "[524]", "[529]",
+)
+STATUS_RE = re.compile(r"^\s*\**STATUS\**\s*:\s*\**\s*(ready|blocked|failed|dropped)\b", re.IGNORECASE | re.MULTILINE)
+QUESTION_RE = re.compile(r"^\s*\**QUESTION\**\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+CONTINUE_NOTE = ("The previous model call failed on a passing gateway error. Continue the same task "
+                 "from where you stopped; do not redo finished steps.")
 REPORT_TAIL_CHARS = 6000
 SNAPSHOT_FILE_LIMIT = 20000
 
@@ -142,11 +166,77 @@ def changed_files(before: dict, after: dict) -> list[str]:
     return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
 
 
+def state_dir(job: dict, run_dir: Path) -> Path:
+    """OpenCode's per-job state; a continued job reuses the earlier job's."""
+    return Path(job.get("state_dir") or (run_dir / "state"))
+
+
+def session_facts(state: Path) -> dict:
+    """The latest OpenCode session in this state dir: id, last error, last text."""
+    db = state / "data" / "opencode" / "opencode.db"
+    facts = {"session": "", "error": "", "text": "", "steps": 0}
+    if not db.is_file():
+        return facts
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            row = con.execute("select id from session where parent_id is null "
+                              "order by time_updated desc limit 1").fetchone()
+            if not row:
+                return facts
+            facts["session"] = row[0]
+            msgs = con.execute("select id, data from message where session_id=? order by time_created",
+                               (row[0],)).fetchall()
+            assistant = [(mid, json.loads(d)) for mid, d in msgs]
+            assistant = [(mid, d) for mid, d in assistant if d.get("role") == "assistant"]
+            facts["steps"] = len(assistant)
+            if assistant:
+                _, last = assistant[-1]
+                err = last.get("error") or {}
+                if err:
+                    data = err.get("data") or {}
+                    facts["error"] = str(data.get("message") or err.get("name") or err)[:600]
+                for mid, _ in reversed(assistant):
+                    parts = con.execute("select data from part where message_id=? order by time_created", (mid,)).fetchall()
+                    text = "\n".join(json.loads(d).get("text", "") for (d,) in parts
+                                     if json.loads(d).get("type") == "text")
+                    if text.strip():
+                        facts["text"] = text
+                        break
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    return facts
+
+
+def is_transient(error: str) -> bool:
+    low = (error or "").lower()
+    return bool(low) and any(p in low for p in TRANSIENT_PATTERNS)
+
+
+def parse_status(text: str) -> tuple[str, str]:
+    """(status, question) from OpenCode's closing lines; '' when absent."""
+    found = STATUS_RE.findall(text or "")
+    status = found[-1].lower() if found else ""
+    q = QUESTION_RE.findall(text or "")
+    question = q[-1].strip() if q else ""
+    if question.lower() in {"none", "-", "n/a", "geen"}:
+        question = ""
+    return status, question[:500]
+
+
 def prepare_worktree(job: dict) -> tuple[Path, dict]:
     """A fresh worktree on branch opencode/<id>; returns (work path, git info)."""
     top = Path(job["git_top"])
     worktree = Path(job["worktree"])
     branch = job["branch"]
+    if job.get("reuse_worktree") and worktree.is_dir():
+        workdir = Path(job["workdir"])
+        rel = workdir.relative_to(top) if workdir != top else Path(".")
+        _, base = _git(worktree, "rev-parse", "HEAD")
+        return worktree / rel, {"git": True, "top": str(worktree), "repo": str(top), "worktree": str(worktree),
+                                "branch": branch, "base": base.strip(), "writable": False}
     worktree.parent.mkdir(parents=True, exist_ok=True)
     exclude = top / ".git" / "info" / "exclude"
     try:
@@ -202,7 +292,7 @@ def bwrap_argv(job: dict, run_dir: Path, workroot: Path, git_info: dict) -> list
     for raw in job.get("mask_files", []):
         if Path(raw).is_file() and shown(raw):
             argv += ["--ro-bind", "/dev/null", raw]
-    state = run_dir / "state"
+    state = state_dir(job, run_dir)
     for sub in ("data", "state", "tmp"):
         (state / sub).mkdir(parents=True, exist_ok=True)
     cache = home / ".cache" / "opencode"
@@ -251,7 +341,7 @@ def _denied_files_under(root: Path, patterns, limit: int = 20000):
 
 def sandbox_env(job: dict, run_dir: Path, key: str) -> dict:
     home = job["home"]
-    state = run_dir / "state"
+    state = state_dir(job, run_dir)
     env = {
         "HOME": home,
         "PATH": job.get("path") or "/usr/local/bin:/usr/bin:/bin",
@@ -269,6 +359,10 @@ def sandbox_env(job: dict, run_dir: Path, key: str) -> dict:
         "OPENCODE_CONFIG_CONTENT": json.dumps(job["opencode_config"]),
         "OMNIROUTE_API_KEY": key,
     }
+    if job.get("lean", True):
+        # ~2,000 installed skills otherwise ride along in every step (~90k tokens).
+        env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
+        env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] = "1"
     return env
 
 
@@ -308,11 +402,58 @@ def collect_git(git_info: dict, workroot: Path, files: list[str]) -> str:
     return shown
 
 
+def lock_session(job: dict, run_dir: Path):
+    """One run per OpenCode session: a second follow-up is refused, not queued."""
+    import fcntl
+
+    state = state_dir(job, run_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    handle = open(state / ".session.lock", "w", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def run_with_resume(job: dict, run_dir: Path, workroot: Path, git_info: dict, env: dict, deadline: float):
+    """Run OpenCode; resume the same session after a passing gateway failure.
+
+    Returns (exit code, output, session facts, session id, retry notes)."""
+    state = state_dir(job, run_dir)
+    session = job.get("continue_session", "")
+    message = job["task"]
+    retries: list[str] = []
+    outputs: list[str] = []
+    while True:
+        argv = bwrap_argv(job, run_dir, workroot, git_info) + [job["opencode_bin"], "run", "-m", job["model"]]
+        if session:
+            argv += ["--session", session]
+        argv += ["--dir", str(workroot), message]
+        code, output = _run(argv, cwd=str(workroot), env=env, timeout=max(60, int(deadline - time.time())))
+        outputs.append(output)
+        facts = session_facts(state)
+        session = facts["session"] or session
+        error = facts["error"] or (output.strip()[-600:] if code not in (0, 124) else "")
+        if code == 124 or not is_transient(error) or len(retries) >= len(RETRY_BACKOFF) or not session:
+            break
+        wait = RETRY_BACKOFF[len(retries)]
+        if time.time() + wait + 120 > deadline:
+            break
+        retries.append(f"{' '.join(error.split())[:160]} (retry {len(retries) + 1} after {wait}s)")
+        time.sleep(wait)
+        message = CONTINUE_NOTE
+    if facts.get("error") and code == 0:
+        code = 1  # OpenCode exits 0 even when its last model call failed
+    return code, "\n".join(outputs), facts, session, retries
+
+
 def main(job_dir: str) -> int:
     run_dir = Path(job_dir)
     job = json.loads((run_dir / "job.json").read_text(encoding="utf-8-sig"))
     started = time.time()
-    report = [f"# opencode_task {job['id']}", f"task: {' '.join(job['task'].split())[:300]}"]
+    report = [f"# opencode_task {job['id']}", f"task: {' '.join(job.get('brief', job['task']).split())[:300]}"]
 
     key = take_key(run_dir)
     if os.environ.get("OPENCODE_RECURSION_GUARD"):
@@ -325,6 +466,12 @@ def main(job_dir: str) -> int:
     if slot is None:
         print("\n".join(report + ["status: busy",
                                   f"reason: all {job.get('slots', 12)} OpenCode slots stayed busy; retry later"]))
+        return 75
+    session_lock = lock_session(job, run_dir)
+    if session_lock is None:
+        slot.close()
+        print("\n".join(report + ["STATUS: failed",
+                                  f"reason: job {job.get('continue_of') or job['id']} is still running in that session; wait for its report"]))
         return 75
     try:
         if job.get("worktree"):
@@ -340,19 +487,32 @@ def main(job_dir: str) -> int:
             git_info = {"git": bool(job.get("git_top")), "top": job.get("git_top", ""),
                         "writable": bool(job.get("git_writable"))}
         before = snapshot(workroot, git_info["top"])
-        argv = bwrap_argv(job, run_dir, workroot, git_info) + [
-            job["opencode_bin"], "run", "-m", job["model"], "--dir", str(workroot), job["task"]]
         env = sandbox_env(job, run_dir, key)
         key = ""
-        code, output = _run(argv, cwd=str(workroot), env=env, timeout=int(job.get("timeout", 3600)))
+        code, output, facts, session, retries = run_with_resume(
+            job, run_dir, workroot, git_info, env, deadline=started + int(job.get("timeout", 3600)))
         report.append(f"opencode exit: {code}")
         test_out = ""
+        tcode = None
         if job.get("test_command"):
             test_argv = bwrap_argv(job, run_dir, workroot, git_info) + ["bash", "-c", job["test_command"]]
             env_test = dict(env)
             env_test.pop("OMNIROUTE_API_KEY", None)
             tcode, test_out = _run(test_argv, cwd=str(workroot), env=env_test, timeout=int(job.get("test_timeout", 900)))
             report.append(f"test exit: {tcode}")
+        status, question = parse_status(facts.get("text", ""))
+        if facts.get("error") or code not in (0,):
+            status = "failed" if status != "blocked" else status
+        if not status:
+            status = "ready" if code == 0 else "failed"
+        head = [f"STATUS: {status}"] + ([f"QUESTION: {question}"] if question else [])
+        if status == "ready" and tcode not in (None, 0):
+            status = "failed"
+            head = ["STATUS: failed", "NOTE: OpenCode reported ready, but test_command failed (see Test output)."]
+        head += [f"session: {session or '-'} (follow-up: opencode_task continue_job={job['id']})"]
+        if retries:
+            head += ["gateway retries:"] + [f"- {r}" for r in retries]
+        report[2:2] = head
         after = snapshot(workroot, git_info["top"])
         changed = changed_files(before, after)
         where = f"worktree {workroot}" if git_info.get("worktree") else f"edited in place in {workroot}"
@@ -374,11 +534,20 @@ def main(job_dir: str) -> int:
         if job.get("test_command"):
             report += ["", "## Test output", _tail(test_out)]
         report += ["", "## OpenCode output", _tail(output)]
-        report.append(f"\nstatus: {'ok' if code == 0 else 'failed'} in {int(time.time() - started)}s")
-        print("\n".join(report))
+        took = int(time.time() - started)
+        report.append(f"\nstatus: {'ok' if code == 0 else 'failed'} in {took}s")
+        text = "\n".join(report)
+        (run_dir / "report.md").write_text(text, encoding="utf-8")
+        (run_dir / "result.json").write_text(json.dumps({
+                "id": job["id"], "status": status, "exit": code, "seconds": took, "retries": len(retries),
+                "session": session, "steps": facts.get("steps", 0), "changed": len(changed),
+                "question": question, "continue_of": job.get("continue_of", ""),
+                "test_exit": tcode}, indent=1), encoding="utf-8")
+        print(text)
         return 0 if code == 0 else 1
     finally:
         slot.close()
+        session_lock.close()
 
 
 if __name__ == "__main__":

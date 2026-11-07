@@ -23,6 +23,13 @@ Governance (15-10-2026, Michael):
 sees keys and credentials the caller may read, and runs up to
 HERMES_OPENCODE_MAX_SLOTS jobs at once (default 12). Only what the caller has
 no access to stays masked.
+
+07-11-2026 (Michael, ideas from DeepSeek's dsh-superagent): every task gets a
+short handoff contract (stop by impact, one concrete question, honest status,
+a closing STATUS line), and ``continue_job`` sends a follow-up into the
+OpenCode session of an earlier job, in the same workdir or worktree, so a
+fix-up round keeps the context instead of re-reading the repository. Passing
+gateway failures are resumed by the runner.
 """
 
 from __future__ import annotations
@@ -46,6 +53,51 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "opencode_task"
 DEFAULT_MODEL = "omniroute/auto/best-coding"
 RUNNER = Path(__file__).resolve().with_name("opencode_task_runner.py")
+
+# Appended to every task. Kept short: OpenCode reads it on every job.
+HANDOFF_CONTRACT = """
+
+---
+How to work and hand back (from the agent that delegated this job):
+- Work unattended to a reviewable result. Nobody answers questions while you run.
+- Stop by impact, not effort: finish local changes completely; if the job needs a design
+  decision, a credential, or access you do not have, stop and ask one concrete question.
+- Stay inside the task's scope; mention anything else you noticed in one line, do not fix it.
+- Verify what you changed (run the relevant tests or the command that proves it). Never claim
+  a check you did not run. Do not commit, push or deploy.
+- End your final message with these lines:
+  STATUS: ready | blocked | failed | dropped
+  (ready = done and verified; blocked = needs the QUESTION answered; failed = could not do it;
+  dropped = nothing to do, e.g. already done or not reproducible)
+  QUESTION: <one concrete question, only when blocked>
+  Before them, at most five lines: what changed and how you verified it."""
+
+
+def _job_root() -> Path:
+    return get_hermes_home() / "cache/opencode-tasks"
+
+
+def load_previous_job(job_id: str, owner_email: str) -> tuple[Optional[dict], Optional[str]]:
+    """The earlier job a follow-up continues, or an error. Same owner only."""
+    job_id = (job_id or "").strip()
+    if not job_id or "/" in job_id or job_id.startswith("."):
+        return None, "continue_job must be the id of an earlier opencode_task job."
+    path = _job_root() / job_id / "job.json"
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None, f"continue_job: no earlier job {job_id} found."
+    if (prev.get("owner_email") or "") != (owner_email or ""):
+        return None, "continue_job: that job belongs to someone else."
+    state = Path(prev.get("state_dir") or (_job_root() / job_id / "state"))
+    if not (state / "data" / "opencode" / "opencode.db").is_file():
+        return None, f"continue_job: job {job_id} has no OpenCode session to continue."
+    prev["_state_dir"] = str(state)
+    from tools.opencode_task_runner import session_facts
+    prev["_session"] = session_facts(state).get("session", "")
+    if not prev["_session"]:
+        return None, f"continue_job: job {job_id} has no OpenCode session to continue."
+    return prev, None
 
 
 def _host_home() -> Path:
@@ -107,8 +159,10 @@ OPENCODE_TASK_SCHEMA = {
             "worktree": {"type": "boolean", "description": "Work in a separate git worktree on branch opencode/<id> instead of the live tree (default false). Use it for parallel jobs in one repository, or when the live tree has work in progress."},
             "test_command": {"type": "string", "description": "Optional command run in the workdir after OpenCode, e.g. 'pytest -q tests/x'."},
             "timeout": {"type": "integer", "description": "Seconds before OpenCode is stopped (default 3600, max 7200)."},
+            "full_context": {"type": "boolean", "description": "Load every installed skill and MCP server into OpenCode (default false). That costs about ten times more tokens per step and is slower; use it only when the job needs a specific skill or MCP tool."},
+            "continue_job": {"type": "string", "description": "Id of an earlier opencode_task job (opencode_job in its result). Sends this task as a follow-up into that job's OpenCode session, in the same workdir or worktree, so it keeps everything it already read. Use it for review fixes, failed tests and answers to its QUESTION instead of starting a fresh job. workdir may then be the same workdir or omitted."},
         },
-        "required": ["task", "workdir"],
+        "required": ["task"],
     },
 }
 
@@ -275,8 +329,27 @@ def home_layout(access) -> dict:
             "runtime_paths": [str(_host_home() / p) for p in RUNTIME_PATHS]}
 
 
-def opencode_config(deny_patterns: list[str]) -> dict:
-    """Inline config (highest precedence): provider, no MCP, the caller's denies, no edits outside the workdir."""
+def user_mcp_names() -> list[str]:
+    """MCP servers the host's OpenCode config defines. Inline config merges with
+    it, so an empty "mcp" does not switch them off; each needs enabled=false."""
+    import re
+
+    names: set[str] = set()
+    for name in ("opencode.jsonc", "opencode.json"):
+        path = _host_home() / ".config" / "opencode" / name
+        try:
+            text = re.sub(r"(?m)^\s*//.*$", "", path.read_text(encoding="utf-8-sig"))
+            names.update((json.loads(text).get("mcp") or {}).keys())
+        except (OSError, ValueError, AttributeError):
+            continue
+    return sorted(names)
+
+
+def opencode_config(deny_patterns: list[str], lean: bool = True) -> dict:
+    """Inline config (highest precedence): provider, the caller's denies, no edits outside the workdir.
+
+    lean (07-11-2026): the host's MCP servers off. With the external skills also
+    off (runner env) a step costs ~13k input tokens instead of ~134k."""
     rules = {"*": "allow"}
     bash_rules = {"*": "allow", "*opencode*run*": "deny"}
     for pattern in deny_patterns:
@@ -295,7 +368,7 @@ def opencode_config(deny_patterns: list[str]) -> dict:
                     "auto/best-coding", "auto/coding", "auto/best-coding-fast", "auto/best-reasoning")},
             }
         },
-        "mcp": {},
+        "mcp": {name: {"enabled": False} for name in user_mcp_names()} if lean else {},
         "permission": {
             "external_directory": "deny",
             "read": dict(rules),
@@ -306,14 +379,59 @@ def opencode_config(deny_patterns: list[str]) -> dict:
     }
 
 
+def resolve_continuation(continue_job: str, workdir: Optional[str]) -> tuple[Optional[dict], Optional[str]]:
+    """The earlier job a follow-up continues, checked against the caller and workdir."""
+    ctx, _ = _current_context()
+    access = getattr(ctx, "access", None) if ctx is not None else None
+    owner = getattr(getattr(access, "subject", None), "email", "") if access is not None else ""
+    prev, err = load_previous_job(continue_job, owner)
+    if err:
+        return None, err
+    given = (workdir or "").strip()
+    if given and os.path.realpath(os.path.expanduser(given)) != prev["workdir"]:
+        return None, f"continue_job {continue_job} worked in {prev['workdir']}; pass that workdir or none."
+    return prev, None
+
+
+def continuation_args(continue_job, workdir, model):
+    """(earlier job or None, workdir, model, error) for an optional follow-up."""
+    if not continue_job:
+        return None, workdir, model, None
+    prev, err = resolve_continuation(continue_job, workdir)
+    if err:
+        return None, workdir, model, err
+    return prev, prev["workdir"], model or prev.get("model"), None
+
+
+def apply_continuation(job: dict, prev: Optional[dict]) -> None:
+    """Point a new job at the earlier job's OpenCode session and worktree."""
+    if prev is None:
+        return
+    job.update({"continue_of": prev["id"], "state_dir": prev["_state_dir"],
+                "continue_session": prev.get("_session", "")})
+    if prev.get("worktree"):
+        job.update({"branch": prev["branch"], "worktree": prev["worktree"], "reuse_worktree": True})
+
+
+def wants_lean(full_context: Optional[bool], prev: Optional[dict]) -> bool:
+    """Lean unless asked for full context; a follow-up keeps its session's choice."""
+    if full_context is None:
+        return (prev or {}).get("lean", True)
+    return not full_context
+
+
 def opencode_task(task: str, workdir: str, model: Optional[str] = None, background: bool = True,
                   test_command: Optional[str] = None, timeout: Optional[int] = None, worktree: bool = False,
-                  task_id: Optional[str] = None, session_id: Optional[str] = None) -> str:
+                  task_id: Optional[str] = None, session_id: Optional[str] = None,
+                  continue_job: Optional[str] = None, full_context: Optional[bool] = None) -> str:
     task = (task or "").strip()
     if not task:
         return tool_error("opencode_task needs a task.")
     if os.environ.get("OPENCODE_RECURSION_GUARD"):
         return tool_error("Refused: already running inside OpenCode (recursion guard). Do the work directly.")
+    prev, workdir, model, err = continuation_args(continue_job, workdir, model)
+    if err:
+        return tool_error(err)
     raw_workdir = (workdir or "").strip()
     if not raw_workdir or not os.path.isabs(os.path.expanduser(raw_workdir)):
         return tool_error("workdir must be an absolute path.")
@@ -346,7 +464,7 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
     top = _git_top(resolved)
     job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
     job: dict[str, Any] = {
-        "id": job_id, "task": task, "workdir": str(resolved), "model": (model or DEFAULT_MODEL).strip(),
+        "id": job_id, "task": task + ("" if prev else HANDOFF_CONTRACT), "brief": task, "workdir": str(resolved), "model": (model or DEFAULT_MODEL).strip(),
         "opencode_bin": opencode_bin, "home": str(_host_home()), "slot_dir": str(get_default_hermes_root() / "run/opencode-slots"), "slots": _max_slots(),
         "slot_wait": 600, "timeout": max(60, min(int(timeout or 3600), 7200)),
         "test_command": (test_command or "").strip(),
@@ -374,13 +492,15 @@ def opencode_task(task: str, workdir: str, model: Optional[str] = None, backgrou
             job.update({"branch": f"opencode/{job_id}", "worktree": str(top / ".opencode-worktrees" / job_id)})
     elif worktree:
         return tool_error("worktree=true needs a git repository as workdir.")
+    apply_continuation(job, prev)
     mask_dirs, mask_files, deny_patterns = mask_plan(access)
     # Never mask the place OpenCode has to work in.
     keep = Path(job.get("worktree") or resolved)
     job["mask_dirs"] = [d for d in mask_dirs if not str(keep).startswith(d.rstrip("/") + "/") and str(keep) != d]
     job["mask_files"] = mask_files
     job["deny_patterns"] = deny_patterns
-    job["opencode_config"] = opencode_config(deny_patterns)
+    job["lean"] = wants_lean(full_context, prev)
+    job["opencode_config"] = opencode_config(deny_patterns, lean=job["lean"])
     job.update(home_layout(access))
 
     run_dir = get_hermes_home() / "cache/opencode-tasks" / job_id
@@ -422,6 +542,7 @@ def _handle_opencode_task(args, **kw):
         task=args.get("task"), workdir=args.get("workdir"), model=args.get("model"),
         background=args.get("background", True), test_command=args.get("test_command"),
         timeout=args.get("timeout"), worktree=bool(args.get("worktree", False)), task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+        continue_job=args.get("continue_job"), full_context=args.get("full_context"),
     )
 
 
