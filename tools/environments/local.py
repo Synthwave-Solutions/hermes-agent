@@ -331,6 +331,7 @@ def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     _inject_dwd_identity_env(out)
     _inject_bot_ceiling_env(out)
     _inject_granted_env_vars(out)
+    _inject_personal_app_env(out)
     return _finalize_child_env(out)
 
 
@@ -455,6 +456,20 @@ def _inject_granted_env_vars(env: dict[str, str]) -> None:
             env.setdefault(key, value)
     except Exception:
         logger.debug("could not apply granted env vars for subprocess", exc_info=True)
+
+
+def _inject_personal_app_env(env: dict[str, str]) -> None:
+    """The signed-in person's own API keys from WebUI Integrations (Nango), for their CLIs.
+
+    Bound per WebUI turn by the host (tools.app_connections_tool). Only the person's own
+    connections are exported and they override the shared host value, so a personal key
+    is what their CLI uses. Unbound runs (cron, routed profiles, plain CLI) are untouched.
+    """
+    try:
+        from tools.app_connections_tool import personal_cli_env
+        env.update(personal_cli_env())
+    except Exception:
+        logger.debug("could not apply personal app env for subprocess", exc_info=True)
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
