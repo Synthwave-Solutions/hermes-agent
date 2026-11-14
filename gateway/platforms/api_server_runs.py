@@ -719,6 +719,8 @@ async def _admit_run_to_authority(
 
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
+    from gateway.platforms.api_server_runtime_options import _request_agent_overrides
+
     _openai_error = _api_server._openai_error
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -757,7 +759,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     previous_response_id = body.get("previous_response_id")
     session_id = body.get("session_id") or stored_session_id
     route = self._resolve_route(body.get("model"))
-    agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
+    agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
         session_id=session_id, gateway_session_key=gateway_session_key,
         requested_model=agent_overrides.get("requested_model"),
@@ -1316,6 +1318,8 @@ _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "onc
 
 async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
+    from gateway.platforms.api_server_runtime_options import _coerce_request_bool
+
     _openai_error = _api_server._openai_error
     run_id, _, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
@@ -1336,7 +1340,7 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
     # Room grants may resolve exactly one request and never widen to session/always.
     allowed = {"once", "deny"} if room_scoped else {"once", "session", "always", "deny"}
-    resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
+    resolve_all = any(_coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
     approval_session_key = self._run_approval_sessions.get(run_id)
     for failed, message, code, status in (
         (raw_request_id is not None and (not request_id or len(request_id) > 256),
