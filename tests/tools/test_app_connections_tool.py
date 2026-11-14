@@ -1,7 +1,7 @@
 """app_connections tool: fail closed when unbound, approval for writes, GraphQL read detection."""
 import json
 
-from tests.tools._child_env_fixtures import child_env  # noqa: F401
+from tests.tools._child_env_fixtures import child_env
 from tools import app_connections_tool as m
 
 
