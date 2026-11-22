@@ -56,6 +56,11 @@ def run_cell(request, execution_count):
     """Exec one cell; returns (response payload, FULL stdout text)."""
     out, err = io.StringIO(), io.StringIO()
     status, trace = "ok", ""
+    for _k, _v in (request.get("session_env") or {}).items():
+        if _v:
+            __import__("os").environ[_k] = _v
+        else:
+            __import__("os").environ.pop(_k, None)
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
@@ -477,6 +482,22 @@ def shutdown_kernels_for_delegated_child(child_session_id: str) -> None:
 atexit.register(shutdown_all_kernels)
 
 
+def _synthpulse_session_env() -> dict:
+    """HERMES_SESSION_* of the calling cell; an empty value means explicitly unset (clears a stale one)."""
+    env: dict = {}
+    try:
+        from gateway.session_context import _VAR_MAP, _UNSET, session_context_engaged
+        for name, var in _VAR_MAP.items():
+            value = var.get()
+            if value is not _UNSET:
+                env[name] = "" if value is None else str(value)
+            elif session_context_engaged():
+                env[name] = ""
+    except Exception:
+        pass
+    return env
+
+
 def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
                  sandbox_tools: frozenset) -> None:
     """Serve tool RPC for the kernel's whole life: ``_rpc_server_loop`` returns on disconnect or
@@ -890,7 +911,7 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
             kernel.cell_log_start = len(kernel.tool_call_log)
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
+            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code, "session_env": _synthpulse_session_env()}) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
             result = _cell_result(
