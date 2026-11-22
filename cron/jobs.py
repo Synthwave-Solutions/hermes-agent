@@ -2753,8 +2753,14 @@ def _resolve_creating_owner(owner_email: Optional[str]) -> str:
     if _SYSTEM_PRINCIPAL_CREATE_SCOPE.get():
         return cron_system_principal() if _is_operator_shell() else ""
     if _creating_session_is_enforced_admin():
-        return cron_system_principal()
-    return ""
+        principal = cron_system_principal()
+        if principal:
+            return principal
+    try:  # fall back to the signed-in user of this conversation
+        from gateway.session_context import get_session_env
+        return normalize_owner_identity(get_session_env("HERMES_SESSION_USER_ID", ""))
+    except Exception:
+        return ""
 
 
 def owner_audit_file() -> Path:
