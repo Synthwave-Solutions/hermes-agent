@@ -17,6 +17,10 @@ CLI ran in-process, mapped onto what the owner serves -- the mapping Ink uses
 import contextlib
 import sys
 import uuid
+import os
+
+# Same budget as hermes_cli.gateway_chat.SESSION_CREATE_TIMEOUT (kept local to avoid an import cycle).
+SESSION_CREATE_TIMEOUT = max(30.0, float(os.environ.get("HERMES_SESSION_CREATE_TIMEOUT", "120") or 120))
 
 from hermes_cli.gateway_client import GatewayClientError
 
@@ -141,7 +145,7 @@ async def _new(view, rest):
         request["api_key"] = view.launch_api_key
     from hermes_cli.gateway_chat import client_env_policy
     request.update(client_env_policy(accepted))  # never in launch_request: this shell's, sent afresh
-    snapshot = await view.client.rpc("session.create", request_id=uuid.uuid4().hex, **request)
+    snapshot = await view.client.rpc("session.create", _timeout=SESSION_CREATE_TIMEOUT, request_id=uuid.uuid4().hex, **request)
     await view.adopt(snapshot)
     print(t("cli.session.new_session"))
     print(f"Session: {view.session_id}", file=sys.stderr, flush=True)

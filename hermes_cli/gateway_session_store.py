@@ -25,6 +25,10 @@ import uuid
 from hermes_cli.gateway_client import GatewayClientError
 from hermes_cli.gateway_connection import RESUME_REFUSALS, GatewayConnection
 
+# session.create preloads skills and toolsets and can take 30 to 45 s under load (measured 23 Nov 2026);
+# the 30 s RPC default made one-shot launches with many skills fail. Same budget as hermes_cli.gateway_chat.
+SESSION_CREATE_TIMEOUT = max(30.0, float(os.environ.get("HERMES_SESSION_CREATE_TIMEOUT", "120") or 120))
+
 logger = logging.getLogger(__name__)
 
 # Read-only SessionDB methods main's CLI calls (served by the WAL reader).
@@ -174,7 +178,7 @@ class GatewaySessionStore:
         if title:
             params["title"] = title
         params.update(self.client_env())
-        snapshot = self.call("session.create", request_id=uuid.uuid4().hex, **params)
+        snapshot = self.call("session.create", timeout=SESSION_CREATE_TIMEOUT, request_id=uuid.uuid4().hex, **params)
         warning = (snapshot.get("info") or {}).get("config_warning")
         if warning:
             print(f"Warning: {warning}", file=sys.stderr)
@@ -549,7 +553,7 @@ def create_titled_session(title):
     try:
         store = session_store()
         params.update(store.client_env())
-        snapshot = store.call("session.create", request_id=uuid.uuid4().hex, title=title, **params)
+        snapshot = store.call("session.create", timeout=SESSION_CREATE_TIMEOUT, request_id=uuid.uuid4().hex, title=title, **params)
     except GatewayClientError as exc:
         logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)
         return None
