@@ -1,163 +1,236 @@
-"""Routing may pick a tier without overriding explicit reasoning or profile policy."""
+"""Semantic routing preserves profile policy, explicit reasoning and prompt bytes."""
+
 from copy import deepcopy
-from types import SimpleNamespace
+import json
+from types import SimpleNamespace as NS
 
 import pytest
-import agent.conversation_loop as loop
-import agent.turn_api_request as request_module
-from agent.turn_api_request import build_api_request
+from agent.model_tiering import (
+    apply_model_tiering,
+    configure_model_tiering,
+    tiering_request_user,
+)
 
-from agent.model_tiering import apply_model_tiering, configure_model_tiering
+
+class Classifier:
+    def __init__(self, results):
+        self.results = iter(results)
+        self.calls = []
+        self.chat = NS(completions=self)
+
+    def with_options(self, **kw):
+        assert kw["max_retries"] == 0 and kw["timeout"] <= 30
+        return self
+
+    def create(self, **kw):
+        self.calls.append(kw)
+        result = next(self.results)
+        if isinstance(result, Exception):
+            raise result
+        return NS(
+            choices=[NS(finish_reason="stop", message=NS(content=json.dumps(result)))]
+        )
 
 
 @pytest.fixture(autouse=True)
-def tiering_env(monkeypatch):
-    monkeypatch.delenv('HERMES_MODEL_TIERING', raising=False)
+def clean_env(monkeypatch):
+    monkeypatch.delenv("HERMES_MODEL_TIERING", raising=False)
 
 
-def request():
-    return {'model': 'synthwave-auto', 'extra_body': {'reasoning': {'enabled': True, 'effort': 'medium'}}}
+def setup(results, **state):
+    a = NS(client=Classifier(results), reasoning_config=None, **state)
+    configure_model_tiering(
+        a,
+        {
+            "model": {
+                "routing": {
+                    "classifier_model": "classifier",
+                    "candidates": {
+                        "small": {
+                            "model": "small-model",
+                            "efforts": ["low", "medium", "high"],
+                        },
+                        "large": {
+                            "model": "large-model",
+                            "efforts": ["low", "high", "xhigh"],
+                        },
+                    },
+                }
+            }
+        },
+    )
+    return a
 
 
-@pytest.mark.parametrize('value', [False, 'false', 0, 'off'])
-def test_profile_switch_disables_all_tiering(value):
-    agent = SimpleNamespace()
-    configure_model_tiering(agent, {'model': {'tiering': value}})
-    kwargs = request()
-    before = deepcopy(kwargs)
-    apply_model_tiering(agent, kwargs, [{'role': 'user', 'content': 'hoi'}])
-    assert kwargs == before
+def decision(candidate="small", effort="low"):
+    return {"candidate": candidate, "effort": effort, "reason": "task requirements"}
 
 
-def test_profile_switch_is_scoped_and_snapshotted():
-    disabled, enabled = SimpleNamespace(), SimpleNamespace()
-    config = {'model': {'tiering': False}}
-    configure_model_tiering(disabled, config)
-    configure_model_tiering(enabled, {})
-    config['model']['tiering'] = True
-    for agent, expected in [(disabled, 'synthwave-auto'), (enabled, 'synthwave-luna'), (disabled, 'synthwave-auto')]:
-        kwargs = request()
-        apply_model_tiering(agent, kwargs, [{'role': 'user', 'content': 'hoi'}])
-        assert kwargs['model'] == expected
+def call(agent, text="Wat betekent architectuur?", messages=None):
+    kwargs = {"model": "synthwave-auto"}
+    apply_model_tiering(agent, kwargs, messages or [{"role": "user", "content": text}])
+    return kwargs
 
 
-@pytest.mark.parametrize('reasoning', [{'enabled': False}, {'enabled': True, 'effort': 'high'}, {'effort': 'low'}])
-def test_explicit_reasoning_survives_automatic_tier(reasoning):
-    agent = SimpleNamespace(reasoning_config=reasoning)
-    kwargs = request()
-    kwargs['extra_body']['reasoning'] = deepcopy(reasoning)
-    apply_model_tiering(agent, kwargs, [{'role': 'user', 'content': 'hoi'}])
-    assert kwargs['model'] == 'synthwave-luna'
-    assert kwargs['extra_body']['reasoning'] == reasoning
+def test_semantic_choice_not_keywords_and_independent_effort():
+    a = setup(
+        [decision("small", "low"), decision("large", "low"), decision("small", "high")]
+    )
+    assert (
+        call(a)["model"] == "small-model"
+    )  # architecture keyword does not dictate size
+    assert call(a, "second")["extra_body"]["reasoning"]["effort"] == "low"
+    out = call(a, "third")
+    assert (
+        out["model"] == "small-model"
+        and out["extra_body"]["reasoning"]["effort"] == "high"
+    )
+    assert len(a.client.calls) == 3
 
 
-@pytest.mark.parametrize('state', [
-    {'_reasoning_effort_rejected': True},
-    {'_reasoning_disable_rejected': True},
-    {'_wire_reasoning_config': {'enabled': False}},
-    {'request_overrides': {'reasoning_effort': 'low'}},
-    {'request_overrides': {'extra_body': {'reasoning': {'effort': 'high'}}}},
-    {'request_overrides': {'extra_body': {'enable_thinking': False}}},
-])
-def test_provider_recovery_and_overrides_are_preserved(state):
-    kwargs = {'model': 'synthwave-auto'}
-    apply_model_tiering(SimpleNamespace(**state), kwargs, [{'role': 'user', 'content': 'hoi'}])
-    assert kwargs == {'model': 'synthwave-luna'}
+@pytest.mark.parametrize(
+    "reasoning", [{"enabled": False}, {"effort": "high"}, {"effort": "low"}]
+)
+def test_explicit_reasoning_preserved(reasoning):
+    a = setup([decision()])
+    a.reasoning_config = reasoning
+    out = {"model": "synthwave-auto", "extra_body": {"reasoning": deepcopy(reasoning)}}
+    apply_model_tiering(a, out, [{"role": "user", "content": "hello"}])
+    assert out["model"] == "small-model" and out["extra_body"]["reasoning"] == reasoning
 
 
-def test_automatic_effort_and_prompt_stability():
-    messages = [{'role': 'system', 'content': 'Stable prefix'}, {'role': 'user', 'content': 'hoi'}]
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"_reasoning_effort_rejected": True},
+        {"_reasoning_disable_rejected": True},
+        {"_wire_reasoning_config": {"enabled": False}},
+        {"request_overrides": {"reasoning_effort": "low"}},
+        {"request_overrides": {"extra_body": {"thinking": {"type": "disabled"}}}},
+    ],
+)
+def test_recovery_and_request_overrides_preserved(state):
+    assert call(setup([decision()], **state)) == {"model": "small-model"}
+
+
+@pytest.mark.parametrize("value", [False, "false", 0, "off"])
+def test_profile_switch(value):
+    a = setup([])
+    configure_model_tiering(a, {"model": {"tiering": value}})
+    assert call(a) == {"model": "synthwave-auto"} and not a.client.calls
+
+
+def test_explicit_model_and_native_protocol_are_untouched():
+    a = setup([])
+    out = {"model": "explicit"}
+    apply_model_tiering(a, out, [])
+    assert out == {"model": "explicit"}
+    a.api_mode = "codex_responses"
+    assert call(a) == {"model": "synthwave-auto"} and not a.client.calls
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        ValueError("unavailable"),
+        {"candidate": "unknown", "effort": "low"},
+        decision("small", "unsupported"),
+    ],
+)
+def test_invalid_or_failed_classifier_leaves_original_and_is_cached(result):
+    a = setup([result])
+    assert call(a) == {"model": "synthwave-auto"}
+    assert call(a) == {"model": "synthwave-auto"} and len(a.client.calls) == 1
+
+
+def test_prompt_provenance_cache_and_new_steer():
+    a = setup([decision(), decision("large", "high")], _persist_user_message_idx=1)
+    messages = [
+        {"role": "system", "content": "secret stable prefix"},
+        {"role": "user", "content": "injected architecture context; hoi"},
+    ]
     before = deepcopy(messages)
-    agent = SimpleNamespace(reasoning_config=None, _wire_reasoning_config={'enabled': True, 'effort': 'medium'})
-    kwargs = request()
-    apply_model_tiering(agent, kwargs, messages)
-    assert kwargs['extra_body']['reasoning']['effort'] == 'low'
-    assert messages == before
-    assert agent.reasoning_config is None
-
-
-def test_environment_kill_switch_and_explicit_model(monkeypatch):
-    for model, env in [('synthwave-auto', '0'), ('chosen-model', '1')]:
-        monkeypatch.setenv('HERMES_MODEL_TIERING', env)
-        kwargs = {'model': model}
-        apply_model_tiering(SimpleNamespace(), kwargs, [{'role': 'user', 'content': 'hoi'}])
-        assert kwargs == {'model': model}
-
-
-def test_clean_request_ignores_injected_cues_but_prices_full_context():
-    from agent.model_tiering import tiering_request_user
-    wire = [{'role': 'user', 'content': '[Workspace::v1: /production/architecture]\n' + 'attached context ' * 40 + '\nhoi'}]
-    before = deepcopy(wire)
-    agent = SimpleNamespace(_persist_user_message_idx=0, reasoning_config=None)
-    with tiering_request_user(agent, wire, 'hoi'):
-        kwargs = request()
-        apply_model_tiering(agent, kwargs, wire)
-        assert kwargs['model'] == 'synthwave-luna'
-        assert kwargs['extra_body']['reasoning']['effort'] == 'low'
-        large = [{'role': 'system', 'content': 'x' * 600_004}, *wire]
-        kwargs = request()
-        apply_model_tiering(agent, kwargs, large)
-        assert kwargs['model'] == 'synthwave-sol'
-    assert wire == before
-    kwargs = request()
-    apply_model_tiering(agent, kwargs, wire)
-    assert kwargs['model'] == 'synthwave-sol'  # no clean provenance outside this request
-
-
-def test_newer_steer_and_tool_failures_still_escalate():
-    from agent.model_tiering import tiering_request_user
-    agent = SimpleNamespace(_persist_user_message_idx=0, reasoning_config=None)
-    messages = [{'role': 'user', 'content': 'hoi'}, {'role': 'user', 'content': 'security review'}]
-    with tiering_request_user(agent, messages, 'hoi'):
-        kwargs = request()
-        apply_model_tiering(agent, kwargs, messages)
-        assert kwargs['extra_body']['reasoning']['effort'] == 'high'
-    messages = [messages[0], {'role': 'tool', 'content': 'error'}, {'role': 'tool', 'content': 'failed'}]
-    with tiering_request_user(agent, messages, 'hoi'):
-        kwargs = request()
-        apply_model_tiering(agent, kwargs, messages)
-        assert kwargs['extra_body']['reasoning']['effort'] == 'high'
-
-
-def test_nested_requests_and_exceptions_do_not_leak_clean_input():
-    from agent.model_tiering import classify_turn, tiering_request_user
-    agent = SimpleNamespace(_persist_user_message_idx=0)
-    messages = [{'role': 'user', 'content': 'architecture'}]
-    with tiering_request_user(agent, messages, [{'type': 'text', 'text': 'hoi'}]):
-        assert classify_turn(messages)[0] == 'luna'
-        with pytest.raises(ValueError):
-            with tiering_request_user(agent, messages, 'architecture'):
-                assert classify_turn(messages)[0] == 'sol'
-                raise ValueError('builder failed')
-        assert classify_turn(messages)[0] == 'luna'
-    assert classify_turn(messages)[0] == 'sol'
-
-
-def test_request_builder_binds_clean_user_for_real_tiering(monkeypatch):
-    monkeypatch.setattr(loop, '_redecorate_prompt_cache_for_provider',
-                        lambda agent, messages, **kw: (messages, None, kw['tools_for_api']))
-    monkeypatch.setattr(request_module, 'observe_request_tools', lambda *args: None)
-    monkeypatch.setattr(request_module, '_fire_pre_api_request_hook', lambda *args, **kw: None)
-    agent = SimpleNamespace(
-        _persist_user_message_idx=0, reasoning_config=None, tools=[],
-        _reset_stream_delivery_tracking=lambda: None,
-        _reapply_reasoning_echo_for_provider=lambda messages: None,
-        api_mode='chat_completions', _empty_content_retries=0,
-        _image_rejecting_models=set(), _force_ascii_payload=False,
-        _is_user_initiated_turn=False, session_id='test', platform='webui',
-        model='synthwave-auto', provider='custom:omniroute', base_url='http://invalid',
+    with tiering_request_user(a, messages, "hoi"):
+        assert call(a, messages=messages)["model"] == "small-model"
+        assert call(a, messages=messages)["model"] == "small-model"
+    payload = json.loads(a.client.calls[0]["messages"][1]["content"])
+    assert payload["task"] == "hoi" and "secret stable prefix" not in json.dumps(
+        payload
     )
-    def build(messages, **kw):
-        result = request()
-        apply_model_tiering(agent, result, messages)
-        return result
-    agent._build_api_kwargs = build
-    wire = [{'role': 'user', 'content': '[Workspace::v1: /production/architecture]\nhoi'}]
-    result = build_api_request(
-        agent, api_messages=wire, _moa_prepared_request=None, tools_for_api=[],
-        system_message='', messages=wire, original_user_message='hoi', approx_tokens=20,
-        total_chars=80, retry_count=0, api_call_count=0, api_request_id='request',
-        api_start_time=0, effective_task_id='task', turn_id='turn',
-    )
-    assert result.api_kwargs['model'] == 'synthwave-luna'
-    assert build(wire)['model'] == 'synthwave-sol'
+    assert messages == before and a.reasoning_config is None
+    messages.append({"role": "user", "content": "new task"})
+    with tiering_request_user(a, messages, "old task"):
+        assert call(a, messages=messages)["model"] == "large-model"
+    assert json.loads(a.client.calls[1]["messages"][1]["content"])["task"] == "new task"
+
+
+def test_profile_catalog_snapshot_and_no_cross_agent_cache():
+    one = setup([decision()])
+    two = setup([decision("large", "high")])
+    assert call(one)["model"] == "small-model"
+    assert call(two)["model"] == "large-model"
+    assert call(one)["model"] == "small-model"
+    assert len(one.client.calls) == len(two.client.calls) == 1
+
+
+def test_tool_reassessment_is_bounded():
+    a = setup([decision(), decision("large", "high")])
+    m = [{"role": "user", "content": "task"}]
+    assert call(a, messages=m)["model"] == "small-model"
+    for i in range(8):
+        m.append({"role": "tool", "content": "step result"})
+        assert call(a, messages=m)["model"] == "large-model"
+    assert len(a.client.calls) == 2
+
+
+def test_classifier_failure_uses_independent_prompt_route_once():
+    a = setup([TimeoutError("upstream stalled"), decision("large", "xhigh")])
+    a._semantic_routing_config["fallback_classifier_model"] = "second-classifier"
+    result = call(a)
+    assert result["model"] == "large-model"
+    assert result["extra_body"]["reasoning"]["effort"] == "xhigh"
+    assert [r["model"] for r in a.client.calls] == ["classifier", "second-classifier"]
+    assert a._semantic_route_decision["classifier_model"] == "second-classifier"
+    assert a._semantic_routing_status["attempts"] == 2
+    assert call(a) == result and len(a.client.calls) == 2
+
+
+def test_both_classifier_failures_are_visible_and_bounded():
+    a = setup([TimeoutError(), ValueError("invalid JSON")])
+    a._semantic_routing_config["fallback_classifier_model"] = "second-classifier"
+    assert call(a) == {"model": "synthwave-auto"}
+    assert a._semantic_routing_status == {
+        "status": "fallback",
+        "attempts": 2,
+        "errors": ["TimeoutError", "ValueError"],
+    }
+    assert call(a) == {"model": "synthwave-auto"} and len(a.client.calls) == 2
+
+
+def test_truncated_classifier_output_uses_fallback_without_mutating_prompt():
+    a = setup([decision("large", "high")])
+    a._semantic_routing_config["fallback_classifier_model"] = "second-classifier"
+    normal_create = a.client.create
+    requests = []
+
+    def truncated_once(**kwargs):
+        requests.append(deepcopy(kwargs))
+        if len(requests) == 1:
+            return NS(
+                choices=[
+                    NS(finish_reason="length", message=NS(content='{"candidate":'))
+                ]
+            )
+        return normal_create(**kwargs)
+
+    a.client.chat.completions.create = truncated_once
+    messages = [
+        {"role": "system", "content": "stable prefix"},
+        {"role": "user", "content": "Prove this concurrency invariant."},
+    ]
+    before = deepcopy(messages)
+    assert call(a, messages=messages)["model"] == "large-model"
+    assert messages == before and len(requests) == 2
+    assert all(r["max_tokens"] >= 1024 for r in requests)
+    assert all(r["temperature"] > 0.1 for r in requests)
+    assert all(r["extra_headers"]["x-omniroute-no-memory"] == "true" for r in requests)
