@@ -12,6 +12,10 @@ import uuid
 from hermes_cli.gateway_client import RESUME_KEY_MISMATCH, GatewayClientError, connect_gateway
 from hermes_cli.gateway_connection import RESUME_REFUSALS
 
+# session.create preloads skills and toolsets; under load it legitimately takes 30 to 45 s (measured
+# 23 Nov 2026). The TUI already waits 120 s (HERMES_TUI_RPC_TIMEOUT_MS); the CLI used the 30 s RPC default.
+SESSION_CREATE_TIMEOUT = max(30.0, float(os.environ.get("HERMES_SESSION_CREATE_TIMEOUT", "120") or 120))
+
 # These options change execution or require frontend facilities not yet exposed by
 # the authority. Reject them, rather than mutate process-wide gateway settings.
 _UNSUPPORTED = (
@@ -219,7 +223,7 @@ async def run_gateway_chat(args, emitter=None):
             missing = sorted(set(policy) - set(parameters))
             if missing:
                 raise GatewayClientError("Gateway does not support creation options: " + ", ".join(missing))
-            snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
+            snapshot = await client.rpc("session.create", _timeout=SESSION_CREATE_TIMEOUT, request_id=uuid.uuid4().hex, source=source, **policy)
             if (warning := (snapshot.get("info") or {}).get("config_warning")) and not isinstance(oneshot_prompt, str):
                 print(f"Warning: {warning}", file=sys.stderr)
         if not isinstance(oneshot_prompt, str):  # main's -z writes nothing to stderr on success
