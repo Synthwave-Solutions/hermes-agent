@@ -1456,8 +1456,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         getattr(agent, "session_id", None),
     )
     # SYNTHWAVE fork: per-turn model tiering (``model.tiering``). When the session model is
-    # the synthwave-auto combo, each turn picks a tier (luna/terra/sol) and reasoning effort from
-    # the question. Fail-open by design.
+    # the synthwave-auto combo, a prompt classifier selects a configured model and reasoning
+    # effort. Explicit choices remain authoritative; classifier failure preserves the request.
     try:
         from agent.model_tiering import apply_model_tiering
         apply_model_tiering(agent, kwargs, api_messages)
