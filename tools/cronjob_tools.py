@@ -262,6 +262,41 @@ def _primary_routed_delivery_platforms(job: dict[str, Any]) -> set:
         return set()
 
 
+def _hand_off_run_from_webui(job: dict[str, Any], extra_prompt: Optional[str] = None) -> Optional[str]:
+    """Queue a manual run from a WebUI chat for the gateway ticker.
+
+    When the WebUI runs in its own container, a background run from there dials the gateway
+    runtime endpoint named in the shared HERMES_HOME, which is a loopback address inside the
+    gateway's container, so every "run now" failed in under a second with "Gateway connection
+    failed". The gateway's ticker runs a queued job within about a minute and delivers it like a
+    scheduled run. Returns None (normal path) outside the WebUI, inside the gateway, or when no
+    live gateway serves this profile.
+    """
+    if "api.streaming" not in sys.modules:
+        return None
+    runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
+    if callable(runner_ref) and runner_ref() is not None:
+        return None
+    if not is_job_runnable(job):
+        return None
+    try:
+        from hermes_cli.cron import _builtin_gateway_liveness
+        if _builtin_gateway_liveness() is not True:
+            return None
+    except Exception:  # noqa: BLE001 - keep the normal path when liveness cannot be read
+        return None
+    updated = trigger_job(job["id"], extra_prompt=extra_prompt)
+    _notify_provider_jobs_changed_safe()
+    return _dumps({
+        "success": True,
+        "job": _format_job(updated),
+        "execution_mode": "queued",
+        "note": (
+            "Queued for the gateway's scheduler: it starts within about a minute and its outcome "
+            "is delivered like a scheduled run. Tell the user it is on its way; do not wait or poll."),
+    })
+
+
 def _hand_off_primary_routed_run(job: dict[str, Any], extra_prompt: Optional[str] = None) -> Optional[str]:
     """Queue a manual run for the gateway ticker when the job delivers through the primary gateway's
     profile route: only the gateway process holding the primary's bot can send it, so an in-process
@@ -867,7 +902,8 @@ def _action_run(job: dict[str, Any], a: dict[str, Any]) -> str:
         if scan_error:
             return tool_error(scan_error, success=False)
     # Primary-routed satellite delivery has no sender outside the gateway: hand the run to its ticker.
-    handed_off = _hand_off_primary_routed_run(job, extra_prompt=extra_prompt)
+    handed_off = (_hand_off_run_from_webui(job, extra_prompt=extra_prompt)
+                  or _hand_off_primary_routed_run(job, extra_prompt=extra_prompt))
     if handed_off is not None:
         return handed_off
     # A manual run must actually run even with no ticker active. Preferred: background
