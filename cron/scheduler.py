@@ -2955,6 +2955,17 @@ def _record_refused_fire(job: dict, reason: str, *, consume_occurrence: bool = T
     return recorded
 
 
+def _job_store_profile() -> str:
+    """Name of the profile this scheduler serves: ``<name>`` for a
+    ``profiles/<name>`` home, else ``"default"`` (the root store)."""
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    except Exception:
+        return "default"
+    return home.name if home.parent.name == "profiles" else "default"
+
+
 @contextlib.contextmanager
 def _governed_as_job_owner(
     job: dict,
@@ -3050,6 +3061,11 @@ def _governed_as_job_owner(
             # Tool review reloads this policy before execution. Without its
             # source, every managed owner's action fails closed in cron.
             approval_policy_path=str(policy_path),
+            # The profile whose store this job lives in. Left at the context's
+            # "default", a job in a named profile was governed as if it ran on
+            # the root bot, so an owner granted only that profile had every
+            # tool refused with profile_not_allowed.
+            active_profile=_job_store_profile(),
         )
     )
     try:
