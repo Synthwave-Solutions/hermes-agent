@@ -877,6 +877,23 @@ class TestCronJobsCarryTheirOwner:
             assert bound is not None and bound.access.subject.email == "stephen@synthwave.solutions"
         assert current_governance_context() is None
 
+    def test_a_fire_in_a_named_profile_is_governed_as_that_profile(self):
+        """A job in ``profiles/<name>`` runs on that bot, so its owner's grant
+        for that profile applies, not the root bot's."""
+        import tempfile
+        from pathlib import Path
+        import hermes_constants
+        from cron.scheduler import _governed_as_job_owner
+        from hermes_cli.dashboard_governance.context import current_governance_context
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "profiles" / "partner"
+            home.mkdir(parents=True)
+            with patch.object(hermes_constants, "get_hermes_home", lambda: home):
+                with _governed_as_job_owner({"id": "j4", "owner_email": "stephen@synthwave.solutions"}):
+                    assert current_governance_context().active_profile == "partner"
+        with _governed_as_job_owner({"id": "j5", "owner_email": "stephen@synthwave.solutions"}):
+            assert current_governance_context().active_profile == "default"
+
     def test_an_ownerless_job_still_runs_unbound(self):
         from cron.scheduler import _governed_as_job_owner
         from hermes_cli.dashboard_governance.context import current_governance_context
