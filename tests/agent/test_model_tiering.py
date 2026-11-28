@@ -88,6 +88,20 @@ def test_semantic_choice_not_keywords_and_independent_effort():
     assert len(a.client.calls) == 3
 
 
+def test_classified_effort_replaces_transport_defaults():
+    agent = setup([decision()], _wire_reasoning_config={"effort": "medium"})
+    kwargs = {
+        "model": "synthwave-auto",
+        "reasoning_effort": "medium",
+        "extra_body": {"reasoning_effort": "medium"},
+    }
+    apply_model_tiering(agent, kwargs, [{"role": "user", "content": "hello"}])
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["extra_body"]["reasoning_effort"] == "low"
+    assert kwargs["extra_body"]["reasoning"]["effort"] == "low"
+    assert agent._wire_reasoning_config["effort"] == "low"
+
+
 @pytest.mark.parametrize(
     "reasoning", [{"enabled": False}, {"effort": "high"}, {"effort": "low"}]
 )

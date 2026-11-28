@@ -141,6 +141,12 @@ def apply_model_tiering(agent, kwargs: dict, api_messages: list) -> None:
             reasoning = {"enabled": True}
             extra["reasoning"] = reasoning
         reasoning["effort"] = effort
+        # OpenAI-compatible transports may serialize the same effort as a flat
+        # field. The Claude bridge gives that field precedence when present.
+        for fields in (kwargs, extra):
+            if "reasoning_effort" in fields:
+                fields["reasoning_effort"] = effort
+        agent._wire_reasoning_config = dict(reasoning)
         logger.info("model_tiering: %s -> %s effort=%s", model, target, effort)
     except Exception as exc:  # fail-open: never break the turn
         logging.getLogger(__name__).error(
